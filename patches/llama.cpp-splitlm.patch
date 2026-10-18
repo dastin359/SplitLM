@@ -1148,7 +1148,7 @@ index 2632ae3..662e7f1 100644
          int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
  
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 605c23c..85828f0 100644
+index 605c23c..fced0bf 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -152,6 +152,9 @@ static size_t opt_mbuf_total  = 0;                        // total buffer space
@@ -1161,18 +1161,19 @@ index 605c23c..85828f0 100644
  static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  static int    opt_ar_select  = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
-@@ -166,6 +169,10 @@ static int opt_opqueue  = 8;   // max number of pending batches
+@@ -166,6 +169,11 @@ static int opt_opqueue  = 8;   // max number of pending batches
  static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
  static int opt_oppoll   = 0;    // polling for batch completions
  static int opt_opfusion  = 1;    // enable/disable op fusion
 +static int opt_mm_add_ddr = 0;
 +static int opt_mm_min_nchunks = 0; // HMX 2D matmuls: split N into at least this many chunks (0 = solver choice)
++static int opt_mmid_stream = 1;    // HMX MUL_MAT_ID(_NX): 1 = streamed expert kernel (async HMX, double buffers), 0 = per-expert synchronous kernel
 +static int opt_nx_swiglu = 0;      // 1: SWIGLU in the gate/up MUL_MAT_NX epilogue (slower on v73: HVX is busy dequantizing)
 +static int opt_conv_block_silu = 1; // 0: leave the SILU after a fused short-conv block as its own op   // 1: MUL_MAT+ADD always reads src2 from DDR when the kernel allows it (testing)
  static int opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = quantized only (default), 2 = always
  
  enum ggml_hexagon_fusion_flags {
-@@ -175,6 +182,12 @@ enum ggml_hexagon_fusion_flags {
+@@ -175,6 +183,12 @@ enum ggml_hexagon_fusion_flags {
      GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
      GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
      GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
@@ -1185,7 +1186,7 @@ index 605c23c..85828f0 100644
  };
  
  static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
-@@ -1998,34 +2011,47 @@ struct ggml_hexagon_opbatch {
+@@ -1998,34 +2012,47 @@ struct ggml_hexagon_opbatch {
          const struct htp_mm_kernel_params * orig_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
          struct htp_mm_kernel_params kparams;
          ggml_hexagon_precompute_fused_matmul_add_params(sess, src0, src1, src2, node.dst(), &kparams);
@@ -1256,7 +1257,7 @@ index 605c23c..85828f0 100644
          }
  
          if (!try_fuse_common(src2, node.dst())) {
-@@ -2419,6 +2445,199 @@ struct ggml_hexagon_opbatch {
+@@ -2419,6 +2446,199 @@ struct ggml_hexagon_opbatch {
          return true;
      }
  
@@ -1456,7 +1457,7 @@ index 605c23c..85828f0 100644
      bool try_fuse(const htp_opnode & node) {
          if (!opt_opfusion) return false;
          if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
-@@ -2427,6 +2646,10 @@ struct ggml_hexagon_opbatch {
+@@ -2427,6 +2647,10 @@ struct ggml_hexagon_opbatch {
          if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
          if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
          if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_CPY)       && try_fuse_gdn_cpy(node))       return true;
@@ -1467,7 +1468,7 @@ index 605c23c..85828f0 100644
          return false;
      }
  };
-@@ -3548,7 +3771,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3548,7 +3772,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
      kparams->logit_softcap = logit_softcap;
  
      kparams->head_split = (opt_fa_head_split != 0) ? 1 : 0;
@@ -1476,7 +1477,7 @@ index 605c23c..85828f0 100644
      kparams->G = G;
  
      const uint32_t n_head = q->ne[2];
-@@ -3565,7 +3788,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3565,7 +3789,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
          const uint32_t DK_pad = hex_round_up(DK, 64);
          const uint32_t DV_pad = hex_round_up(DV, 64);
          size_t Br = 0, Bc = 0;
@@ -1485,7 +1486,7 @@ index 605c23c..85828f0 100644
          if (ret == 0) {
              kparams->kernel_type = HTP_FA_KERNEL_HMX;
              if (logit_softcap == 0.0f) {
-@@ -3889,6 +4112,17 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3889,10 +4113,22 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
          if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, m_for_solver_padded, cost_m, n_threads, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
              return false;
          }
@@ -1503,7 +1504,13 @@ index 605c23c..85828f0 100644
      }
  
      kparams->n_hmx = 1;
-@@ -4504,6 +4738,12 @@ static void ggml_hexagon_precompute_unary_params(
+-    kparams->pipeline = pipeline ? 1 : 0;
++    // matmul-id: the flag selects the streamed expert kernel (the solver above still plans the synchronous one)
++    kparams->pipeline = is_matmul_id ? (opt_mmid_stream ? 1 : 0) : (pipeline ? 1 : 0);
+     kparams->m_chunk = m_chunk;
+     kparams->n_chunk = n_chunk;
+     kparams->n_threads = n_threads;
+@@ -4504,6 +4740,12 @@ static void ggml_hexagon_precompute_unary_params(
      kparams->vtcm_dst_size  = L.dst_bytes * n_threads;
  
      kparams->block = col_tile ? 0 : ((L.src0_bytes / 2) / src0_row_size_aligned);
@@ -1516,7 +1523,7 @@ index 605c23c..85828f0 100644
  
      const uint32_t tiles_per_row = col_tile > 0 ? (src0->ne[0] + col_tile - 1) / col_tile : 1;
      kparams->div_ne01  = init_fastdiv_values(src0->ne[1]);
-@@ -6905,6 +7145,160 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
+@@ -6905,6 +7147,160 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
      return true;
  }
  
@@ -1677,7 +1684,7 @@ index 605c23c..85828f0 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -6929,7 +7323,16 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6929,7 +7325,16 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
              extra->flags &= ~GGML_HEXAGON_TENSOR_FUSEABLE;
  
@@ -1695,7 +1702,7 @@ index 605c23c..85828f0 100644
                  extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
              } else if ((graph->nodes[i]->op == GGML_OP_MUL_MAT &&
                          ggml_get_op_params_i32(graph->nodes[i], 1) != GGML_HINT_SRC0_IS_HADAMARD) ||
-@@ -6943,12 +7346,45 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6943,12 +7348,45 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -1742,7 +1749,7 @@ index 605c23c..85828f0 100644
              htp_opnode node(HTP_OP_INVALID, n);
              node.opcode = op_remap_to_htp(n);
              if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID || node.opcode == HTP_OP_GET_ROWS) {
-@@ -6991,8 +7427,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6991,8 +7429,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                  auto inputs = node.get_inputs();
                  const struct ggml_tensor * src0 = inputs[0];
                  const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
@@ -1777,18 +1784,19 @@ index 605c23c..85828f0 100644
                      (struct htp_unary_kernel_params *)node.kernel_params
                  );
              } else if (node.opcode == HTP_OP_GET_ROWS) {
-@@ -8369,6 +8830,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8369,6 +8832,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
      const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
      const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
 +    const char * str_mm_add_ddr = getenv("GGML_HEXAGON_MM_ADD_DDR");
 +    const char * str_mm_min_nchunks = getenv("GGML_HEXAGON_MM_MIN_NCHUNKS");
++    const char * str_mmid_stream = getenv("GGML_HEXAGON_MMID_STREAM");
 +    const char * str_nx_swiglu = getenv("GGML_HEXAGON_NX_SWIGLU");
 +    const char * str_conv_block_silu = getenv("GGML_HEXAGON_CONV_BLOCK_SILU");
      const char * str_rt_repack = getenv("GGML_HEXAGON_RT_REPACK");
      const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
      const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
-@@ -8378,6 +8843,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8378,6 +8846,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
      const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
      const char * str_fa_head_split = getenv("GGML_HEXAGON_FA_HEAD_SPLIT");
@@ -1798,18 +1806,19 @@ index 605c23c..85828f0 100644
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
-@@ -8427,6 +8895,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8427,6 +8898,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
      opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
      opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
 +    opt_mm_add_ddr = str_mm_add_ddr ? atoi(str_mm_add_ddr)                : opt_mm_add_ddr;
 +    opt_mm_min_nchunks = str_mm_min_nchunks ? atoi(str_mm_min_nchunks)    : opt_mm_min_nchunks;
++    opt_mmid_stream    = str_mmid_stream    ? atoi(str_mmid_stream)       : opt_mmid_stream;
 +    opt_nx_swiglu = str_nx_swiglu ? atoi(str_nx_swiglu)                   : opt_nx_swiglu;
 +    opt_conv_block_silu = str_conv_block_silu ? atoi(str_conv_block_silu) : opt_conv_block_silu;
      opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
      opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
      opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
-@@ -8443,6 +8915,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8443,6 +8919,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
      opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
      opt_fa_head_split = str_fa_head_split ? atoi(str_fa_head_split)       : opt_fa_head_split;
@@ -2687,7 +2696,7 @@ index b72ef2b..a0ca32f 100644
                  drop_mmap(ctx, ctx->mmap + i);
              }
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index 9af3129..94017af 100644
+index 9af3129..ad99252 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -1978,7 +1978,7 @@ static void transfer_output_chunk_worker_fn(unsigned int n, unsigned int i, void
@@ -3063,7 +3072,7 @@ index 9af3129..94017af 100644
          FARF(ERROR, "hmx-mm-id-2d: VTCM too small : m %d k %d n %d budget %zu", m_core_padded, k, n, vtcm_budget);
          return -1;
      }
-@@ -3603,62 +3757,103 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3603,62 +3757,404 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
      htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
  
      hmx_matmul_job_t job;
@@ -3185,25 +3194,323 @@ index 9af3129..94017af 100644
 +                    ctx, dsts[w] + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
 +                    matrix_rows, cur_a, mapping_stride, dst_nb1s[w], dst_nb2s[w], cne1, n_threads);
              }
--
++        }
++    }
+ 
 -            // C: HMX Compute (Queue-based)
 -            hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, (__fp16 *) vtcm_weight_bufs[i % 2], vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
 -            hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
 -            hmx_queue_pop(ctx->hmx_queue);
--
++#undef HMX_MMID_DMA_HEIGHT
++
++    return 0;
++}
++
++// --- Streamed expert kernel (single device) ---
++//
++// One flat item stream over the whole op: (expert, M-chunk, weight, N-chunk). Two raw weight buffers, two
++// fp16 weight buffers, two activation buffers and two output buffers, with async HMX:
++//   iteration i: [gather the activation rows of a new expert / M-chunk] -> wait DMA(i) -> dequant(i) ->
++//                DMA(i + 2) into the raw buffer just freed -> push HMX(i) -> pop HMX(i - 1) -> scatter(i - 1)
++// so HMX(i) runs under scatter(i - 1), the next gather and dequant(i + 1), across expert boundaries.
++// Arithmetic is unchanged: every output tile is still one HMX job over the full k with the same dequant.
++
++// experts with rows, in order
++struct hmx_mmid_pos {
++    const uint32_t * row_counts;
++    uint32_t         n_as;
++    uint32_t         next_a;  // next expert to examine
++    bool             valid;
++    int              a;       // current expert
++    int              cne1;    // its rows
++    int              m_end;   // its rows padded to 32
++    int              mr;      // current M-chunk start
++    int              w;       // current weight
++    int              i;       // current N-chunk
++};
++
++static inline void hmx_mmid_pos_next_expert(struct hmx_mmid_pos * p) {
++    p->valid = false;
++    while (p->next_a < p->n_as) {
++        const uint32_t a = p->next_a++;
++        const uint32_t c = p->row_counts[a];
++        if (c > 0) {
++            p->valid = true;
++            p->a     = (int) a;
++            p->cne1  = (int) c;
++            p->m_end = hex_align_up((int) c, 32);
++            break;
++        }
++    }
++    p->mr = 0;
++    p->w  = 0;
++    p->i  = 0;
++}
++
++static inline void hmx_mmid_pos_init(struct hmx_mmid_pos * p, const uint32_t * row_counts, uint32_t n_as) {
++    p->row_counts = row_counts;
++    p->n_as       = n_as;
++    p->next_a     = 0;
++    hmx_mmid_pos_next_expert(p);
++}
++
++static inline void hmx_mmid_pos_advance(struct hmx_mmid_pos * p, int n_w, int n_chunk_cnt, int m_chunk) {
++    if (++p->i < n_chunk_cnt) return;
++    p->i = 0;
++    if (++p->w < n_w) return;
++    p->w = 0;
++    p->mr += m_chunk;
++    if (p->mr < p->m_end) return;
++    hmx_mmid_pos_next_expert(p);
++}
+ 
 -            // D: Output Store
--            transfer_output_chunk_scattered_threaded(
++// The gather threads write whole 32-row tiles from their first row on, so the last ones can write up to 31 rows
++// past the M-chunk. The synchronous kernel lets that spill into its idle output area; here the next buffer is
++// live (the other activation buffer or a pending output), so each activation buffer gets one spare tile row.
++#define HMX_MMID_ACT_SLACK_ROWS 32
++
++static inline size_t hmx_mmid_stream_vtcm_size(size_t mc, size_t nc, size_t w_col_bytes, size_t vec_dot_size) {
++    return 2 * hex_align_up(nc * w_col_bytes, HTP_MM_HMX_TILE_SIZE) +
++           2 * hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE) +
++           2 * hex_align_up((mc + HMX_MMID_ACT_SLACK_ROWS) * vec_dot_size, HTP_MM_HMX_TILE_SIZE) +
++           2 * hex_align_up(mc * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE) + 256;
++}
++
++// (M-chunk, N-chunk) for the whole op. HVX dequant is the bottleneck, so the estimate counts dequant work
++// (repeated for every M-chunk of an expert) plus a fixed cost per item (thread dispatch, HMX job).
++static int hmx_mmid_stream_plan(size_t budget, const uint32_t * row_counts, uint32_t n_as, int n_w, int k, int n,
++                                size_t w_col_bytes, size_t vec_dot_size, size_t * mc_out, size_t * nc_out, size_t * used_out) {
++    int max_m = 0;
++    for (uint32_t a = 0; a < n_as; ++a) {
++        max_m = hex_smax(max_m, (int) row_counts[a]);
++    }
++    if (max_m == 0) return -1;
++    max_m = hex_align_up(max_m, 32);
++
++    const uint64_t dq_ps_per_elem = 22;        // ~2.2e-5 us per weight element (v73, Q4_0)
++    const uint64_t item_ps        = 10000000;  // ~10 us per item
++
++    uint64_t best_cost = UINT64_MAX;
++    size_t   best_mc = 0, best_nc = 0, best_used = 0;
++    for (int nc = n; nc >= 32; nc -= 32) {
++        size_t mc = hex_align_down((size_t) max_m, 32);
++        while (mc >= 32 && hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size) > budget) {
++            mc -= 32;
++        }
++        if (mc < 32) continue;
++
++        const int n_chunks = (n + nc - 1) / nc;
++        uint64_t cost = 0;
++        for (uint32_t a = 0; a < n_as; ++a) {
++            if (row_counts[a] == 0) continue;
++            const uint64_t m_chunks = (hex_align_up((int) row_counts[a], 32) + mc - 1) / mc;
++            cost += m_chunks * (uint64_t) n_w * ((uint64_t) n * k * dq_ps_per_elem + (uint64_t) n_chunks * item_ps);
++        }
++        if (cost < best_cost || (cost == best_cost && mc * nc > best_mc * best_nc)) {
++            best_cost = cost;
++            best_mc   = mc;
++            best_nc   = nc;
++            best_used = hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size);
++        }
++    }
++    if (best_mc == 0) return -1;
++    *mc_out   = best_mc;
++    *nc_out   = best_nc;
++    *used_out = best_used;
++    return 0;
++}
++
++// Returns 1 when the op cannot use the streamed kernel (nothing was done, use the per-expert kernel),
++// 0 on success, -1 on error.
++static int hmx_mm_id_stream_f32(struct htp_context *ctx,
++                                dma_queue *weight_dma,
++                                int n_w,
++                                float * const * dsts,
++                                const size_t * dst_nb1s,
++                                const size_t * dst_nb2s,
++                                const dma_addr_t * w_data,       // per weight: expert 0
++                                const size_t * w_nb2,            // per weight: expert stride
++                                const float *activation,
++                                int k, int n,
++                                int k_valid,
++                                int ne11,
++                                size_t act_nb1, size_t act_nb2,
++                                int weight_stride,
++                                int weight_type,
++                                int tile_size,
++                                int aligned_tile_size,
++                                const uint32_t * row_counts,
++                                uint32_t n_as,
++                                const struct mmid_row_mapping *matrix_rows,
++                                int mapping_stride,
++                                int n_threads) {
++    struct htp_thread_trace * tr = &ctx->trace[0];
++
++    if (n_w <= 0) return 1;
++    if (k % 32 != 0 || n % 32 != 0) return 1;
++    if (!hex_is_aligned(activation, VLEN)) return 1;
++    for (int w = 0; w < n_w; ++w) {
++        if (!hex_is_aligned(dsts[w], VLEN)) return 1;
++    }
++
++    const size_t row_stride = htp_tensor_get_row_size(weight_type, k);
++    if (row_stride == 0) return 1;
++
++    const bool is_tiled = (tile_size > 0);
++    tiled_dequant_task_fn_t dequant_worker_fn = hmx_get_dequant_worker_fn(weight_type, is_tiled);
++    if (!dequant_worker_fn) return 1;  // HMX would read the raw buffers directly: per-expert kernel
++
++    htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
++
++    const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
++    const uint32_t n_weight_tiles = k / htp_tensor_get_tile_k(weight_type);
++    const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
++
++    const size_t vec_dot_size = k * sizeof(__fp16);
++
++    const uint32_t dma_dst_stride  = is_tiled ? aligned_tile_size : row_stride;
++    const uint32_t dma_src_stride  = is_tiled ? tile_size : weight_stride;
++    const uint32_t dma_width_bytes = is_tiled ? tile_size : row_stride;
++    const size_t   w_col_bytes     = is_tiled ? (size_t) (n_weight_tiles * aligned_tile_size) / 32 : row_stride;
++
++    size_t mc = 0, nc = 0, vtcm_used = 0;
++    if (hmx_mmid_stream_plan(ctx->vtcm_size, row_counts, n_as, n_w, k, n, w_col_bytes, vec_dot_size, &mc, &nc, &vtcm_used)) {
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
++        return 1;
++    }
++
++    const size_t raw_size = hex_align_up(nc * w_col_bytes, HTP_MM_HMX_TILE_SIZE);
++    const size_t wf_size  = hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
++    const size_t act_size = hex_align_up((mc + HMX_MMID_ACT_SLACK_ROWS) * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
++    const size_t out_size = hex_align_up(mc * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
++
++    uint8_t * vtcm_ptr = (uint8_t *) ctx->vtcm_base;
++    void *   raw_bufs[2];
++    __fp16 * wf_bufs[2];
++    __fp16 * act_bufs[2];
++    __fp16 * out_bufs[2];
++    for (int b = 0; b < 2; ++b) raw_bufs[b] = vtcm_seq_alloc(&vtcm_ptr, raw_size);
++    for (int b = 0; b < 2; ++b) wf_bufs[b]  = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, wf_size);
++    for (int b = 0; b < 2; ++b) act_bufs[b] = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, act_size);
++    for (int b = 0; b < 2; ++b) out_bufs[b] = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, out_size);
++    __fp16 * vtcm_scales = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
++
++    if ((size_t) (vtcm_ptr - (uint8_t *) ctx->vtcm_base) > ctx->vtcm_size) {
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
++        return 1;
++    }
++
++    hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));
++
++    const int n_chunk_cnt = (n + (int) nc - 1) / (int) nc;
++
++    FARF(HIGH, "hmx-mm-id-stream: n_w %d k %d n %d mc %zu nc %zu vtcm %zu/%zu", n_w, k, n, mc, nc, vtcm_used, ctx->vtcm_size);
++
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
++
++#define HMX_MMID_DMA_HEIGHT(cols) ((uint32_t) (is_tiled ? hmx_ceil_div((cols), 32) * n_weight_tiles : (cols)))
++#define HMX_MMID_DMA_PUSH(p, buf) do {                                                                          \
++        const size_t nc_d     = (size_t) (p).i * nc;                                                            \
++        const size_t n_cols_d = hex_smin((size_t) n - nc_d, nc);                                                \
++        const dma_addr_t src_d = w_data[(p).w] + (dma_addr_t) ((size_t) (p).a * w_nb2[(p).w] + nc_d * weight_stride); \
++        dma_queue_push(weight_dma, dma_make_data((buf), src_d), dma_dst_stride, dma_src_stride, dma_width_bytes,  \
++                       HMX_MMID_DMA_HEIGHT(n_cols_d));                                                          \
++    } while (0)
++
++    struct hmx_mmid_pos cur, ahead;
++    hmx_mmid_pos_init(&cur, row_counts, n_as);
++    ahead = cur;
++
++    // prologue: weight chunks of items 0 and 1
++    for (int b = 0; b < 2 && ahead.valid; ++b) {
++        HMX_MMID_DMA_PUSH(ahead, raw_bufs[b]);
++        hmx_mmid_pos_advance(&ahead, n_w, n_chunk_cnt, (int) mc);
++    }
++
++    hmx_matmul_job_t job_slots[2];
++    struct {
++        float * dst;
++        size_t  nb1, nb2;
++        int     a, cne1, mr, n_rows, n_cols;
++    } pend = { 0 };
++    bool     have_pend = false;
++    uint32_t item = 0;
++    uint32_t seg  = 0;
++
++    while (cur.valid) {
++        const size_t n_rows = hex_smin((size_t) (cur.m_end - cur.mr), mc);
++        const bool   new_seg = (cur.w == 0 && cur.i == 0);
++        if (new_seg) {
++            if (item > 0) ++seg;
++            // HMX(item - 1) may still read act_bufs[(seg - 1) % 2]
++            transfer_activation_chunk_gathered_threaded(
++                ctx, act_bufs[seg % 2], activation, cur.mr, (int) n_rows, k,
++                matrix_rows, cur.a, mapping_stride, ne11, act_nb1, act_nb2, cur.cne1, n_threads, k_valid);
++        }
++
++        const size_t nc_cur = (size_t) cur.i * nc;
++        const size_t n_cols = hex_smin((size_t) n - nc_cur, nc);
++
++        // A: weight chunk of this item
++        void * curr_raw = (void *) dma_queue_pop(weight_dma).dst;
++
++        // B: dequant into the fp16 buffer HMX(item - 2) used (popped in the previous iteration)
++        dequantize_tiled_weight_chunk_to_fp16_tiles(
++            ctx, wf_bufs[item % 2], curr_raw,
++            (int) n_cols, k, row_stride, weight_type,
++            n_k_tiles, n_k_tiles_div, dequant_worker_fn, n_threads);
++
++        // the raw buffer is free again: weight chunk of item + 2
++        if (ahead.valid) {
++            HMX_MMID_DMA_PUSH(ahead, curr_raw);
++            hmx_mmid_pos_advance(&ahead, n_w, n_chunk_cnt, (int) mc);
++        }
++
++        // C: HMX(item), queued behind HMX(item - 1)
++        hmx_matmul_job_init(&job_slots[item % 2], out_bufs[item % 2], act_bufs[seg % 2], wf_bufs[item % 2], vtcm_scales,
++                            hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS), hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS),
++                            k / HTP_MM_HMX_TILE_N_ROWS);
++        hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job_slots[item % 2]));
++
++        // D: wait HMX(item - 1) and scatter its output while HMX(item) runs
++        if (have_pend) {
++            hmx_queue_pop(ctx->hmx_queue);
+             transfer_output_chunk_scattered_threaded(
 -                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
 -                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
++                ctx, pend.dst, out_bufs[(item - 1) % 2], pend.mr, pend.n_rows, pend.n_cols,
++                matrix_rows, pend.a, mapping_stride, pend.nb1, pend.nb2, pend.cne1, n_threads);
          }
++
++        pend.dst    = dsts[cur.w] + nc_cur;
++        pend.nb1    = dst_nb1s[cur.w];
++        pend.nb2    = dst_nb2s[cur.w];
++        pend.a      = cur.a;
++        pend.cne1   = cur.cne1;
++        pend.mr     = cur.mr;
++        pend.n_rows = (int) n_rows;
++        pend.n_cols = (int) n_cols;
++        have_pend   = true;
++
++        hmx_mmid_pos_advance(&cur, n_w, n_chunk_cnt, (int) mc);
++        ++item;
      }
  
++    if (have_pend) {
++        hmx_queue_pop(ctx->hmx_queue);
++        transfer_output_chunk_scattered_threaded(
++            ctx, pend.dst, out_bufs[(item - 1) % 2], pend.mr, pend.n_rows, pend.n_cols,
++            matrix_rows, pend.a, mapping_stride, pend.nb1, pend.nb2, pend.cne1, n_threads);
++    }
++
++#undef HMX_MMID_DMA_PUSH
 +#undef HMX_MMID_DMA_HEIGHT
 +
      return 0;
  }
  
-@@ -3857,43 +4052,70 @@ static int hmx_mm_op_matmul_id(
+@@ -3857,43 +4353,89 @@ static int hmx_mm_op_matmul_id(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -3214,6 +3521,25 @@ index 9af3129..94017af 100644
 +    float * const      dsts[1]    = { (float *) dst->data };
 +    const size_t       dst_nb1[1] = { nb1 };
 +    const size_t       dst_nb2[1] = { nb2 };
++
++    if (kparams->pipeline && octx->ctx->mdev.count <= 1) {
++        const dma_addr_t w_data[1] = { (dma_addr_t) src0->data };
++        const size_t     w_nb2[1]  = { nb02 };
++        const int ret = hmx_mm_id_stream_f32(octx->ctx, octx->ctx->dma[0], 1, dsts, dst_nb1, dst_nb2, w_data, w_nb2,
++                                             (float *) act->data, ne00, ne01, ne10, ne11, nb11, nb12,
++                                             (int) src0->nb[1], (int) src0->type,
++                                             kparams->tile_size, kparams->aligned_tile_size,
++                                             matrix_row_counts, (uint32_t) n_as, matrix_rows, mmctx->mapping_stride,
++                                             (int) octx->n_threads);
++        if (ret == 0) {
++            return HTP_STATUS_OK;
++        }
++        if (ret < 0) {
++            FARF(ERROR, "HMX matmul ID stream failed, error %d", ret);
++            return HTP_STATUS_NO_SUPPORT;
++        }
++        // ret > 0: not eligible, per-expert kernel below
++    }
 +
 +    // each expert call runs once the next one is known, so it can prefetch that call's first weight chunk
 +    struct hmx_mmid_prefetch pf = { 0 };
@@ -3306,7 +3632,7 @@ index 9af3129..94017af 100644
  
      return HTP_STATUS_OK;
  }
-@@ -4016,49 +4238,102 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -4016,49 +4558,126 @@ static int hmx_mm_op_matmul_id_nx(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -3339,11 +3665,6 @@ index 9af3129..94017af 100644
 +    if (n_w == 0) {
 +        return HTP_STATUS_OK;
 +    }
-+
-+    // each expert call runs once the next one is known, so it can prefetch that call's first weight chunk
-+    struct hmx_mmid_prefetch pf = { 0 };
-+    bool    have_prev = false;
-+    int32_t prev_a = 0, prev_cne1 = 0, prev_m_start = 0, prev_m_end = 0;
  
 -        const int m_padded = hex_align_up(cne1, 32);
 -        int m_start = 0, m_end = m_padded;
@@ -3351,6 +3672,61 @@ index 9af3129..94017af 100644
 -            const bool my_expert = (target_dev == octx->ctx->mdev.idx);
 -            if (++target_dev == octx->ctx->mdev.count) {
 -                target_dev = 0;
+-            }
+-            if (!my_expert) continue;
+-        } else if (mdev_split) {
+-            const bool can_split = (uint32_t) cne1 >= octx->ctx->mdev.count;
+-            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_padded, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+-            m_start = (int) range.start;
+-            m_end   = (int) (range.start + range.count);
++    if (kparams->pipeline && octx->ctx->mdev.count <= 1 && uniform) {
++        dma_addr_t w_data[HTP_OP_MAX_OUTPUTS];
++        size_t     w_nb2[HTP_OP_MAX_OUTPUTS];
++        for (int w = 0; w < n_w; ++w) {
++            w_data[w] = (dma_addr_t) srcs[w]->data;
++            w_nb2[w]  = srcs[w]->nb[2];
++        }
++        const struct htp_tensor * restrict s0 = srcs[0];
++        const int ret = hmx_mm_id_stream_f32(octx->ctx, octx->ctx->dma[0], n_w, dsts, dst_nb1, dst_nb2, w_data, w_nb2,
++                                             (float *) act->data, s0->ne[0], s0->ne[1], act->ne[0], act->ne[1],
++                                             act->nb[1], act->nb[2], (int) s0->nb[1], (int) s0->type,
++                                             kparams->tile_size, kparams->aligned_tile_size,
++                                             matrix_row_counts, (uint32_t) n_as, matrix_rows, mmctx->mapping_stride,
++                                             (int) octx->n_threads);
++        if (ret == 0) {
++            return HTP_STATUS_OK;
+         }
+-        if (m_start >= m_end) continue;
++        if (ret < 0) {
++            FARF(ERROR, "HMX matmul ID NX stream failed, error %d", ret);
++            return HTP_STATUS_NO_SUPPORT;
++        }
++        // ret > 0: not eligible, per-expert kernel below
++    }
+ 
+-        for (uint32_t p = 0; p < n_weights; ++p) {
+-            const struct htp_tensor * restrict src_w = octx->src[p];
+-            const struct htp_tensor * restrict dst   = octx->dsts[p];
+-            if (!src_w || !dst) continue;
++    // each expert call runs once the next one is known, so it can prefetch that call's first weight chunk
++    struct hmx_mmid_prefetch pf = { 0 };
++    bool    have_prev = false;
++    int32_t prev_a = 0, prev_cne1 = 0, prev_m_start = 0, prev_m_end = 0;
+ 
+-            int ret = hmx_mm_id_2d_f32(octx->ctx, octx->ctx->dma[0], (float*) dst->data, (float*) act->data,
+-                                       src_w->data + cur_a * src_w->nb[2],
+-                                       cne1, src_w->ne[0], src_w->ne[1],
+-                                       act->ne[0],
+-                                       act->ne[1],
+-                                       act->nb[1], act->nb[2],
+-                                       dst->nb[1], dst->nb[2],
+-                                       (int) src_w->nb[1], (int) src_w->type,
+-                                       kparams->tile_size, kparams->aligned_tile_size,
+-                                       matrix_rows, cur_a, mmctx->mapping_stride,
+-                                       m_start, m_end, (int) octx->n_threads);
+-            if (ret != 0) {
+-                FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %u, error %d\n", cur_a, p, ret);
+-                return HTP_STATUS_NO_SUPPORT;
 +    uint32_t target_dev = 0;
 +    for (uint32_t cur_a = 0; cur_a <= (uint32_t) n_as; ++cur_a) {
 +        const bool at_end = (cur_a == (uint32_t) n_as);
@@ -3374,35 +3750,9 @@ index 9af3129..94017af 100644
 +                m_start = (int) range.start;
 +                m_end   = (int) (range.start + range.count);
              }
--            if (!my_expert) continue;
--        } else if (mdev_split) {
--            const bool can_split = (uint32_t) cne1 >= octx->ctx->mdev.count;
--            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_padded, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
--            m_start = (int) range.start;
--            m_end   = (int) (range.start + range.count);
 +            if (m_start >= m_end) continue;
          }
--        if (m_start >= m_end) continue;
- 
--        for (uint32_t p = 0; p < n_weights; ++p) {
--            const struct htp_tensor * restrict src_w = octx->src[p];
--            const struct htp_tensor * restrict dst   = octx->dsts[p];
--            if (!src_w || !dst) continue;
--
--            int ret = hmx_mm_id_2d_f32(octx->ctx, octx->ctx->dma[0], (float*) dst->data, (float*) act->data,
--                                       src_w->data + cur_a * src_w->nb[2],
--                                       cne1, src_w->ne[0], src_w->ne[1],
--                                       act->ne[0],
--                                       act->ne[1],
--                                       act->nb[1], act->nb[2],
--                                       dst->nb[1], dst->nb[2],
--                                       (int) src_w->nb[1], (int) src_w->type,
--                                       kparams->tile_size, kparams->aligned_tile_size,
--                                       matrix_rows, cur_a, mmctx->mapping_stride,
--                                       m_start, m_end, (int) octx->n_threads);
--            if (ret != 0) {
--                FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %u, error %d\n", cur_a, p, ret);
--                return HTP_STATUS_NO_SUPPORT;
++
 +        if (have_prev) {
 +            const int n_groups = uniform ? 1 : n_w;
 +            for (int g = 0; g < n_groups; ++g) {
@@ -3432,8 +3782,8 @@ index 9af3129..94017af 100644
 +                    FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %d, error %d\n", prev_a, g, ret);
 +                    return HTP_STATUS_NO_SUPPORT;
 +                }
-             }
-         }
++            }
++        }
 +
 +        have_prev    = true;
 +        prev_a       = (int32_t) cur_a;
@@ -4136,7 +4486,7 @@ index 803a832..b59d220 100644
      const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
          : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8826b27..79c2f6e 100644
+index 8826b27..0c2d41c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -4555,6 +4555,79 @@ struct test_ssm_conv : public test_case {
@@ -4391,7 +4741,21 @@ index 8826b27..79c2f6e 100644
  
      // gpt-oss issue with Vulkan mmq_id
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
-@@ -11768,6 +11964,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11101,6 +11297,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
+     }
+ 
++    // large expert matmuls (MoE prefill shapes): several N- and M-chunks per expert, uneven rows per expert
++    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_F16}) {
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 16, 4, false, 1536, 512, 2048));
++        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 2048, 1024, 1536));
++        test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 16, 4, false, 1536, 512, 2048, 2));
++    }
++
+     for (ggml_type type_a : base_types) {
+         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
+             for (int n_mats : {4, 8}) {
+@@ -11768,6 +11971,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false));
  

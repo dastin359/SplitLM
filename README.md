@@ -32,18 +32,18 @@ Each row is a same-session A/B against the build before the change, with greedy 
 |---|---|---|---|
 | Fused NPU element-wise kernels (single-pass sigmoid for SILU/SWIGLU, fused conv block, RMS_NORM+SCALE, residual add in the matmul output, batched short-row norms) | Qwen3.5-2B | NPU prefill at 4096 tokens 1,222 → 1,534 t/s (**+26%**); element-wise time per 512 tokens 167 → 80 ms | perplexity ratio 1.0008 |
 | MoE expert matmul: next weight chunk's DMA issued during the activation gather and across experts; one gather for gate+up | LFM2.5-24B-A2B | prefill at 4096 tokens 579 → 641 t/s (**+11%**); expert gate+up 36.8 → 30.7 ms per layer | identical text and perplexity |
+| Streamed, pipelined NPU expert kernel: the matrix unit multiplies chunk i while the vector units expand chunk i+1 and write out chunk i−1 | LFM2.5-24B-A2B | prefill 428 → 510 t/s at 512 tokens (**+19%**), 695 → 799 at 2048 (**+15%**), 685 → 749 at 4096 (**+9%**) | identical text and perplexity |
 | Causal key-block skipping in NPU flash attention | LFM2.5-24B-A2B | attention −32 to −35%; prefill at 4096 tokens (4096-token batches) 603 → 654 t/s (**+8.5%**) | identical perplexity |
 | All NPU fixes merged, vs stock NPU kernels at the same 2048-token batches | LFM2.5-24B-A2B | 537 → 651 t/s (**+21%**); 672 t/s with 4096-token batches | see Limitations |
 | In-place recurrent state (no per-token state copy) | Qwen3.5-2B | CPU decode 60.3 → 63.4 t/s (**+5%**) | identical text |
 | Speculative decoding with the model's MTP head, 3 drafted tokens | Qwen3.8-27B | decode 5.0-5.3 → 8.7-8.9 t/s (**1.7×**), 67% accepted | identical text |
 
-In progress, not yet in this build: a streamed, pipelined NPU expert kernel (the matrix unit multiplies chunk i while the vector units expand chunk i+1 and write out chunk i−1) measured LFM2.5 prefill +19% at 512 tokens, +15% at 2048 and +9% at 4096 (749 t/s), with identical text and perplexity.
 
 ### Bigger models
 
 | Model | Result |
 |---|---|
-| **LFM2.5-24B-A2B** (24B MoE, 64 experts) | Runs split in **14.7 GB** (measured with 512-token batches) instead of ~27 GB for two weight copies: the CPU reads the NPU's tiled experts in place. NPU prefill at 4096 tokens: 672 t/s (CPU: 167 t/s). End to end on a 3,686-token prompt: first token in 6.1 s vs 15.9 s CPU-only; decode 39.1 t/s vs 18.6 on the NPU alone. |
+| **LFM2.5-24B-A2B** (24B MoE, 64 experts) | Runs split in **14.7 GB** (measured with 512-token batches) instead of ~27 GB for two weight copies: the CPU reads the NPU's tiled experts in place. NPU prefill at 4096 tokens: 749 t/s (CPU: 167 t/s). End to end on a 3,686-token prompt: first token in 6.1 s vs 15.9 s CPU-only; decode 39.1 t/s vs 18.6 on the NPU alone. |
 | **Qwen3.8-27B** (dense) | NPU prefill + CPU decode in one process in 17.5-18.4 GB (18.8-19.9 GB with the MTP head; two weight copies would need ~32 GB). MTP speculative decoding 8.7-8.9 t/s vs 5.0-5.3 plain (344-token prompt). |
 
 ### Against Qualcomm's own runtime
@@ -55,13 +55,13 @@ Qualcomm AI Hub's "optimized" Qwen3.5-2B is byte-identical to the GGUF used here
 | Phase | Model | Now | % of ceiling |
 |---|---|---|---|
 | NPU prefill, 4096 tokens | Qwen3.5-2B | 1,631 t/s = 4.5 TFLOPS (2048-token batches) | 39% of 11.48 TFLOPS |
-| NPU prefill, 4096 tokens | LFM2.5-24B-A2B | 672 t/s = 2.9 TFLOPS | 26% |
+| NPU prefill, 4096 tokens | LFM2.5-24B-A2B | 749 t/s = 3.3 TFLOPS | 29% (26% before the pipelined expert kernel) |
 | NPU prefill, 4096 tokens | Qwen3.8-27B | 105 t/s = 5.2 TFLOPS (stock NPU kernels, 512-token batches; not re-measured) | 45% |
 | CPU decode after 4096 tokens (llama-bench, CPU only) | Qwen3.5-2B | 55.4 t/s = 67 GB/s of weights | 61% of ~110 GB/s |
 
 TFLOPS = t/s × 2 × active matmul weights per token (2.75 / 4.38 / 49.45 GFLOP; attention and output head excluded). The ceilings come from measurement, not datasheets: inside a matrix job the NPU sustains 3,809-3,982 FP16 MACs per cycle at 1.40 GHz, which we round up to a 4,096-MAC peak (11.48 TFLOPS); the best DRAM read loop reaches ~110 GB/s (135 GB/s theoretical).
 
-What keeps Qwen3.5-2B below the prefill ceiling: every Q4_0 matmul expands weights to fp16 on the vector units first (the matmuls alone cap near 70%), and the recurrent-state scan and element-wise ops take about 40% of the time (125 of 317 ms per 512-token batch); its realistic FP16 ceiling is about 55%. LFM2.5 is held back mainly by its expert matmuls (the shipped kernel runs DMA, dequant, matrix unit and scatter one after another; the pipelined kernel above attacks this) and by attention. Decode's matmul kernels stream at 90-95 GB/s (profiled from an empty context); the rest of the gap is ~785 graph nodes per token with their thread barriers (about 1.3 ms) plus about 2.3 ms per token of attention over the 4,096-token cache (63.4 t/s from an empty context vs 55.4 at 4K).
+What keeps Qwen3.5-2B below the prefill ceiling: every Q4_0 matmul expands weights to fp16 on the vector units first (the matmuls alone cap near 70%), and the recurrent-state scan and element-wise ops take about 40% of the time (125 of 317 ms per 512-token batch); its realistic FP16 ceiling is about 55%. LFM2.5 is held back mainly by its expert matmuls (the pipelined expert kernel above overlaps its DMA, dequant, matrix-unit and scatter steps; the matrix unit is still idle much of the time) and by attention. Decode's matmul kernels stream at 90-95 GB/s (profiled from an empty context); the rest of the gap is ~785 graph nodes per token with their thread barriers (about 1.3 ms) plus about 2.3 ms per token of attention over the 4,096-token cache (63.4 t/s from an empty context vs 55.4 at 4K).
 
 Other measurements (Qwen3.5-2B, early build with stock NPU kernels): NPU prefill costs 8 mJ per token above a 15.5 W idle vs 90 mJ on the CPU (512-token prompts); CPU decode 0.81 J per token above idle vs 0.20 J on the NPU at half the speed (1.08 vs 0.73 J counting idle). Four simultaneous 400-550-token requests: 79 generated t/s aggregate with NPU prefill and CPU continuous batching; the same engine on the CPU alone reached 55 t/s in an earlier run (older build; not a same-session A/B).
 
@@ -89,7 +89,7 @@ Other measurements (Qwen3.5-2B, early build with stock NPU kernels): NPU prefill
 
 ### Changes to llama.cpp (`patches/`)
 
-- `ggml-hexagon` (NPU): fused element-wise kernels (sigmoid, conv block, norms, residual add in the matmul output), a faster MoE expert matmul (weight DMA overlapped with the activation gather, one gather for gate+up), causal key-block skipping in flash attention, and a 64-bit mapping-mask fix. New `test-backend-ops` cases cover the fused kernels, LFM-shaped expert matmuls and causal-mask attention; the mask fix is checked with the existing tests.
+- `ggml-hexagon` (NPU): fused element-wise kernels (sigmoid, conv block, norms, residual add in the matmul output), a streamed, pipelined MoE expert matmul (weight DMA overlapped with the activation gather, one gather for gate+up, matrix-unit work overlapped with dequant and scatter), causal key-block skipping in flash attention, and a 64-bit mapping-mask fix. New `test-backend-ops` cases cover the fused kernels, LFM-shaped expert matmuls and causal-mask attention; the mask fix is checked with the existing tests.
 - `ggml-cpu`: `CPU_HTPTILE` and `CPU_SHARED` buffer types, NEON kernels over NPU tiles, an i8mm kernel for 2-4-token speculative verification, a per-op and per-matmul-shape profiler (`GGML_CPU_PROF=N`), opt-in decode knobs (`GGML_GEMV_NOBAR`, `GGML_REPACK_CHUNKS`, `GGML_GEMV_PF`, default off).
 - `llama`: recurrent states read in place instead of copied each step; `llama_model_get_tensor()`; `LLAMA_MMAP_NO_PREFETCH`. `common`: `common_speculative_set_ctx_tgt()`, so speculative decoding can prefill on one context and verify on another.
 
