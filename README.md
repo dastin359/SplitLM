@@ -19,11 +19,18 @@ Full table with every chip, model and phase: https://claude.ai/artifact/WeygbBF4
 
 | Model | Tri-Lane TTFT | Tri-Lane decode | CPU only | NPU only |
 |---|---|---|---|---|
-| Qwen3.5-2B, 512-token prompt | **418 ms** | **55.9 t/s** | ~990 ms, 57 t/s | 401 ms, 28 t/s |
-| LFM2.5-24B-A2B (MoE), 512-token prompt | **1.47 s** | **49.7 t/s** | 2.56 s, 56.7 t/s | 1.40 s, 20.6 t/s |
-| Qwen3.8-27B (dense), 404-token prompt | **3.9 s** | **5.65 t/s** | ~12.6 s, 5.9 t/s | 3.85 s, 2.85 t/s |
+| Qwen3.5-2B, 404-token prompt | **0.30 s** | **57.5 t/s** | 0.80 s, 58.2 t/s | 0.29 s, 29.4 t/s |
+| Qwen3.5-2B, 3,328-token prompt | **2.12 s** | **51.2 t/s** | 8.27 s, 51.2 t/s | 2.11 s, 28.1 t/s |
+| LFM2.5-24B-A2B (MoE), 388-token prompt | **1.28 s** | **49.5 t/s** | 1.84 s, 50.2 t/s | 1.27 s, 19.9 t/s |
+| Qwen3.8-27B (dense) + MTP drafting, 344-token prompt | **4.8-5.4 s** | **8.7-8.9 t/s** | ~12.6 s, 5.6 t/s (10.4 with MTP) | 3.85 s, 2.85 t/s |
 
-Tri-Lane gets NPU-class time to first token and 88-98% of CPU decode speed. On LFM2.5-24B-A2B the split fits in **14.7 GB**, and on Qwen3.8-27B in **21 GB**, because the CPU reads the NPU's copy of the weights in place. Two copies would need about 27 GB and 30 GB.
+Tri-Lane gets NPU time to first token and CPU decode speed in the same request. On LFM2.5-24B-A2B the split fits in **14.7 GB**, and on Qwen3.8-27B in **19-20 GB**, because the CPU reads the NPU's copy of the weights in place (`CPU_HTPTILE`) and borrows its CPU-resident head and embeddings (`CPU_SHARED`). Two copies would need about 27 GB and 30 GB.
+
+Against Qualcomm's own runtime (GenieX 0.9.0, llama.cpp-based) on the byte-identical Qwen3.5-2B GGUF that AI Hub ships: NPU 0.41 s TTFT / 28.3 t/s, CPU 0.85 s / 47.7 t/s. Energy: NPU prefill costs 8 mJ per token vs 90 mJ on the CPU; CPU decode 0.81 J per token vs 0.21 J on the NPU (half the speed).
+
+How close to the hardware (details on the results page): NPU prefill reaches 38% of the 11.48 TFLOPS FP16 HMX peak on Qwen3.5-2B (was 29% with stock kernels); CPU decode streams 76-90 GB/s, 69-82% of the ~110 GB/s we could measure from DRAM.
+
+Concurrency: the server prefills on the NPU while the CPU decodes up to four sequences in one batch: 79 generated t/s aggregate for four simultaneous 400-550-token requests on Qwen3.5-2B, vs 55 for the same engine on the CPU alone. An optional NPU decode slot (`--npu-decode-slots 1`) lets the idle NPU decode a fifth sequence.
 
 ## How it works
 
@@ -69,6 +76,9 @@ API: `POST /v1/chat/completions` (OpenAI format, `stream: true` for SSE). An opt
 - `ggml/src/ggml-cpu/htp-tile.cpp`: the `CPU_HTPTILE` buffer type and NEON kernels (SDOT default, USDOT and scalar variants via `GGML_HTPTILE_KERNEL`).
 - `ggml/src/ggml-cpu/ggml-cpu.c`: per-op CPU profiler, enabled with `GGML_CPU_PROF=N`.
 - `src/llama-model.cpp`, `include/llama.h`: `llama_model_get_tensor()` and `LLAMA_MMAP_NO_PREFETCH` (so an aliased model's mmap does not pull the whole file into RAM).
+- `src/llama-graph.cpp`: recurrent states are read in place when every state comes from its own cell, instead of a GET_ROWS copy (+5% Qwen3.5 decode; `LLAMA_RS_NO_IDENT=1` disables).
+- `ggml/src/ggml-cpu/htp-tile.cpp`: `CPU_SHARED` buffer type (decode model borrows another model's CPU-resident weights) and an i8mm multi-token tile kernel for speculative verification (lane 2).
+- `ggml/src/ggml-hexagon/`: NPU prefill fusions: single-pass sigmoid for SILU/SWIGLU, fused conv block (CONCAT + SSM_CONV + SILU + state copy), RMS_NORM+SCALE, residual ADD inside the matmul output stage, batched short-row norms (lane 3). Tests in `tests/test-backend-ops.cpp`.
 
 ## Things we learned the hard way
 
@@ -80,7 +90,7 @@ API: `POST /v1/chat/completions` (OpenAI format, `stream: true` for SSE). An opt
 
 ## Limitations
 
-- One request at a time (no continuous batching yet).
+- Speculative decoding runs in `trilane-spec` (single stream); the multi-slot server does not draft yet.
 - Single-copy aliasing covers Q4_0 weights only. Qwen3.6-35B-A3B's IQ3_S experts cannot be tiled for the NPU.
 - CPU-lane prefill over aliased weights is a per-token GEMV, so dense aliased models always prefill on the NPU.
-- MTP speculative decoding is not integrated yet.
+- LFM2.5 on the fused NPU build shows a small logit shift against stock kernels (KLD 0.006, perplexity +0.66%); Qwen3.5-2B is unchanged (perplexity ratio 1.0008).
