@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tri-Lane</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #14161a; --muted: #5d6470; --line: #e3e6eb;
+  --npu: #7c3aed; --cpu: #0e9f6e; --gpu: #d97706; --hand: #e11d48; --accent: #2563eb;
+  --bubble-user: #e8efff; --bubble-bot: #f1f3f6; --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1115; --panel: #171a21; --ink: #e8eaee; --muted: #9aa3b2; --line: #272c36;
+          --npu: #a78bfa; --cpu: #34d399; --gpu: #fbbf24; --hand: #fb7185; --accent: #60a5fa;
+          --bubble-user: #1d2a44; --bubble-bot: #1f232c; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+header h1 span { color: var(--muted); font-weight: 500; }
+.badges { display: flex; gap: 8px; flex-wrap: wrap; }
+.badge { border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.badge b { color: var(--ink); font-weight: 600; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 16px; padding: 16px 20px; height: calc(100vh - 60px); }
+@media (max-width: 960px) { main { grid-template-columns: 1fr; height: auto; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; display: flex; flex-direction: column; min-height: 0; }
+.panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0; padding: 12px 14px 0; font-weight: 600; }
+#chat { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; min-height: 300px; }
+.msg { max-width: 92%; padding: 9px 12px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+.msg.user { align-self: flex-end; background: var(--bubble-user); }
+.msg.assistant { align-self: flex-start; background: var(--bubble-bot); }
+.msg .meta { display: block; margin-top: 6px; font-size: 11px; color: var(--muted); font-family: var(--mono); white-space: normal; }
+.composer { border-top: 1px solid var(--line); padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.composer textarea { width: 100%; min-height: 64px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 8px; font: inherit; background: var(--bg); color: var(--ink); }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.controls label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+select, input[type=number] { border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; background: var(--bg); color: var(--ink); font: inherit; }
+input[type=number] { width: 72px; }
+button { border: 0; border-radius: 8px; padding: 7px 14px; font: inherit; font-weight: 600; cursor: pointer; background: var(--accent); color: #fff; }
+button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+button:disabled { opacity: .5; cursor: default; }
+.right { gap: 0; overflow-y: auto; }
+.tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 12px 14px; }
+@media (max-width: 560px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.tile .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+.tile .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.tile .s { font-size: 12px; color: var(--muted); margin-top: 2px; }
+#lanes { margin: 4px 14px 0; border: 1px solid var(--line); border-radius: 10px; width: calc(100% - 28px); height: 150px; display: block; }
+.legend { display: flex; gap: 14px; padding: 6px 14px 0; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.phase { padding: 8px 14px 0; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+table { width: calc(100% - 28px); margin: 8px 14px 14px; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 5px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+th { color: var(--muted); font-weight: 600; }
+.tablewrap { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tri-Lane <span>· phase-split inference on Snapdragon X</span></h1>
+  <div class="badges" id="badges"></div>
+</header>
+<main>
+  <section class="panel">
+    <h2>Chat</h2>
+    <div id="chat"></div>
+    <div class="composer">
+      <textarea id="input" placeholder="Ask something… (Ctrl+Enter to send)"></textarea>
+      <div class="controls">
+        <label>Lanes
+          <select id="route">
+            <option value="auto">Tri-Lane (NPU prefill → CPU decode)</option>
+            <option value="npu">NPU only</option>
+            <option value="cpu">CPU only</option>
+          </select>
+        </label>
+        <label>Max tokens <input id="maxtok" type="number" value="256" min="1" max="4096"></label>
+        <label>Temp <input id="temp" type="number" value="0.7" min="0" max="2" step="0.1"></label>
+        <span style="flex:1"></span>
+        <button class="ghost" id="longprompt" title="Paste a long document to show NPU prefill">+ long doc</button>
+        <button class="ghost" id="clear">New chat</button>
+        <button id="send">Send</button>
+      </div>
+    </div>
+  </section>
+  <section class="panel right">
+    <h2>Last request</h2>
+    <div class="tiles">
+      <div class="tile"><div class="k">Time to first token</div><div class="v" id="t-ttft">–</div><div class="s" id="s-ttft">&nbsp;</div></div>
+      <div class="tile"><div class="k">Prefill</div><div class="v" id="t-pre">–</div><div class="s" id="s-pre">&nbsp;</div></div>
+      <div class="tile"><div class="k">Decode</div><div class="v" id="t-dec">–</div><div class="s" id="s-dec">&nbsp;</div></div>
+      <div class="tile"><div class="k">Prefix cache</div><div class="v" id="t-cache">–</div><div class="s" id="s-cache">&nbsp;</div></div>
+      <div class="tile"><div class="k">NPU → CPU handoff</div><div class="v" id="t-hand">–</div><div class="s" id="s-hand">&nbsp;</div></div>
+      <div class="tile"><div class="k">Generated</div><div class="v" id="t-gen">–</div><div class="s" id="s-gen">&nbsp;</div></div>
+    </div>
+    <h2>Lanes (last 60 s)</h2>
+    <canvas id="lanes"></canvas>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--npu)"></span>NPU (Hexagon)</span>
+      <span><span class="dot" style="background:var(--cpu)"></span>CPU (Oryon)</span>
+      <span><span class="dot" style="background:var(--hand)"></span>state handoff</span>
+      <span>filled = prefill, striped = decode</span>
+    </div>
+    <div class="phase" id="phase">phase: idle</div>
+    <h2 style="margin-top:10px">History</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>#</th><th>route</th><th>prompt</th><th>cached</th><th>prefill</th><th>TTFT ms</th><th>prefill t/s</th><th>decode t/s</th><th>gen</th></tr></thead>
+        <tbody id="hist"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let messages = [];
+let busy = false;
+let stats = null;
+let clockOffset = 0; // engine clock - performance.now()
+
+function fmt(n, d = 0) { return (n === undefined || n === null || isNaN(n)) ? '–' : Number(n).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d }); }
+function devName(d) { return !d ? '' : d.startsWith('HTP') ? 'NPU' : d.startsWith('GPU') ? 'GPU' : d; }
+
+function addMsg(role, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  $('chat').appendChild(div);
+  $('chat').scrollTop = $('chat').scrollHeight;
+  return div;
+}
+
+function showLast(s) {
+  if (!s) return;
+  $('t-ttft').textContent = fmt(s.ttft_ms) + ' ms';
+  $('s-ttft').textContent = `${s.n_prefill} tokens prefilled`;
+  $('t-pre').textContent = fmt(s.prefill_tps) + ' t/s';
+  $('s-pre').textContent = `on ${devName(s.prefill_dev)} · ${fmt(s.prefill_ms)} ms`;
+  $('t-dec').textContent = fmt(s.decode_tps, 1) + ' t/s';
+  $('s-dec').textContent = `on ${devName(s.decode_dev)}`;
+  $('t-cache').textContent = s.n_cached > 0 ? fmt(s.n_cached) + ' tok' : 'miss';
+  $('s-cache').textContent = `of ${fmt(s.n_prompt)} prompt tokens`;
+  $('t-hand').textContent = s.handoff_mb > 0 ? fmt(s.handoff_ms, 1) + ' ms' : '–';
+  $('s-hand').textContent = s.handoff_mb > 0 ? `${fmt(s.handoff_mb, 1)} MB of KV + state` : 'same device';
+  $('t-gen').textContent = fmt(s.n_gen) + ' tok';
+  $('s-gen').textContent = `route: ${s.route} · ${s.stop}`;
+}
+
+async function send() {
+  const text = $('input').value.trim();
+  if (!text || busy) return;
+  busy = true; $('send').disabled = true;
+  $('input').value = '';
+  messages.push({ role: 'user', content: text });
+  addMsg('user', text.length > 1200 ? text.slice(0, 1200) + ` … [${text.length} chars]` : text);
+  const bot = addMsg('assistant', '');
+  let reply = '';
+  try {
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages, stream: true, max_tokens: +$('maxtok').value, temperature: +$('temp').value, trilane: { route: $('route').value } }),
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', last = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (data === '[DONE]') continue;
+        const j = JSON.parse(data);
+        const d = j.choices?.[0]?.delta?.content;
+        if (d) { reply += d; bot.textContent = reply; $('chat').scrollTop = $('chat').scrollHeight; }
+        if (j.trilane) last = j.trilane;
+      }
+    }
+    if (last) {
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = `${devName(last.prefill_dev)} prefill ${fmt(last.prefill_tps)} t/s · TTFT ${fmt(last.ttft_ms)} ms · ${devName(last.decode_dev)} decode ${fmt(last.decode_tps, 1)} t/s` + (last.n_cached ? ` · cache hit ${last.n_cached} tok` : '');
+      bot.appendChild(meta);
+      showLast(last);
+    }
+    messages.push({ role: 'assistant', content: reply });
+  } catch (e) {
+    bot.textContent = 'Error: ' + e;
+  }
+  busy = false; $('send').disabled = false;
+  poll();
+}
+
+function drawLanes() {
+  const cv = $('lanes');
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const css = getComputedStyle(document.documentElement);
+  const col = (v) => css.getPropertyValue(v).trim();
+  const lanes = [['NPU', col('--npu')], ['CPU', col('--cpu')]];
+  const left = 44, laneH = (H - 24) / 2, span = 60000;
+  const now = performance.now() + clockOffset;
+  g.font = '11px system-ui'; g.fillStyle = col('--muted');
+  lanes.forEach(([name], i) => { g.fillText(name, 8, 14 + i * laneH + laneH / 2); });
+  g.strokeStyle = col('--line');
+  for (let s = 0; s <= 60; s += 10) {
+    const x = left + (W - left - 8) * (1 - s / 60);
+    g.beginPath(); g.moveTo(x, 6); g.lineTo(x, H - 16); g.stroke();
+    g.fillText(s === 0 ? 'now' : `-${s}s`, x - 10, H - 4);
+  }
+  const X = (t) => left + (W - left - 8) * (1 - (now - t) / span);
+  const laneOf = (d) => d && d.startsWith('HTP') ? 0 : 1;
+  function bar(lane, t0, t1, color, striped) {
+    if (t1 < now - span) return;
+    const x0 = Math.max(left, X(t0)), x1 = Math.max(x0 + 2, X(t1));
+    const y = 8 + lane * laneH, h = laneH - 10;
+    g.fillStyle = color;
+    if (!striped) { g.fillRect(x0, y, x1 - x0, h); return; }
+    g.globalAlpha = 0.35; g.fillRect(x0, y, x1 - x0, h); g.globalAlpha = 1;
+    g.save(); g.beginPath(); g.rect(x0, y, x1 - x0, h); g.clip();
+    g.strokeStyle = color; g.lineWidth = 2;
+    for (let sx = x0 - h; sx < x1; sx += 7) { g.beginPath(); g.moveTo(sx, y + h); g.lineTo(sx + h, y); g.stroke(); }
+    g.restore();
+  }
+  for (const s of (stats?.history || [])) {
+    const t0 = s.t_start_ms, tp = t0 + s.prefill_ms, th = tp + s.handoff_ms, te = th + s.decode_ms;
+    bar(laneOf(s.prefill_dev), t0, tp, lanes[laneOf(s.prefill_dev)][1], false);
+    if (s.handoff_mb > 0) { g.fillStyle = col('--hand'); g.fillRect(X(tp), 8, 2, H - 26); }
+    bar(laneOf(s.decode_dev), th, te, lanes[laneOf(s.decode_dev)][1], true);
+  }
+  requestAnimationFrame(drawLanes);
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/stats');
+    stats = await r.json();
+    clockOffset = stats.now_ms - performance.now();
+    $('phase').textContent = 'phase: ' + stats.phase;
+    $('badges').innerHTML = [
+      `<span class="badge"><b>${stats.model}</b></span>`,
+      `<span class="badge"><span class="dot" style="background:var(--npu)"></span>prefill <b>${stats.split ? 'NPU ' + stats.prefill_dev : 'CPU'}</b></span>`,
+      `<span class="badge"><span class="dot" style="background:var(--cpu)"></span>decode <b>CPU</b></span>`,
+      stats.aliased ? `<span class="badge">experts <b>single copy</b> (CPU reads NPU memory)</span>` : '',
+      `<span class="badge">prefix cache <b>${stats.cache.entries}</b> · ${fmt(stats.cache.mb)} MB</span>`,
+      stats.split ? `<span class="badge">NPU keep-warm <b>${fmt(stats.keepwarm_pings)}</b> pings</span>` : '',
+    ].join('');
+    const h = stats.history.slice(-12).reverse();
+    $('hist').innerHTML = h.map(s => `<tr><td>${s.id}</td><td>${s.route}</td><td>${s.n_prompt}</td><td>${s.n_cached}</td><td>${devName(s.prefill_dev)}</td><td>${fmt(s.ttft_ms)}</td><td>${fmt(s.prefill_tps)}</td><td>${fmt(s.decode_tps, 1)}</td><td>${s.n_gen}</td></tr>`).join('');
+    if (!busy && stats.history.length) showLast(stats.history[stats.history.length - 1]);
+  } catch (e) { /* server restarting */ }
+}
+
+const LONG_DOC = `Summarize the following report in five bullet points.\n\n` + Array.from({ length: 14 }, (_, i) =>
+  `Section ${i + 1}. The engineering team evaluated where each phase of language-model inference runs best on a laptop system-on-chip. ` +
+  `Prompt processing multiplies every weight matrix by hundreds of token vectors at once, so it is limited by arithmetic throughput, which favors the neural processing unit and its matrix engine. ` +
+  `Token generation multiplies each weight matrix by a single vector, so it is limited by memory bandwidth and per-operation overhead, which favors the CPU cores. ` +
+  `Moving the attention cache and recurrent state between the two takes a few milliseconds because all processors share the same memory.`).join('\n\n');
+
+$('send').onclick = send;
+$('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send(); });
+$('clear').onclick = () => { messages = []; $('chat').innerHTML = ''; };
+$('longprompt').onclick = () => { $('input').value = LONG_DOC; $('input').focus(); };
+setInterval(() => { if (!busy) poll(); }, 1000);
+poll();
+requestAnimationFrame(drawLanes);
+</script>
+</body>
+</html>

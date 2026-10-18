@@ -13,4 +13,5 @@ cmake -S "%ROOT%." -B "%ROOT%build" -G Ninja ^
 cmake --build "%ROOT%build" || exit /b 1
 rem run next to the llama/ggml DLLs
 copy /y "%ROOT%build\*.exe" "%PKG%\bin\" >nul
+copy /y "%ROOT%ui\trilane-ui.html" "%PKG%\bin\" >nul
 echo BUILD OK
