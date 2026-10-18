@@ -1521,7 +1521,7 @@ index 2632ae3..662e7f1 100644
          int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
  
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 605c23c..84e7760 100644
+index 605c23c..5aebd8d 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -152,6 +152,9 @@ static size_t opt_mbuf_total  = 0;                        // total buffer space
@@ -1540,7 +1540,7 @@ index 605c23c..84e7760 100644
  static int opt_opfusion  = 1;    // enable/disable op fusion
 +static int opt_mm_add_ddr = 0;
 +static int opt_mm_min_nchunks = 0; // HMX 2D matmuls: split N into at least this many chunks (0 = solver choice)
-+static int opt_mmid_stream = 1;    // HMX MUL_MAT_ID(_NX): 1 = streamed expert kernel (async HMX, double buffers), 0 = per-expert synchronous kernel
++static int opt_mmid_stream = 3;    // HMX MUL_MAT_ID(_NX): HTP_MMID_STREAM* bits (1 = streamed expert kernel, +2 activation gather via DMA), 0 = per-expert synchronous kernel
 +static int opt_nx_swiglu = 0;      // 1: SWIGLU in the gate/up MUL_MAT_NX epilogue (slower on v73: HVX is busy dequantizing)
 +static int opt_conv_cb = 0;  // short-conv block: channels per block (0 = 128)
 +static int opt_conv_tt = 0;  // short-conv block: tokens per time tile (0 = as many as fit)
@@ -1884,7 +1884,7 @@ index 605c23c..84e7760 100644
      kparams->n_hmx = 1;
 -    kparams->pipeline = pipeline ? 1 : 0;
 +    // matmul-id: the flag selects the streamed expert kernel (the solver above still plans the synchronous one)
-+    kparams->pipeline = is_matmul_id ? (opt_mmid_stream ? 1 : 0) : (pipeline ? 1 : 0);
++    kparams->pipeline = is_matmul_id ? (uint8_t) (opt_mmid_stream & 3) : (pipeline ? 1 : 0);
      kparams->m_chunk = m_chunk;
      kparams->n_chunk = n_chunk;
      kparams->n_threads = n_threads;
@@ -4070,7 +4070,7 @@ index b72ef2b..a0ca32f 100644
                  drop_mmap(ctx, ctx->mmap + i);
              }
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index 9af3129..fd26a10 100644
+index 9af3129..849c0b5 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -1978,7 +1978,7 @@ static void transfer_output_chunk_worker_fn(unsigned int n, unsigned int i, void
@@ -4446,7 +4446,7 @@ index 9af3129..fd26a10 100644
          FARF(ERROR, "hmx-mm-id-2d: VTCM too small : m %d k %d n %d budget %zu", m_core_padded, k, n, vtcm_budget);
          return -1;
      }
-@@ -3603,62 +3757,568 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3603,62 +3757,682 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
      htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
  
      hmx_matmul_job_t job;
@@ -4630,16 +4630,9 @@ index 9af3129..fd26a10 100644
 +// past the M-chunk. The synchronous kernel lets that spill into its idle output area; here the next buffer is
 +// live (the other activation buffer or a pending output), so each activation buffer gets one spare tile row.
 +#define HMX_MMID_ACT_SLACK_ROWS 32
- 
--            // Start weight DMA for the next chunk early
--            const size_t nc_next = nc + n_chunk_n_cols;
--            if (nc_next < (size_t) n) {
--                const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
--                const uint32_t height_next = is_tiled ? hmx_ceil_div(n_cols_next, 32) * n_weight_tiles : n_cols_next;
--                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[(i + 1) % 2], weight + nc_next * weight_stride),
--                               dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
-+static inline size_t hmx_mmid_stream_vtcm_size(size_t mc, size_t nc, size_t w_col_bytes, size_t vec_dot_size) {
-+    return 2 * hex_align_up(nc * w_col_bytes, HTP_MM_HMX_TILE_SIZE) +
++
++static inline size_t hmx_mmid_stream_vtcm_size(size_t mc, size_t nc, size_t w_col_bytes, size_t vec_dot_size, size_t fixed) {
++    return fixed + 2 * hex_align_up(nc * w_col_bytes, HTP_MM_HMX_TILE_SIZE) +
 +           2 * hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE) +
 +           2 * hex_align_up((mc + HMX_MMID_ACT_SLACK_ROWS) * vec_dot_size, HTP_MM_HMX_TILE_SIZE) +
 +           2 * hex_align_up(mc * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE) + 256;
@@ -4648,7 +4641,8 @@ index 9af3129..fd26a10 100644
 +// (M-chunk, N-chunk) for the whole op. HVX dequant is the bottleneck, so the estimate counts dequant work
 +// (repeated for every M-chunk of an expert) plus a fixed cost per item (thread dispatch, HMX job).
 +static int hmx_mmid_stream_plan(size_t budget, const uint32_t * row_counts, uint32_t n_as, int n_w, int k, int n,
-+                                size_t w_col_bytes, size_t vec_dot_size, size_t * mc_out, size_t * nc_out, size_t * used_out) {
++                                size_t w_col_bytes, size_t vec_dot_size, size_t fixed,
++                                size_t * mc_out, size_t * nc_out, size_t * used_out) {
 +    int max_m = 0;
 +    for (uint32_t a = 0; a < n_as; ++a) {
 +        max_m = hex_smax(max_m, (int) row_counts[a]);
@@ -4663,23 +4657,27 @@ index 9af3129..fd26a10 100644
 +    size_t   best_mc = 0, best_nc = 0, best_used = 0;
 +    for (int nc = n; nc >= 32; nc -= 32) {
 +        size_t mc = hex_align_down((size_t) max_m, 32);
-+        while (mc >= 32 && hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size) > budget) {
++        while (mc >= 32 && hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size, fixed) > budget) {
 +            mc -= 32;
 +        }
 +        if (mc < 32) continue;
 +
-+        const int n_chunks = (n + nc - 1) / nc;
-+        uint64_t cost = 0;
++        // M-chunks over all experts in 32-row tiles (32-bit divisions only; the per-item factor is the same
++        // for every expert)
++        const uint32_t mt = (uint32_t) (mc / 32);
++        uint32_t m_chunks = 0;
++#pragma clang loop vectorize(disable) unroll(disable)
 +        for (uint32_t a = 0; a < n_as; ++a) {
-+            if (row_counts[a] == 0) continue;
-+            const uint64_t m_chunks = (hex_align_up((int) row_counts[a], 32) + mc - 1) / mc;
-+            cost += m_chunks * (uint64_t) n_w * ((uint64_t) n * k * dq_ps_per_elem + (uint64_t) n_chunks * item_ps);
++            const uint32_t t = (row_counts[a] + 31) / 32;
++            m_chunks += (t + mt - 1) / mt;
 +        }
++        const uint32_t n_chunks = (uint32_t) (n + nc - 1) / (uint32_t) nc;
++        const uint64_t cost = (uint64_t) m_chunks * (uint64_t) n_w * ((uint64_t) n * k * dq_ps_per_elem + (uint64_t) n_chunks * item_ps);
 +        if (cost < best_cost || (cost == best_cost && mc * nc > best_mc * best_nc)) {
 +            best_cost = cost;
 +            best_mc   = mc;
 +            best_nc   = nc;
-+            best_used = hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size);
++            best_used = hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size, fixed);
 +        }
 +    }
 +    if (best_mc == 0) return -1;
@@ -4694,8 +4692,16 @@ index 9af3129..fd26a10 100644
 +// dynamically and interleaved by type, so memory-bound (gather, scatter) and VTCM-bound (dequant) tasks run
 +// on different HVX threads at the same time.
 +enum { HMX_MMID_T_GATHER = 0, HMX_MMID_T_SCATTER = 1, HMX_MMID_T_DEQUANT = 2 };
-+
+ 
+-            // Start weight DMA for the next chunk early
+-            const size_t nc_next = nc + n_chunk_n_cols;
+-            if (nc_next < (size_t) n) {
+-                const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
+-                const uint32_t height_next = is_tiled ? hmx_ceil_div(n_cols_next, 32) * n_weight_tiles : n_cols_next;
+-                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[(i + 1) % 2], weight + nc_next * weight_stride),
+-                               dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
 +#define HMX_MMID_MAX_TASKS 96
++#define HMX_MMID_DMA_PAIRS 4   // row pairs in flight per thread in the DMA gather
 +#define HMX_MMID_MAX_G     24  // gather tasks: multiples of 32 rows (the tile padding stays inside the task)
 +#define HMX_MMID_MAX_S     32  // scatter tasks: multiples of 16 rows
 +#define HMX_MMID_MAX_D     32  // dequant tasks
@@ -4706,6 +4712,13 @@ index 9af3129..fd26a10 100644
 +    uint32_t                        n_tasks;
 +    uint8_t                         type[HMX_MMID_MAX_TASKS];
 +    uint8_t                         idx[HMX_MMID_MAX_TASKS];
++
++    // gather tasks of the DMA threads (1..n-1): own counter; thread 0 keeps its DMA queue for the weights
++    struct htp_context            * ctx;
++    atomic_uint                     g_next;
++    uint32_t                        n_g_dma;
++    float                         * dma_ring;        // per thread (index i - 1): 2 * HMX_MMID_DMA_PAIRS rows of k
++    size_t                          dma_ring_floats;
 +
 +    const struct mmid_row_mapping * matrix_rows;
 +    uint32_t                        mapping_stride;
@@ -4727,10 +4740,97 @@ index 9af3129..fd26a10 100644
 +    tiled_dequantize_state_t        dq;
 +} hmx_mmid_hvx_step_t;
 +
++// Gather of `rows` activation rows (fp32, DDR) into fp16 HMX tiles through this thread's DMA queue: the rows
++// are fetched HMX_MMID_DMA_PAIRS pairs ahead into a VTCM ring, so HVX converts from VTCM instead of waiting on
++// DDR loads. Same conversion and tile layout as transfer_activation_chunk_fp32_to_fp16_gathered(_flat); the
++// padding rows of the last tile are left as they are (their HMX output rows are never stored).
++static void hmx_mmid_gather_dma(dma_queue * q, float * ring, __fp16 * vtcm_dst, const float * src,
++                                uint32_t start_row, uint32_t vtcm_start_row, uint32_t rows, uint32_t k_block,
++                                const struct mmid_row_mapping * matrix_rows, uint32_t cur_a, uint32_t mapping_stride,
++                                uint32_t ne11, const struct fastdiv_values * ne11_div, size_t nb11, size_t nb12,
++                                uint32_t k_valid) {
++    const struct mmid_row_mapping * map = matrix_rows + (size_t) cur_a * mapping_stride + start_row;
++    const uint32_t n_pairs   = (rows + 1) / 2;
++    const size_t   row_bytes = (size_t) k_valid * sizeof(float);
++
++#define HMX_MMID_ROW_SRC(r) ((dma_addr_t) ((const uint8_t *) src + \
++        (ne11 > 1 ? fastmodulo(map[(r)].i1, ne11, ne11_div) : 0) * nb11 + (size_t) map[(r)].i2 * nb12))
++#define HMX_MMID_PUSH_PAIR(pp) do {                                                                      \
++        float * d0 = ring + (size_t) (2 * ((pp) % HMX_MMID_DMA_PAIRS)) * k_block;                        \
++        dma_queue_push(q, dma_make_data(d0, HMX_MMID_ROW_SRC(2 * (pp))), row_bytes, row_bytes, row_bytes, 1); \
++        if (2 * (pp) + 1 < rows) {                                                                       \
++            dma_queue_push(q, dma_make_data(d0 + k_block, HMX_MMID_ROW_SRC(2 * (pp) + 1)),               \
++                           row_bytes, row_bytes, row_bytes, 1);                                           \
++        }                                                                                                \
++    } while (0)
++
++    uint32_t pushed = 0;
++    for (; pushed < n_pairs && pushed < HMX_MMID_DMA_PAIRS; ++pushed) {
++        HMX_MMID_PUSH_PAIR(pushed);
++    }
++
++    for (uint32_t p = 0; p < n_pairs; ++p) {
++        const bool has1 = (2 * p + 1 < rows);
++        dma_queue_pop(q);
++        if (has1) dma_queue_pop(q);
++
++        const float * row0 = ring + (size_t) (2 * (p % HMX_MMID_DMA_PAIRS)) * k_block;
++        const float * row1 = row0 + k_block;
++
++        const uint32_t lr = vtcm_start_row + 2 * p;          // vtcm-local row
++        const uint32_t r0 = lr / HTP_MM_HMX_TILE_N_ROWS;     // tile row index
++        const uint32_t r1 = lr % HTP_MM_HMX_TILE_N_ROWS;     // intra-tile row idx
++        HVX_Vector * tile_row = (HVX_Vector *) (vtcm_dst + (size_t) r0 * (k_block / HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS);
++
++        uint32_t c = 0;
++        for (; c + 32 <= k_valid; c += 32) {
++            HVX_Vector v0 = *(const HVX_Vector *) (row0 + c);
++            HVX_Vector v1 = has1 ? *(const HVX_Vector *) (row1 + c) : Q6_V_vzero();
++            tile_row[(c / HTP_MM_HMX_TILE_N_COLS) * (HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16) / VLEN) + r1 / 2] =
++                hvx_vec_f32_to_f16_shuff(v0, v1);
++        }
++        if (c < k_block) {
++            HVX_Vector v0 = *(const HVX_Vector *) (row0 + c);
++            HVX_Vector v1 = has1 ? *(const HVX_Vector *) (row1 + c) : Q6_V_vzero();
++            uint32_t rem = k_valid - c;
++            HVX_VectorPred mask = Q6_Q_vsetq2_R(rem > 0 ? rem * sizeof(float) : 0);
++            v0 = Q6_V_vmux_QVV(mask, v0, Q6_V_vzero());
++            v1 = Q6_V_vmux_QVV(mask, v1, Q6_V_vzero());
++            tile_row[(c / HTP_MM_HMX_TILE_N_COLS) * (HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16) / VLEN) + r1 / 2] =
++                hvx_vec_f32_to_f16_shuff(v0, v1);
++        }
++
++        if (pushed < n_pairs) {  // into the slot just converted
++            HMX_MMID_PUSH_PAIR(pushed);
++            ++pushed;
++        }
++    }
++#undef HMX_MMID_PUSH_PAIR
++#undef HMX_MMID_ROW_SRC
++}
++
 +static void hmx_mmid_hvx_step_worker(unsigned int n, unsigned int i, void * data) {
 +    (void) n;
 +    hmx_mmid_hvx_step_t * st = (hmx_mmid_hvx_step_t *) data;
 +    struct htp_thread_trace * tr = &st->traces[i];
++
++    if (i > 0 && st->n_g_dma > 0) {
++        dma_queue * q    = st->ctx->dma[i];
++        float *     ring = st->dma_ring + (size_t) (i - 1) * st->dma_ring_floats;
++        for (;;) {
++            const uint32_t j = atomic_fetch_add(&st->g_next, 1);
++            if (j >= st->n_g_dma) break;
++            const uint32_t r0 = j * st->g_task_rows;
++            int rows = (int) st->g_cne1 - (int) (st->g_mr + r0);  // signed: hex_smin is unsigned
++            if (rows > (int) st->g_task_rows) rows = (int) st->g_task_rows;
++            if (rows <= 0) continue;
++            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, j);
++            hmx_mmid_gather_dma(q, ring, st->g_dst, st->g_src, st->g_mr + r0, r0, (uint32_t) rows, st->k,
++                                st->matrix_rows, st->g_a, st->mapping_stride, st->ne11, &st->ne11_div,
++                                st->nb11, st->nb12, st->k_valid);
++            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, j);
++        }
++    }
 +
 +    for (;;) {
 +        const uint32_t t = atomic_fetch_add(&st->next, 1);
@@ -4755,7 +4855,7 @@ index 9af3129..fd26a10 100644
 +                }
 +                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, j);
 +                break;
-             }
++            }
 +            case HMX_MMID_T_SCATTER: {
 +                const uint32_t r0 = j * st->s_task_rows;
 +                int rows = (int) st->s_n_rows - (int) r0;
@@ -4767,7 +4867,7 @@ index 9af3129..fd26a10 100644
 +                    st->matrix_rows, st->s_a, st->mapping_stride, st->s_nb1, st->s_nb2, st->s_cne1);
 +                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, j);
 +                break;
-+            }
+             }
 +            default: {
 +                const uint32_t start = j * st->dq.n_tiles_per_task;
 +                const uint32_t end   = hex_smin(start + st->dq.n_tiles_per_task, st->dq.n_tot_tiles);
@@ -4786,7 +4886,10 @@ index 9af3129..fd26a10 100644
 -            hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
 -            hmx_queue_pop(ctx->hmx_queue);
 +// task list: memory-bound tasks first and spread out, dequant tasks in between
-+static void hmx_mmid_hvx_step_build(hmx_mmid_hvx_step_t * st, uint32_t n_g, uint32_t n_s, uint32_t n_d) {
++static void hmx_mmid_hvx_step_build(hmx_mmid_hvx_step_t * st, uint32_t n_g, uint32_t n_s, uint32_t n_d, bool dma_gather) {
++    st->n_g_dma = dma_gather ? n_g : 0;
++    atomic_store(&st->g_next, 0);
++    if (dma_gather) n_g = 0;
 +    uint32_t g = 0, s = 0, d = 0, t = 0;
 +    assert(n_g <= HMX_MMID_MAX_G && n_s <= HMX_MMID_MAX_S && n_d <= HMX_MMID_MAX_D);
 +    while (g < n_g || s < n_s || d < n_d) {
@@ -4821,7 +4924,8 @@ index 9af3129..fd26a10 100644
 +                                uint32_t n_as,
 +                                const struct mmid_row_mapping *matrix_rows,
 +                                int mapping_stride,
-+                                int n_threads) {
++                                int n_threads,
++                                uint32_t flags) {  // HTP_MMID_STREAM_* bits
 +    struct htp_thread_trace * tr = &ctx->trace[0];
 +
 +    if (n_w <= 0) return 1;
@@ -4830,7 +4934,11 @@ index 9af3129..fd26a10 100644
 +    for (int w = 0; w < n_w; ++w) {
 +        if (!hex_is_aligned(dsts[w], VLEN)) return 1;
 +    }
-+
+ 
+-            // D: Output Store
+-            transfer_output_chunk_scattered_threaded(
+-                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
+-                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
 +    const size_t row_stride = htp_tensor_get_row_size(weight_type, k);
 +    if (row_stride == 0) return 1;
 +
@@ -4851,8 +4959,14 @@ index 9af3129..fd26a10 100644
 +    const uint32_t dma_width_bytes = is_tiled ? tile_size : row_stride;
 +    const size_t   w_col_bytes     = is_tiled ? (size_t) (n_weight_tiles * aligned_tile_size) / 32 : row_stride;
 +
++    // DMA gather rings for worker threads 1..n-1 (thread 0's DMA queue carries the weights)
++    const bool   dma_gather      = (n_threads > 1) && (flags & HTP_MMID_STREAM_DMA_GATHER);
++    const size_t dma_ring_floats = (size_t) 2 * HMX_MMID_DMA_PAIRS * k;
++    const size_t dma_ring_size   = dma_gather ? hex_align_up((size_t) (n_threads - 1) * dma_ring_floats * sizeof(float), HTP_MM_HMX_TILE_SIZE) : 0;
++
 +    size_t mc = 0, nc = 0, vtcm_used = 0;
-+    if (hmx_mmid_stream_plan(ctx->vtcm_size, row_counts, n_as, n_w, k, n, w_col_bytes, vec_dot_size, &mc, &nc, &vtcm_used)) {
++    if (hmx_mmid_stream_plan(ctx->vtcm_size, row_counts, n_as, n_w, k, n, w_col_bytes, vec_dot_size, dma_ring_size,
++                             &mc, &nc, &vtcm_used)) {
 +        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 +        return 1;
 +    }
@@ -4872,6 +4986,7 @@ index 9af3129..fd26a10 100644
 +    for (int b = 0; b < 2; ++b) act_bufs[b] = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, act_size);
 +    for (int b = 0; b < 2; ++b) out_bufs[b] = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, out_size);
 +    __fp16 * vtcm_scales = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
++    float *  dma_ring    = dma_gather ? (float *) vtcm_seq_alloc(&vtcm_ptr, dma_ring_size) : NULL;
 +
 +    if ((size_t) (vtcm_ptr - (uint8_t *) ctx->vtcm_base) > ctx->vtcm_size) {
 +        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
@@ -4906,7 +5021,10 @@ index 9af3129..fd26a10 100644
 +    }
 +
 +    hmx_mmid_hvx_step_t step;
-+    step.traces         = ctx->trace;
++    step.traces          = ctx->trace;
++    step.ctx             = ctx;
++    step.dma_ring        = dma_ring;
++    step.dma_ring_floats = dma_ring_floats;
 +    step.matrix_rows    = matrix_rows;
 +    step.mapping_stride = (uint32_t) mapping_stride;
 +    step.g_src          = activation;
@@ -4981,7 +5099,7 @@ index 9af3129..fd26a10 100644
 +            step.s_nb2    = o->nb2;
 +            step.s_task_rows = 16 * hmx_ceil_div((uint32_t) o->n_rows, 16 * HMX_MMID_MAX_S);
 +            n_s = hmx_ceil_div((uint32_t) o->n_rows, step.s_task_rows);
-+        }
+         }
 +        {
 +            const uint32_t n_tot_tiles = (uint32_t) hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS) * n_weight_tiles;
 +            dq->dst              = wf_bufs[item % 2];
@@ -4991,7 +5109,7 @@ index 9af3129..fd26a10 100644
 +            dq->n_tiles_per_task = hmx_ceil_div(n_tot_tiles, 2 * (uint32_t) n_threads);
 +            dq->n_tasks          = hmx_ceil_div(n_tot_tiles, dq->n_tiles_per_task);
 +        }
-+        hmx_mmid_hvx_step_build(&step, n_g, n_s, dq->n_tasks);
++        hmx_mmid_hvx_step_build(&step, n_g, n_s, dq->n_tasks, dma_gather);
 +        if (n_threads > 1) {
 +            worker_pool_run_func(ctx->worker_pool, hmx_mmid_hvx_step_worker, &step, n_threads);
 +        } else {
@@ -5002,16 +5120,12 @@ index 9af3129..fd26a10 100644
 +            pend[0] = pend[1];
 +            n_pend  = 1;
 +        }
- 
--            // D: Output Store
--            transfer_output_chunk_scattered_threaded(
--                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
--                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
++
 +        // the raw buffer is free again: weight chunk of item + 2
 +        if (ahead.valid) {
 +            HMX_MMID_DMA_PUSH(ahead, curr_raw);
 +            hmx_mmid_pos_advance(&ahead, n_w, n_chunk_cnt, (int) mc);
-         }
++        }
 +
 +        hmx_matmul_job_init(&job_slots[item % 2], out_bufs[item % 2], act_bufs[seg % 2], wf_bufs[item % 2], vtcm_scales,
 +                            hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS), hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS),
@@ -5030,8 +5144,8 @@ index 9af3129..fd26a10 100644
 +
 +        hmx_mmid_pos_advance(&cur, n_w, n_chunk_cnt, (int) mc);
 +        ++item;
-     }
- 
++    }
++
 +    // epilogue: the last one or two items, oldest first
 +    for (int p = 0; p < n_pend; ++p) {
 +        hmx_queue_pop(ctx->hmx_queue);
@@ -5040,15 +5154,15 @@ index 9af3129..fd26a10 100644
 +        transfer_output_chunk_scattered_threaded(
 +            ctx, o->dst, out_bufs[it % 2], o->mr, o->n_rows, o->n_cols,
 +            matrix_rows, o->a, mapping_stride, o->nb1, o->nb2, o->cne1, n_threads);
-+    }
-+
+     }
+ 
 +#undef HMX_MMID_DMA_PUSH
 +#undef HMX_MMID_DMA_HEIGHT
 +
      return 0;
  }
  
-@@ -3857,43 +4517,89 @@ static int hmx_mm_op_matmul_id(
+@@ -3857,43 +4631,89 @@ static int hmx_mm_op_matmul_id(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -5060,7 +5174,7 @@ index 9af3129..fd26a10 100644
 +    const size_t       dst_nb1[1] = { nb1 };
 +    const size_t       dst_nb2[1] = { nb2 };
 +
-+    if (kparams->pipeline && octx->ctx->mdev.count <= 1) {
++    if ((kparams->pipeline & HTP_MMID_STREAM) && octx->ctx->mdev.count <= 1) {
 +        const dma_addr_t w_data[1] = { (dma_addr_t) src0->data };
 +        const size_t     w_nb2[1]  = { nb02 };
 +        const int ret = hmx_mm_id_stream_f32(octx->ctx, octx->ctx->dma[0], 1, dsts, dst_nb1, dst_nb2, w_data, w_nb2,
@@ -5068,7 +5182,7 @@ index 9af3129..fd26a10 100644
 +                                             (int) src0->nb[1], (int) src0->type,
 +                                             kparams->tile_size, kparams->aligned_tile_size,
 +                                             matrix_row_counts, (uint32_t) n_as, matrix_rows, mmctx->mapping_stride,
-+                                             (int) octx->n_threads);
++                                             (int) octx->n_threads, kparams->pipeline);
 +        if (ret == 0) {
 +            return HTP_STATUS_OK;
 +        }
@@ -5170,7 +5284,7 @@ index 9af3129..fd26a10 100644
  
      return HTP_STATUS_OK;
  }
-@@ -4016,49 +4722,126 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -4016,49 +4836,126 @@ static int hmx_mm_op_matmul_id_nx(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -5217,7 +5331,7 @@ index 9af3129..fd26a10 100644
 -            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_padded, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
 -            m_start = (int) range.start;
 -            m_end   = (int) (range.start + range.count);
-+    if (kparams->pipeline && octx->ctx->mdev.count <= 1 && uniform) {
++    if ((kparams->pipeline & HTP_MMID_STREAM) && octx->ctx->mdev.count <= 1 && uniform) {
 +        dma_addr_t w_data[HTP_OP_MAX_OUTPUTS];
 +        size_t     w_nb2[HTP_OP_MAX_OUTPUTS];
 +        for (int w = 0; w < n_w; ++w) {
@@ -5230,7 +5344,7 @@ index 9af3129..fd26a10 100644
 +                                             act->nb[1], act->nb[2], (int) s0->nb[1], (int) s0->type,
 +                                             kparams->tile_size, kparams->aligned_tile_size,
 +                                             matrix_row_counts, (uint32_t) n_as, matrix_rows, mmctx->mapping_stride,
-+                                             (int) octx->n_threads);
++                                             (int) octx->n_threads, kparams->pipeline);
 +        if (ret == 0) {
 +            return HTP_STATUS_OK;
          }
@@ -5334,10 +5448,10 @@ index 9af3129..fd26a10 100644
      return HTP_STATUS_OK;
  }
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
-index 09875a6..037d5b2 100644
+index 09875a6..dcce582 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.h
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.h
-@@ -56,6 +56,16 @@ enum htp_mm_kernel_type {
+@@ -56,6 +56,20 @@ enum htp_mm_kernel_type {
      HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
  };
  
@@ -5351,10 +5465,14 @@ index 09875a6..037d5b2 100644
 +    HTP_MM_EPI_SWIGLU_PAIR = 5, // dst = silu(gate) * up, gate/up = the two halves of one HMX output chunk
 +};
 +
++// MUL_MAT_ID(_NX) on HMX: htp_mm_kernel_params.pipeline bits (0 = per-expert synchronous kernel)
++#define HTP_MMID_STREAM             1  // streamed expert kernel (async HMX, double buffers)
++#define HTP_MMID_STREAM_DMA_GATHER  2  // + activation gather through the worker threads' DMA queues
++
  // Op-specific struct for precomputed matmul params
  struct htp_mm_kernel_params {
      uint8_t  kernel_type;        // enum htp_mm_kernel_type
-@@ -78,6 +88,7 @@ struct htp_mm_kernel_params {
+@@ -78,6 +92,7 @@ struct htp_mm_kernel_params {
      int32_t  vtcm_act_size;      // activation scratchpad size in VTCM
      int32_t  vtcm_bias_size;     // bias scratchpad size in VTCM (fused only)
      int32_t  vtcm_dst_size;      // dst scratchpad size in VTCM
