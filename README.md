@@ -76,7 +76,7 @@ Other measurements: NPU prefill costs 8 mJ per token vs 90 mJ on the CPU; CPU de
 
 ## How it was built
 
-SplitLM was built in about 16 hours by Claude Code (Claude Opus 5.5) running autonomously overnight under my direction: targets set against measured hardware ceilings, then a fleet of agents in separate git worktrees (NPU kernels, speculative decoding, the MoE expert kernel, attention, decode overhead), each change attacked by an independent reviewer agent before merging. One NPU and one memory bus were shared by everyone, so a hardware lock serialized every measurement, and every speedup in this README is a same-session A/B against the previous build with identical greedy text or identical perplexity. Commits carry `Assisted-by` / `Co-Authored-By` trailers.
+SplitLM was built in about 16 hours by Claude Code (Claude Opus 5.5) running autonomously overnight under my direction: targets set against measured hardware ceilings, then a fleet of agents in separate git worktrees (NPU kernels, speculative decoding, the MoE expert kernel, attention, decode overhead), each change attacked by an independent reviewer agent before merging. One NPU and one memory bus were shared by everyone, so a hardware lock serialized every measurement, and every speedup in this README is a same-session A/B against the previous build with identical greedy text or identical perplexity.
 
 ## Build and run
 
