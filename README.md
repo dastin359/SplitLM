@@ -1,4 +1,4 @@
-# SplitLM: NPU prefill + CPU decode for LLMs on Snapdragon X SoC
+# SplitLM: NPU prefill + CPU decode with custom kernels on Snapdragon X SoC
 
 LLM inference on a Snapdragon X laptop, rebuilt around what each chip is good at, with each phase pushed toward its hardware ceiling. Two halves:
 
