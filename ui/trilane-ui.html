@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Tri-Lane</title>
+<title>SplitLM</title>
 <style>
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --ink: #14161a; --muted: #5d6470; --line: #e3e6eb;
@@ -61,7 +61,7 @@ th { color: var(--muted); font-weight: 600; }
 </head>
 <body>
 <header>
-  <h1>Tri-Lane <span>· phase-split inference on Snapdragon X</span></h1>
+  <h1>SplitLM <span>· phase-split inference on Snapdragon X</span></h1>
   <div class="badges" id="badges"></div>
 </header>
 <main>
@@ -73,7 +73,7 @@ th { color: var(--muted); font-weight: 600; }
       <div class="controls">
         <label>Lanes
           <select id="route">
-            <option value="auto">Tri-Lane (NPU prefill → CPU decode)</option>
+            <option value="auto">SplitLM (NPU prefill → CPU decode)</option>
             <option value="npu">NPU only</option>
             <option value="cpu">CPU only</option>
           </select>
