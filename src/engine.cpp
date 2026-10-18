@@ -142,7 +142,13 @@ bool engine::load(const engine_params & p) {
             dp.load_mode = LLAMA_LOAD_MODE_MMAP;          // aliased weights are never read from the file
             _putenv_s("LLAMA_MMAP_NO_PREFETCH", "1");     // nor prefetched into RAM
             aliased_ = true;
+            dense_aliased_ = dense;
             n_aliased_ = (int) names.size();
+            if (dense) {
+                // the CPU lane only decodes: batched prefill over aliased dense weights is per-token GEMV
+                params_.calibrate = false;
+                params_.cpu_prefill_max = 0;
+            }
             fprintf(stderr, "[trilane] aliasing %d %s tensors of the decode model to NPU memory\n", n_aliased_, moe ? "expert" : "dense");
         }
     }
@@ -187,7 +193,7 @@ bool engine::load(const engine_params & p) {
     fprintf(stderr, "[trilane] %s (%s), split=%d aliased=%d\n", model_name_.c_str(), desc, split(), aliased_);
 
     if (split() && p.keepwarm_ms > 0) keepwarm_start();
-    if (split() && p.calibrate) calibrate();
+    if (split() && params_.calibrate) calibrate();
     return true;
 }
 

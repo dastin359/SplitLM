@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -47,6 +48,7 @@ static void usage() {
 int main(int argc, char ** argv) {
     trilane::engine_params ep;
     std::string host = "127.0.0.1", ui_path;
+    int bench_words = 0, bench_gen = 64;
     int port = 8080;
     for (int i = 1; i < argc; i++) {
         std::string k = argv[i];
@@ -65,6 +67,8 @@ int main(int argc, char ** argv) {
         else if (k == "--no-calibrate")    ep.calibrate = false;
         else if (k == "--cache-mb")        ep.prefix_cache_mb = (size_t) atoll(next());
         else if (k == "--ui")              ui_path = next();
+        else if (k == "--bench")           bench_words = atoi(next());
+        else if (k == "--bench-gen")       bench_gen = atoi(next());
         else if (k == "-v")                g_verbose = true;
         else usage();
     }
@@ -80,6 +84,40 @@ int main(int argc, char ** argv) {
 
     trilane::engine eng;
     if (!eng.load(ep)) { fprintf(stderr, "[trilane] failed to load %s\n", ep.model.c_str()); return 1; }
+
+    // --bench N: one-shot run through the real engine (no HTTP), prompt of ~N words on each lane, then a cached follow-up
+    if (bench_words > 0) {
+        std::string doc = "Summarize the following notes in three bullet points.\n\n";
+        const char * words[] = { "the", "npu", "runs", "prompt", "prefill", "while", "cpu", "cores", "stream", "tokens", "from", "shared", "memory" };
+        for (int i = 0; i < bench_words; i++) doc += std::string(words[(i * 7 + i / 13) % 13]) + ((i % 17 == 16) ? ".\n" : " ");
+        auto show = [&](const char * tag, const trilane::gen_stats & s, const std::string & text) {
+            printf("%-14s prompt %5d cached %5d | prefill %5d tok on %-4s %7.1f ms (%6.1f t/s) | TTFT %7.1f ms | decode %5.2f t/s on %s (%d tok)\n",
+                   tag, s.n_prompt, s.n_cached, s.n_prefill, s.prefill_dev.c_str(), s.prefill_ms, s.prefill_ms > 0 ? s.n_prefill / (s.prefill_ms / 1000.0) : 0.0,
+                   s.ttft_ms, s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0, s.decode_dev.c_str(), s.n_gen);
+            printf("               > %.100s\n", text.c_str());
+            fflush(stdout);
+        };
+        for (const char * route : { "split", "npu", "cpu" }) {
+            if (!eng.split() && strcmp(route, "cpu") != 0) continue;
+            if (eng.dense_aliased() && strcmp(route, "cpu") == 0) {
+                printf("cpu            skipped: aliased dense weights make CPU batch prefill a per-token GEMV\n");
+                continue;
+            }
+            trilane::gen_params gp; gp.max_tokens = bench_gen; gp.temperature = 0; gp.route = route;
+            std::string out;
+            auto st = eng.chat({ { "user", std::string("[") + route + "] " + doc } }, gp, [&](const std::string & p) { out += p; return true; });
+            show(route, st, out);
+            if (strcmp(route, "split") == 0) {
+                gp.route = "auto";
+                std::string out2;
+                auto st2 = eng.chat({ { "user", std::string("[") + route + "] " + doc }, { "assistant", out }, { "user", "Now give it a title." } }, gp,
+                                    [&](const std::string & p) { out2 += p; return true; });
+                show("followup/auto", st2, out2);
+            }
+        }
+        fflush(stdout);
+        return 0;
+    }
 
     httplib::Server svr;
     svr.set_default_headers({ { "Access-Control-Allow-Origin", "*" } });

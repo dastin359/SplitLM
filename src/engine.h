@@ -86,6 +86,7 @@ class engine {
     std::string model_name() const { return model_name_; }
     bool        split() const { return cd_ != cp_; }
     bool        aliased() const { return aliased_; }
+    bool        dense_aliased() const { return dense_aliased_; }
     std::string prefill_dev() const { return params_.prefill_dev; }
     double      now_ms() const;
 
@@ -124,6 +125,7 @@ class engine {
     llama_context * cd_ = nullptr;
     const llama_vocab * vocab_ = nullptr;
     bool        aliased_ = false;
+    bool        dense_aliased_ = false;
     int         n_aliased_ = 0;
     std::string model_name_;
     std::string tmpl_;
