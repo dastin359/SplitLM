@@ -320,6 +320,16 @@ $('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrl
 $('clear').onclick = () => { messages = []; $('chat').innerHTML = ''; };
 $('longprompt').onclick = () => { $('input').value = LONG_DOC; $('input').focus(); };
 $('burst').onclick = burst;
+// #autodemo: scripted walkthrough for a screen recording: a long document split across NPU and CPU,
+// four long prompts at once, then the same-length document on the CPU alone
+if (location.hash === '#autodemo') (async () => {
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+  await wait(6000);
+  $('route').value = 'auto'; $('input').value = LONG_DOC; await send(); await wait(5000);
+  await burst(); await wait(5000);
+  $('clear').click(); $('route').value = 'cpu'; $('input').value = 'Same document, CPU only. ' + LONG_DOC; await send(); await wait(6000);
+  document.title = 'autodemo done';
+})();
 setInterval(poll, 500);
 poll();
 requestAnimationFrame(drawLanes);

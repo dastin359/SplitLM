@@ -93,6 +93,15 @@ Other measurements (Qwen3.5-2B, early build with stock NPU kernels): NPU prefill
 - `ggml-cpu`: `CPU_HTPTILE` and `CPU_SHARED` buffer types, NEON kernels over NPU tiles, an i8mm kernel for 2-4-token speculative verification, a per-op and per-matmul-shape profiler (`GGML_CPU_PROF=N`), opt-in decode knobs (`GGML_GEMV_NOBAR`, `GGML_REPACK_CHUNKS`, `GGML_GEMV_PF`, default off).
 - `llama`: recurrent states read in place instead of copied each step; `llama_model_get_tensor()`; `LLAMA_MMAP_NO_PREFETCH`. `common`: `common_speculative_set_ctx_tgt()`, so speculative decoding can prefill on one context and verify on another.
 
+## The ExecuTorch path
+
+SplitLM runs on llama.cpp's Hexagon backend because it builds natively for Windows on Arm today (ExecuTorch 1.5.1 publishes Windows wheels for x64 only, and its Qualcomm backend compiles models ahead of time with the QAIRT SDK). The design maps directly onto ExecuTorch, and that is the planned port:
+
+- **Two methods, two delegates.** Export the model's prefill method (a 1024-4096-token batch) delegated to the Qualcomm QNN backend on the HTP, and its single-token decode method delegated to XNNPACK on the Oryon CPU. ExecuTorch's Qualcomm llama example already builds separate prefill and KV-cache decode graphs, but runs both on the NPU; our measurements say decode belongs on the CPU (55 t/s vs 29 t/s on the NPU for Qwen3.5-2B at 4096 tokens).
+- **State handoff.** Keep the KV cache (and recurrent state for hybrid models) in a shared buffer that both methods use as input and output, the same snapshot/restore that SplitLM does with `llama_state_seq_get/set_data` today.
+- **One weight copy.** Our `CPU_HTPTILE` result (CPU reads of NPU memory at 91-99% of heap bandwidth) says the decode delegate can read the NPU's weight buffers in place instead of loading a second copy.
+- **Kernel lessons.** Fp16 matmuls with on-the-fly Q4_0 expansion cap near 70% of the HMX peak; QNN's integer (w4a16 / w8a16) matmuls avoid that expansion, which is the route past the ~55% FP16 ceiling measured here.
+
 ## How it was built
 
 SplitLM was built in about 16 hours by Claude Code (Claude Opus 5.5) running autonomously overnight under my direction: targets set against measured hardware ceilings, then a fleet of agents in separate git worktrees (NPU kernels, speculative decoding, the MoE expert kernel, attention, decode overhead). Each kernel change was checked with `test-backend-ops`, a same-session A/B run against the previous build, and a greedy-text or perplexity comparison; a multi-agent code review covered the engine and server, and later kernel work also got an adversarial reviewer agent. One NPU and one memory bus were shared by everyone, so a hardware lock serialized the measurements; when the lock failed (a few times overnight), the overlapping runs were discarded and redone. Comparisons across builds or settings are labeled as such.
