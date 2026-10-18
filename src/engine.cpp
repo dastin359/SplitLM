@@ -78,8 +78,48 @@ static size_t utf8_complete(const std::string & s) {
     return n;
 }
 
+static llama_sampler * make_sampler(const gen_params & gp) {
+    llama_sampler * s = llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (gp.temperature <= 0.0f) {
+        llama_sampler_chain_add(s, llama_sampler_init_greedy());
+    } else {
+        llama_sampler_chain_add(s, llama_sampler_init_top_k(64));
+        llama_sampler_chain_add(s, llama_sampler_init_top_p(gp.top_p, 1));
+        llama_sampler_chain_add(s, llama_sampler_init_min_p(gp.min_p, 1));
+        llama_sampler_chain_add(s, llama_sampler_init_temp(gp.temperature));
+        llama_sampler_chain_add(s, llama_sampler_init_dist(gp.seed));
+    }
+    return s;
+}
+
+// --- request ---
+
+request::~request() {
+    if (smpl) llama_sampler_free(smpl);
+}
+
+void request::push(std::string s) {
+    { std::lock_guard<std::mutex> lk(mtx); pieces.push_back(std::move(s)); }
+    cv.notify_one();
+}
+
+void request::finish(const std::string & reason) {
+    { std::lock_guard<std::mutex> lk(mtx); if (st.stop_reason.empty()) st.stop_reason = reason; done = true; }
+    cv.notify_all();
+}
+
+// --- engine ---
+
 engine::~engine() {
+    {
+        std::lock_guard<std::mutex> lk(q_mtx_);
+        stop_ = true;
+    }
+    q_cv_.notify_all();
+    if (npu_thread_.joinable()) npu_thread_.join();
+    if (cpu_thread_.joinable()) cpu_thread_.join();
     keepwarm_stop();
+    // the aliased decode model points into the NPU model's buffers, so it must go first
     if (cd_ && cd_ != cp_) llama_free(cd_);
     if (md_ && md_ != mp_) llama_model_free(md_);
     if (cp_) llama_free(cp_);
@@ -96,8 +136,8 @@ static llama_model_params base_mparams() {
 
 bool engine::load(const engine_params & p) {
     params_ = p;
+    params_.max_seqs = std::max(1, params_.max_seqs);
     static std::vector<ggml_backend_dev_t> npu_devs, no_devs;
-    static llama_model_tensor_buft_override overrides[2] = {};
 
     const bool use_npu = p.prefill_dev != "CPU";
     if (use_npu) {
@@ -152,12 +192,11 @@ bool engine::load(const engine_params & p) {
             fprintf(stderr, "[trilane] aliasing %d %s tensors of the decode model to NPU memory\n", n_aliased_, moe ? "expert" : "dense");
         }
     }
-    GGML_UNUSED(overrides);
     {
         double t0 = now_ms();
         md_ = llama_model_load_from_file(p.model.c_str(), dp);
         if (!md_) return false;
-        fprintf(stderr, "[trilane] decode model on CPU%s loaded in %.0f ms\n", aliased_ ? " (experts aliased to NPU memory)" : "", now_ms() - t0);
+        fprintf(stderr, "[trilane] decode model on CPU%s loaded in %.0f ms\n", aliased_ ? " (weights aliased to NPU memory)" : "", now_ms() - t0);
     }
     if (!mp_) mp_ = md_;
 
@@ -165,23 +204,23 @@ bool engine::load(const engine_params & p) {
     // small models fit, and big ubatches can exceed per-op NPU buffer limits (e.g. a 248K-vocab head)
     if (params_.n_ubatch <= 0) params_.n_ubatch = llama_model_size(mp_) > (3ull << 30) ? 2048 : 512;
     params_.n_batch = std::max(params_.n_batch, params_.n_ubatch);
-    fprintf(stderr, "[trilane] n_ubatch = %d\n", params_.n_ubatch);
-    const engine_params & p2 = params_;
+    fprintf(stderr, "[trilane] n_ubatch = %d, decode slots = %d\n", params_.n_ubatch, params_.max_seqs);
 
-    auto make_ctx = [&](llama_model * m, int threads, bool host_only) {
+    auto make_ctx = [&](llama_model * m, int threads, bool host_only, int n_seq) {
         llama_context_params cp = llama_context_default_params();
-        cp.n_ctx           = p.n_ctx;
-        cp.n_batch         = p2.n_batch;
-        cp.n_ubatch        = p2.n_ubatch;
-        cp.n_seq_max       = 1;
+        cp.n_ctx           = params_.n_ctx * n_seq;
+        cp.n_batch         = params_.n_batch;
+        cp.n_ubatch        = params_.n_ubatch;
+        cp.n_seq_max       = n_seq;
+        cp.kv_unified      = true;   // slots share one cell pool
         cp.n_threads       = threads;
         cp.n_threads_batch = threads;
         cp.no_perf         = true;
         cp.op_offload      = !host_only;
         return llama_init_from_model(m, cp);
     };
-    cd_ = make_ctx(md_, p.threads_decode, true);
-    cp_ = mp_ != md_ ? make_ctx(mp_, p.threads_prefill, false) : cd_;
+    cd_ = make_ctx(md_, params_.threads_decode, true, params_.max_seqs);
+    cp_ = mp_ != md_ ? make_ctx(mp_, params_.threads_prefill, false, 1) : cd_;
     if (!cd_ || !cp_) return false;
 
     vocab_ = llama_model_get_vocab(mp_);
@@ -192,14 +231,20 @@ bool engine::load(const engine_params & p) {
     tmpl_ = t ? t : "";
     fprintf(stderr, "[trilane] %s (%s), split=%d aliased=%d\n", model_name_.c_str(), desc, split(), aliased_);
 
-    if (split() && p.keepwarm_ms > 0) keepwarm_start();
+    if (split() && params_.keepwarm_ms > 0) keepwarm_start();
     if (split() && params_.calibrate) calibrate();
+
+    if (split()) npu_thread_ = std::thread([this] { npu_worker(); });
+    cpu_thread_ = std::thread([this] { cpu_worker(); });
     return true;
 }
 
 // Times synthetic prefills of two lengths on each lane, fits t(n) = fixed + n/tps, and sets the routing threshold.
+// Runs before the workers start, so it may use both contexts directly.
 void engine::calibrate() {
-    const int n_short = 32, n_long = std::min(512, params_.n_ubatch);
+    // prefill() chunks by n_batch, so the lengths need not follow n_ubatch
+    const int n_short = 32, n_long = std::min(512, params_.n_ctx - 1);
+    if (n_long <= n_short) return;
     std::vector<llama_token> toks(n_long);
     for (int i = 0; i < n_long; i++) toks[i] = (llama_token) (1000 + (i * 7919) % 20000);
     auto time_prefill = [&](llama_context * c, int n, bool npu) {
@@ -209,7 +254,7 @@ void engine::calibrate() {
             if (npu) keepwarm_pause(true);
             llama_memory_clear(llama_get_memory(c), true);
             double t0 = now_ms();
-            prefill(c, t, 0);
+            if (!prefill(c, t, 0, 0)) fprintf(stderr, "[trilane] calibration prefill failed\n");
             best = std::min(best, now_ms() - t0);
             if (npu) keepwarm_pause(false);
         }
@@ -227,7 +272,6 @@ void engine::calibrate() {
     llama_memory_clear(llama_get_memory(cp_), true);
     llama_memory_clear(llama_get_memory(cd_), true);
 
-    // NPU wins when npu_fixed + n/npu_tps (+ handoff, small) < cpu_fixed + n/cpu_tps
     const double gain_per_tok = 1000.0 / cost_.cpu_tps - 1000.0 / cost_.npu_tps;
     const double extra_fixed  = cost_.npu_fixed_ms - cost_.cpu_fixed_ms + 5.0;
     cost_.crossover = gain_per_tok > 0 ? (int) std::max(0.0, extra_fixed / gain_per_tok) : 1 << 30;
@@ -260,24 +304,30 @@ std::vector<llama_token> engine::tokenize(const std::string & text) const {
     return toks;
 }
 
-// prefill toks[from..] at positions from.., logits for the last token only
-void engine::prefill(llama_context * c, const std::vector<llama_token> & toks, int from) {
+// prefill toks[from..] at positions from.. into sequence seq, logits for the last token only; false on a failed decode
+bool engine::prefill(llama_context * c, const std::vector<llama_token> & toks, int from, llama_seq_id seq) {
     const int nb = params_.n_batch;
     llama_batch b = llama_batch_init(nb, 0, 1);
     for (int i0 = from; i0 < (int) toks.size(); i0 += nb) {
         const int n = std::min(nb, (int) toks.size() - i0);
         b.n_tokens = n;
         for (int j = 0; j < n; j++) {
-            b.token[j] = toks[i0 + j]; b.pos[j] = i0 + j; b.n_seq_id[j] = 1; b.seq_id[j][0] = 0;
+            b.token[j] = toks[i0 + j]; b.pos[j] = i0 + j; b.n_seq_id[j] = 1; b.seq_id[j][0] = seq;
             b.logits[j] = (i0 + j == (int) toks.size() - 1);
         }
-        if (llama_decode(c, b) != 0) fprintf(stderr, "[trilane] prefill decode failed\n");
+        if (llama_decode(c, b) != 0) {
+            fprintf(stderr, "[trilane] prefill decode failed at token %d\n", i0);
+            llama_batch_free(b);
+            return false;
+        }
     }
     llama_synchronize(c);
     llama_batch_free(b);
+    return true;
 }
 
-const engine::cache_entry * engine::cache_lookup(const std::vector<llama_token> & toks) {
+// copies the longest cached exact prefix (shorter than toks) into state_out; returns its token count
+int engine::cache_lookup(const std::vector<llama_token> & toks, std::vector<uint8_t> & state_out) {
     std::lock_guard<std::mutex> lk(cache_mtx_);
     auto best = cache_.end();
     for (auto it = cache_.begin(); it != cache_.end(); ++it) {
@@ -286,18 +336,19 @@ const engine::cache_entry * engine::cache_lookup(const std::vector<llama_token> 
             best = it;
         }
     }
-    if (best == cache_.end()) return nullptr;
+    if (best == cache_.end()) return 0;
     cache_.splice(cache_.begin(), cache_, best);
-    return &cache_.front();
+    state_out = cache_.front().state;
+    return (int) cache_.front().toks.size();
 }
 
-void engine::cache_insert(const std::vector<llama_token> & toks, std::vector<uint8_t> && state) {
+void engine::cache_insert(const std::vector<llama_token> & toks, const std::vector<uint8_t> & state) {
     std::lock_guard<std::mutex> lk(cache_mtx_);
     for (auto it = cache_.begin(); it != cache_.end(); ++it) {
         if (it->toks == toks) { cache_bytes_ -= it->state.size(); cache_.erase(it); break; }
     }
     cache_bytes_ += state.size();
-    cache_.push_front({ toks, std::move(state) });
+    cache_.push_front({ toks, state });
     while (cache_bytes_ > params_.prefix_cache_mb * 1048576ull && cache_.size() > 1) {
         cache_bytes_ -= cache_.back().state.size();
         cache_.pop_back();
@@ -306,130 +357,293 @@ void engine::cache_insert(const std::vector<llama_token> & toks, std::vector<uin
 
 size_t engine::cache_entries() const { std::lock_guard<std::mutex> lk(cache_mtx_); return cache_.size(); }
 size_t engine::cache_bytes() const { std::lock_guard<std::mutex> lk(cache_mtx_); return cache_bytes_; }
-
 std::vector<gen_stats> engine::history() const { std::lock_guard<std::mutex> lk(hist_mtx_); return history_; }
+int engine::npu_queue_len() const { std::lock_guard<std::mutex> lk(q_mtx_); return (int) npu_queue_.size(); }
 
-void engine::set_phase(const std::string & p) { std::lock_guard<std::mutex> lk(live_mtx_); live_phase_ = p; }
+std::string engine::live_phase() const {
+    std::lock_guard<std::mutex> lk(live_mtx_);
+    return "NPU: " + npu_phase_ + " | CPU: " + cpu_phase_;
+}
+
+// learn how far the calibrated model is off for this lane (warm contexts, cached prefixes, thermal state)
+void engine::learn(bool on_npu, int n, double ms) {
+    std::lock_guard<std::mutex> lk(cost_mtx_);
+    if (cost_.cpu_tps <= 0 || cost_.npu_tps <= 0 || n <= 0) return;
+    const double base = on_npu ? cost_.npu_fixed_ms + 1000.0 * n / cost_.npu_tps
+                               : cost_.cpu_fixed_ms + 1000.0 * n / cost_.cpu_tps;
+    const double ratio = std::clamp(ms / std::max(base, 1.0), 0.25, 4.0);
+    double & corr = on_npu ? cost_.npu_corr : cost_.cpu_corr;
+    corr = 0.7 * corr + 0.3 * ratio;
+}
+
+void engine::record(const request_ptr & r) {
+    std::lock_guard<std::mutex> lk(hist_mtx_);
+    history_.push_back(r->st);
+    if (history_.size() > 200) history_.erase(history_.begin());
+}
+
+request_ptr engine::submit(const std::vector<chat_msg> & msgs, const gen_params & gp) {
+    auto r = std::make_shared<request>();
+    r->gp = gp;
+    r->st.t_submit_ms = now_ms();
+    r->toks = tokenize(apply_template(msgs));
+    r->st.n_prompt = (int) r->toks.size();
+    if (r->toks.empty() || (int64_t) r->toks.size() >= params_.n_ctx) {
+        r->finish("context_overflow");
+        return r;
+    }
+    // max_tokens <= 0 means "as many as fit"; never more than the slot's context leaves room for
+    const int64_t room = (int64_t) params_.n_ctx - (int64_t) r->toks.size();
+    r->gp.max_tokens = (int) (gp.max_tokens <= 0 ? room : std::min<int64_t>(gp.max_tokens, room));
+    r->st.n_cached  = cache_lookup(r->toks, r->restore);
+    r->st.n_prefill = r->st.n_prompt - r->st.n_cached;
+    r->smpl = make_sampler(gp);
+
+    // lane choice: compare predicted prefill time per lane, counting the NPU queue ahead of us
+    std::string route = gp.route;
+    {
+        std::lock_guard<std::mutex> lk(q_mtx_);
+        r->st.id = next_id_++;
+        if (!split()) route = "cpu";
+        else if (route == "auto") {
+            std::lock_guard<std::mutex> ck(cost_mtx_);
+            if (cost_.cpu_tps > 0 && cost_.npu_tps > 0) {
+                double npu_wait = 0;
+                for (auto & q : npu_queue_) npu_wait += cost_.predict_npu(q->st.n_prefill);
+                if (npu_busy_) npu_wait += cost_.predict_npu(256); // rough remainder of the prefill in flight
+                // a CPU prefill pauses every sequence decoding on the CPU lane, so it costs once per stalled sequence too
+                const int stalled = n_active_ + (int) cpu_inbox_.size();
+                const double cpu_cost = cost_.predict_cpu(r->st.n_prefill) * (1 + stalled);
+                route = npu_wait + cost_.predict_npu(r->st.n_prefill) < cpu_cost ? "split" : "cpu";
+            } else {
+                route = r->st.n_prefill > params_.cpu_prefill_max ? "split" : "cpu";
+            }
+        }
+        r->st.route       = route;
+        r->st.prefill_dev = route == "cpu" ? "CPU" : params_.prefill_dev;
+        r->st.decode_dev  = route == "npu" ? params_.prefill_dev : "CPU";
+        if (route == "cpu") cpu_inbox_.push_back(r); else npu_queue_.push_back(r);
+    }
+    q_cv_.notify_all();
+    return r;
+}
 
 gen_stats engine::chat(const std::vector<chat_msg> & msgs, const gen_params & gp, const std::function<bool(const std::string &)> & on_piece) {
-    std::lock_guard<std::mutex> glk(gen_mtx_);
-    gen_stats st;
-    st.t_start_ms = now_ms();
-    { std::lock_guard<std::mutex> lk(hist_mtx_); st.id = next_id_++; }
-
-    const std::vector<llama_token> toks = tokenize(apply_template(msgs));
-    st.n_prompt = (int) toks.size();
-    if (toks.empty() || (int) toks.size() + gp.max_tokens > params_.n_ctx) {
-        st.stop_reason = "context_overflow";
-        return st;
+    request_ptr r = submit(msgs, gp);
+    for (;;) {
+        std::unique_lock<std::mutex> lk(r->mtx);
+        r->cv.wait(lk, [&] { return !r->pieces.empty() || r->done; });
+        while (!r->pieces.empty()) {
+            std::string p = std::move(r->pieces.front());
+            r->pieces.pop_front();
+            lk.unlock();
+            if (!on_piece(p)) r->cancelled = true;
+            lk.lock();
+        }
+        if (r->done && r->pieces.empty()) break;
     }
+    std::lock_guard<std::mutex> lk(r->mtx);
+    return r->st;
+}
 
-    // prefix cache: restore the longest cached exact prefix, prefill only the rest
-    std::vector<uint8_t> restore;
-    if (const cache_entry * e = cache_lookup(toks)) {
-        st.n_cached = (int) e->toks.size();
-        restore = e->state;
-    }
-    st.n_prefill = st.n_prompt - st.n_cached;
+bool engine::should_stop(const request_ptr & r) const {
+    if (r->cancelled) { r->st.stop_reason = "client"; return true; }
+    if (llama_vocab_is_eog(vocab_, r->cur)) { r->st.stop_reason = "stop"; return true; }
+    if (r->st.n_gen >= r->gp.max_tokens) { r->st.stop_reason = "length"; return true; }
+    return false;
+}
 
-    // lane choice: long prefills on the NPU, short ones stay on the CPU (no NPU dispatch, no handoff)
-    std::string route = gp.route;
-    if (!split()) route = "cpu";
-    else if (route == "auto") {
-        if (cost_.cpu_tps > 0 && cost_.npu_tps > 0) {
-            route = cost_.predict_npu(st.n_prefill) < cost_.predict_cpu(st.n_prefill) ? "split" : "cpu";
+// stream r->cur as text, holding back an incomplete UTF-8 tail
+void engine::emit(const request_ptr & r) {
+    char buf[256];
+    int n = llama_token_to_piece(vocab_, r->cur, buf, sizeof(buf), 0, false);
+    if (n > 0) r->pending.append(buf, n);
+    size_t ok = utf8_complete(r->pending);
+    if (ok > 0) { r->push(r->pending.substr(0, ok)); r->pending.erase(0, ok); }
+    r->st.n_gen++;
+}
+
+// NPU lane: prefill one request at a time, then hand its state to the CPU lane (or decode on the NPU for route "npu")
+void engine::npu_worker() {
+    for (;;) {
+        request_ptr r;
+        {
+            std::unique_lock<std::mutex> lk(q_mtx_);
+            q_cv_.wait(lk, [&] { return stop_ || !npu_queue_.empty(); });
+            if (stop_) return;
+            r = npu_queue_.front();
+            npu_queue_.pop_front();
+            npu_busy_ = true;
+        }
+        if (r->cancelled) { r->finish("client"); record(r); npu_busy_ = false; continue; }
+
+        keepwarm_pause(true);
+        { std::lock_guard<std::mutex> lk(live_mtx_); npu_phase_ = "prefill #" + std::to_string(r->st.id); }
+        r->st.t_start_ms = now_ms();
+        r->st.queue_ms   = r->st.t_start_ms - r->st.t_submit_ms;
+        llama_memory_clear(llama_get_memory(cp_), true);
+        const bool restored = r->restore.empty() || llama_state_seq_set_data(cp_, r->restore.data(), r->restore.size(), 0) > 0;
+        if (!restored || !prefill(cp_, r->toks, restored ? r->st.n_cached : 0, 0)) {
+            llama_memory_clear(llama_get_memory(cp_), true);
+            keepwarm_pause(false);
+            npu_busy_ = false;
+            { std::lock_guard<std::mutex> lk(live_mtx_); npu_phase_ = "idle"; }
+            r->st.stop_reason = "prefill_error";
+            record(r);
+            r->finish("prefill_error");
+            continue;
+        }
+        r->cur = llama_sampler_sample(r->smpl, cp_, -1);
+        r->st.prefill_ms = now_ms() - r->st.t_start_ms;
+        learn(true, r->st.n_prefill, r->st.prefill_ms);
+
+        // snapshot = handoff blob; it also becomes the prefix-cache entry for this prompt
+        r->blob.resize(llama_state_seq_get_size(cp_, 0));
+        llama_state_seq_get_data(cp_, r->blob.data(), r->blob.size(), 0);
+        cache_insert(r->toks, r->blob);
+        r->restore.clear();
+        r->restore.shrink_to_fit();
+
+        if (r->st.route == "npu") {
+            // comparison mode: decode on the NPU too
+            r->st.ttft_ms = now_ms() - r->st.t_submit_ms;
+            r->t_decode0 = now_ms();
+            r->st.t_decode_start_ms = r->t_decode0;
+            llama_batch b = llama_batch_init(1, 0, 1);
+            r->pos = (int) r->toks.size();
+            while (!should_stop(r)) {
+                emit(r);
+                b.n_tokens = 1; b.token[0] = r->cur; b.pos[0] = r->pos++; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
+                if (llama_decode(cp_, b) != 0) { r->st.stop_reason = "decode_error"; break; }
+                r->cur = llama_sampler_sample(r->smpl, cp_, -1);
+            }
+            llama_batch_free(b);
+            if (!r->pending.empty()) r->push(r->pending);
+            r->st.decode_ms = now_ms() - r->t_decode0;
+            r->st.batch_peak = 1;
+            record(r);
+            r->finish(r->st.stop_reason);
         } else {
-            route = st.n_prefill > params_.cpu_prefill_max ? "split" : "cpu";
+            {
+                std::lock_guard<std::mutex> lk(q_mtx_);
+                cpu_inbox_.push_back(r);
+            }
+            q_cv_.notify_all();
         }
+        keepwarm_pause(false);
+        npu_busy_ = false;
+        { std::lock_guard<std::mutex> lk(live_mtx_); npu_phase_ = "idle"; }
     }
-    st.route = route;
-    llama_context * pre = route == "cpu" ? cd_ : cp_;
-    llama_context * dec = route == "npu" ? cp_ : cd_;
-    st.prefill_dev = pre == cp_ && split() ? params_.prefill_dev : "CPU";
-    st.decode_dev  = dec == cp_ && split() ? params_.prefill_dev : "CPU";
+}
 
-    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    if (gp.temperature <= 0.0f) {
-        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
-    } else {
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(64));
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(gp.top_p, 1));
-        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(gp.min_p, 1));
-        llama_sampler_chain_add(smpl, llama_sampler_init_temp(gp.temperature));
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(gp.seed));
-    }
+// CPU lane: continuous batching. Admit prefilled requests into free slots between steps, then decode
+// one token for every active slot in a single batch.
+void engine::cpu_worker() {
+    const int S = params_.max_seqs;
+    std::vector<request_ptr> slots(S);
+    llama_batch b = llama_batch_init(S, 0, 1);
+    llama_memory_t mem = llama_get_memory(cd_);
 
-    const bool uses_npu = pre == cp_ || dec == cp_;
-    if (uses_npu && split()) keepwarm_pause(true);
+    auto finish_slot = [&](int s) {
+        request_ptr r = slots[s];
+        if (!r->pending.empty()) { r->push(r->pending); r->pending.clear(); }
+        r->st.decode_ms = now_ms() - r->t_decode0;
+        llama_memory_seq_rm(mem, s, -1, -1);
+        slots[s].reset();
+        n_active_--;
+        record(r);
+        r->finish(r->st.stop_reason);
+    };
 
-    set_phase("prefill:" + st.prefill_dev);
-    double t0 = now_ms();
-    llama_memory_clear(llama_get_memory(pre), true);
-    if (!restore.empty()) llama_state_seq_set_data(pre, restore.data(), restore.size(), 0);
-    prefill(pre, toks, st.n_cached);
-    llama_token tok = llama_sampler_sample(smpl, pre, -1);
-    double t1 = now_ms();
-    st.prefill_ms = t1 - t0;
-
-    // learn how far the calibrated model is off for this lane (warm contexts, cached prefixes, thermal state)
-    if (cost_.cpu_tps > 0 && cost_.npu_tps > 0) {
-        const bool on_npu = pre == cp_ && split();
-        const double base = on_npu ? cost_.npu_fixed_ms + 1000.0 * st.n_prefill / cost_.npu_tps
-                                   : cost_.cpu_fixed_ms + 1000.0 * st.n_prefill / cost_.cpu_tps;
-        const double ratio = std::clamp(st.prefill_ms / std::max(base, 1.0), 0.25, 4.0);
-        double & corr = on_npu ? cost_.npu_corr : cost_.cpu_corr;
-        corr = 0.7 * corr + 0.3 * ratio;
-    }
-
-    // snapshot = handoff blob; it also becomes the prefix-cache entry for this prompt
-    std::vector<uint8_t> snap(llama_state_seq_get_size(pre, 0));
-    llama_state_seq_get_data(pre, snap.data(), snap.size(), 0);
-    if (dec != pre) {
-        set_phase("handoff");
-        llama_memory_clear(llama_get_memory(dec), true);
-        llama_state_seq_set_data(dec, snap.data(), snap.size(), 0);
-        st.handoff_mb = snap.size() / 1048576.0;
-    }
-    if (dec != cp_ && uses_npu && split()) keepwarm_pause(false);
-    double t2 = now_ms();
-    st.handoff_ms = t2 - t1;
-    st.ttft_ms = t2 - t0;
-    cache_insert(toks, std::move(snap));
-
-    set_phase("decode:" + st.decode_dev);
-    std::string pending;
-    llama_batch b = llama_batch_init(1, 0, 1);
-    int pos = (int) toks.size();
-    st.stop_reason = "length";
-    for (int i = 0; i < gp.max_tokens; i++) {
-        if (llama_vocab_is_eog(vocab_, tok)) { st.stop_reason = "stop"; break; }
-        char buf[256];
-        int n = llama_token_to_piece(vocab_, tok, buf, sizeof(buf), 0, false);
-        if (n > 0) pending.append(buf, n);
-        size_t ok = utf8_complete(pending);
-        if (ok > 0) {
-            if (!on_piece(pending.substr(0, ok))) { st.stop_reason = "client"; break; }
-            pending.erase(0, ok);
+    for (;;) {
+        // admit
+        for (;;) {
+            int s = -1;
+            for (int i = 0; i < S; i++) if (!slots[i]) { s = i; break; }
+            request_ptr r;
+            {
+                std::unique_lock<std::mutex> lk(q_mtx_);
+                if (n_active_ == 0) q_cv_.wait(lk, [&] { return stop_ || !cpu_inbox_.empty(); });
+                if (stop_) { llama_batch_free(b); return; }
+                if (s < 0 || cpu_inbox_.empty()) break;
+                r = cpu_inbox_.front();
+                cpu_inbox_.pop_front();
+            }
+            if (r->cancelled) { r->finish("client"); record(r); continue; }
+            llama_memory_seq_rm(mem, s, -1, -1);
+            const double t0 = now_ms();
+            if (!r->blob.empty()) {
+                // prefilled on the NPU: restore its state into this slot
+                if (llama_state_seq_set_data(cd_, r->blob.data(), r->blob.size(), s) == 0) {
+                    llama_memory_seq_rm(mem, s, -1, -1);
+                    r->st.stop_reason = "handoff_error";
+                    record(r);
+                    r->finish("handoff_error");
+                    continue;
+                }
+                r->st.handoff_mb = r->blob.size() / 1048576.0;
+                r->st.handoff_ms = now_ms() - t0;
+                r->blob.clear();
+                r->blob.shrink_to_fit();
+            } else {
+                // short prompt: prefill on the CPU lane (the other slots pause for this one call)
+                { std::lock_guard<std::mutex> lk(live_mtx_); cpu_phase_ = "prefill #" + std::to_string(r->st.id); }
+                r->st.t_start_ms = t0;
+                r->st.queue_ms   = t0 - r->st.t_submit_ms;
+                const bool restored = r->restore.empty() || llama_state_seq_set_data(cd_, r->restore.data(), r->restore.size(), s) > 0;
+                if (!restored || !prefill(cd_, r->toks, restored ? r->st.n_cached : 0, s)) {
+                    llama_memory_seq_rm(mem, s, -1, -1);
+                    r->st.stop_reason = "prefill_error";
+                    record(r);
+                    r->finish("prefill_error");
+                    continue;
+                }
+                r->cur = llama_sampler_sample(r->smpl, cd_, -1);
+                r->st.prefill_ms = now_ms() - t0;
+                learn(false, r->st.n_prefill, r->st.prefill_ms);
+                std::vector<uint8_t> snap(llama_state_seq_get_size(cd_, s));
+                llama_state_seq_get_data(cd_, snap.data(), snap.size(), s);
+                cache_insert(r->toks, snap);
+                r->restore.clear();
+                r->restore.shrink_to_fit();
+            }
+            r->pos = (int) r->toks.size();
+            r->st.slot = s;
+            r->st.ttft_ms = now_ms() - r->st.t_submit_ms;
+            r->t_decode0 = now_ms();
+            r->st.t_decode_start_ms = r->t_decode0;
+            slots[s] = r;
+            n_active_++;
         }
-        st.n_gen++;
-        if (i + 1 == gp.max_tokens) break;
-        b.n_tokens = 1; b.token[0] = tok; b.pos[0] = pos++; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
-        if (llama_decode(dec, b) != 0) { st.stop_reason = "decode_error"; break; }
-        tok = llama_sampler_sample(smpl, dec, -1);
-    }
-    if (!pending.empty()) on_piece(pending);
-    llama_batch_free(b);
-    llama_sampler_free(smpl);
-    st.decode_ms = now_ms() - t2;
-    if (dec == cp_ && split()) keepwarm_pause(false);
-    set_phase("idle");
 
-    {
-        std::lock_guard<std::mutex> lk(hist_mtx_);
-        history_.push_back(st);
-        if (history_.size() > 200) history_.erase(history_.begin());
+        // step: emit each slot's pending token, stop finished ones, decode the rest together
+        b.n_tokens = 0;
+        std::vector<int> in_batch;
+        for (int s = 0; s < S; s++) {
+            request_ptr & r = slots[s];
+            if (!r) continue;
+            if (should_stop(r)) { finish_slot(s); continue; }
+            emit(r);
+            const int i = b.n_tokens++;
+            b.token[i] = r->cur; b.pos[i] = r->pos++; b.n_seq_id[i] = 1; b.seq_id[i][0] = s; b.logits[i] = 1;
+            in_batch.push_back(s);
+        }
+        if (b.n_tokens == 0) continue;
+        {
+            std::lock_guard<std::mutex> lk(live_mtx_);
+            cpu_phase_ = "decode x" + std::to_string(b.n_tokens);
+        }
+        if (llama_decode(cd_, b) != 0) {
+            for (int s : in_batch) { slots[s]->st.stop_reason = "decode_error"; finish_slot(s); }
+            continue;
+        }
+        for (int i = 0; i < (int) in_batch.size(); i++) {
+            request_ptr & r = slots[in_batch[i]];
+            r->cur = llama_sampler_sample(r->smpl, cd_, i);
+            r->st.batch_peak = std::max(r->st.batch_peak, (int) in_batch.size());
+        }
+        if (n_active_ == 0) { std::lock_guard<std::mutex> lk(live_mtx_); cpu_phase_ = "idle"; }
     }
-    return st;
 }
 
 // Keeps the NPU out of its idle low-power state: a 4 KB ADD on the prefill device every keepwarm_ms.

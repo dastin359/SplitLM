@@ -26,3 +26,7 @@ target_link_libraries(trilane-server PRIVATE llama trilane-httplib)
 # E1: CPU read bandwidth of HTP0 rpcmem vs heap
 add_executable(trilane-rpcmem-bw src/rpcmem_bw.cpp)
 target_link_libraries(trilane-rpcmem-bw PRIVATE llama)
+
+# throttle diagnosis: memory bandwidth vs CPU compute
+add_executable(trilane-probe src/probe.cpp)
+target_link_libraries(trilane-probe PRIVATE pdh)

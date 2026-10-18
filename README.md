@@ -72,9 +72,9 @@ API: `POST /v1/chat/completions` (OpenAI format, `stream: true` for SSE). An opt
 
 ## Things we learned the hard way
 
-- On battery the laptop throttles hard, and under sustained load it throttles thermally even on AC: decode flips between ~55 and ~30 t/s at the same CPU clock, which looks like a memory-clock step. Benchmarks need AC, cool-downs and temperature logging.
+- On battery the laptop throttles hard. Right after switching to AC we also saw decode flip between ~55 and ~30 t/s at the same reported CPU clock; a later 3-minute probe under sustained load showed no such state (memory bandwidth steady at ~104 GB/s, only brief CPU-compute dips), so the cause is unconfirmed. Benchmarks still get AC, cool-downs and temperature logging.
 - `mmap` + CPU weight repacking keeps two copies of the weights. A 12.6 GB model then thrashes 32 GB. Read weights once (`-lm none`).
-- Task Manager shows the NPU at 0% while it works: llama.cpp reaches the Hexagon through FastRPC, which Windows' NPU counter does not see.
+- Task Manager's NPU graph does show llama.cpp's Hexagon work (an early 0% reading was simply an idle moment, not an invisible path).
 - The upstream Windows Snapdragon CMake preset is missing `-fno-finite-math-only`.
 - Multi-session NPU layer split (`GGML_HEXAGON_DEVICES=4`) fails on Windows with `dspqueue_write 0x0E`.
 

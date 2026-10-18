@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <thread>
 
 using json = nlohmann::ordered_json;
 
@@ -22,7 +23,8 @@ static void log_cb(ggml_log_level level, const char * text, void *) {
 
 static json stats_json(const trilane::gen_stats & s) {
     return {
-        { "id", s.id }, { "t_start_ms", s.t_start_ms },
+        { "id", s.id }, { "t_submit_ms", s.t_submit_ms }, { "t_start_ms", s.t_start_ms }, { "queue_ms", s.queue_ms },
+        { "t_decode_start_ms", s.t_decode_start_ms }, { "slot", s.slot }, { "batch_peak", s.batch_peak },
         { "n_prompt", s.n_prompt }, { "n_cached", s.n_cached }, { "n_prefill", s.n_prefill },
         { "route", s.route }, { "prefill_dev", s.prefill_dev }, { "decode_dev", s.decode_dev },
         { "prefill_ms", s.prefill_ms }, { "prefill_tps", s.prefill_ms > 0 ? s.n_prefill / (s.prefill_ms / 1000.0) : 0.0 },
@@ -37,6 +39,21 @@ static std::string dump(const json & j) {
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
+// value of an optional field; missing or null gives the default (OpenAI clients send nulls)
+template <typename T> static T jv(const json & o, const char * key, T def) {
+    if (!o.is_object() || !o.contains(key) || o[key].is_null()) return def;
+    return o[key].get<T>();
+}
+
+static bool is_error(const std::string & stop) { return stop != "stop" && stop != "length" && stop != "client"; }
+
+static std::string error_text(const std::string & stop) {
+    if (stop == "context_overflow") return "the prompt does not fit in the context window";
+    if (stop == "prefill_error") return "prompt processing failed";
+    if (stop == "handoff_error") return "moving the prompt state to the decode lane failed";
+    return "generation failed (" + stop + ")";
+}
+
 static void usage() {
     fprintf(stderr,
         "usage: trilane-server -m model.gguf [--prefill-dev HTP0|CPU] [--host 127.0.0.1] [--port 8080]\n"
@@ -48,7 +65,7 @@ static void usage() {
 int main(int argc, char ** argv) {
     trilane::engine_params ep;
     std::string host = "127.0.0.1", ui_path;
-    int bench_words = 0, bench_gen = 64;
+    int bench_words = 0, bench_gen = 64, bench_conc = 0, bench_words_conc = 200;
     int port = 8080;
     for (int i = 1; i < argc; i++) {
         std::string k = argv[i];
@@ -69,6 +86,9 @@ int main(int argc, char ** argv) {
         else if (k == "--ui")              ui_path = next();
         else if (k == "--bench")           bench_words = atoi(next());
         else if (k == "--bench-gen")       bench_gen = atoi(next());
+        else if (k == "--bench-concurrent") bench_conc = atoi(next());
+        else if (k == "--bench-words")     bench_words_conc = atoi(next());
+        else if (k == "--slots")           ep.max_seqs = atoi(next());
         else if (k == "-v")                g_verbose = true;
         else usage();
     }
@@ -119,12 +139,59 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    // --bench-concurrent N: N different prompts, first one after another, then all at once
+    if (bench_conc > 0) {
+        const char * words[] = { "the", "npu", "runs", "prompt", "prefill", "while", "cpu", "cores", "stream", "tokens", "from", "shared", "memory" };
+        auto prompt = [&](int k) {
+            std::string doc = "Request " + std::to_string(k) + ": summarize these notes in three bullet points.\n\n";
+            const int nw = bench_words_conc + 37 * k; // different lengths
+            for (int i = 0; i < nw; i++) doc += std::string(words[(i * 7 + k * 3 + i / 13) % 13]) + ((i % 17 == 16) ? ".\n" : " ");
+            return doc;
+        };
+        auto run = [&](bool together) {
+            std::vector<trilane::gen_stats> st(bench_conc);
+            std::vector<std::string> txt(bench_conc);
+            const double t0 = eng.now_ms();
+            auto one = [&](int k) {
+                trilane::gen_params gp; gp.max_tokens = bench_gen; gp.temperature = 0;
+                st[k] = eng.chat({ { "user", prompt(k) } }, gp, [&, k](const std::string & p) { txt[k] += p; return true; });
+            };
+            if (together) {
+                std::vector<std::thread> th;
+                for (int k = 0; k < bench_conc; k++) th.emplace_back(one, k);
+                for (auto & t : th) t.join();
+            } else {
+                for (int k = 0; k < bench_conc; k++) one(k);
+            }
+            const double wall = eng.now_ms() - t0;
+            int gen = 0, pre = 0;
+            for (int k = 0; k < bench_conc; k++) {
+                auto & s = st[k];
+                gen += s.n_gen; pre += s.n_prefill;
+                printf("  #%-3lld prompt %5d on %-5s queue %7.0f ms | TTFT %7.0f ms | decode %5.1f t/s (batch up to %d, slot %d) | %d tok\n",
+                       (long long) s.id, s.n_prompt, s.route.c_str(), s.queue_ms, s.ttft_ms,
+                       s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0, s.batch_peak, s.slot, s.n_gen);
+                std::string head = txt[k].substr(0, 70);
+                for (auto & ch : head) if (ch == '\n') ch = ' ';
+                printf("        text[%d] %s\n", k, head.c_str());
+            }
+            printf("  => %s: wall %.1f s, %d prompt + %d generated tokens, aggregate %.1f generated t/s\n\n",
+                   together ? "concurrent" : "sequential", wall / 1000.0, pre, gen, gen / (wall / 1000.0));
+            fflush(stdout);
+        };
+        printf("=== %d requests, one after another\n", bench_conc); run(false);
+        printf("=== %d requests at once\n", bench_conc); run(true);
+        return 0;
+    }
+
     httplib::Server svr;
-    svr.set_default_headers({ { "Access-Control-Allow-Origin", "*" } });
-    svr.Options(R"(.*)", [](const httplib::Request &, httplib::Response & res) {
-        res.set_header("Access-Control-Allow-Headers", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    // no CORS headers: the dashboard is same-origin, and other web pages must not drive the local engine
+#ifdef _WIN32
+    svr.set_socket_options([](socket_t sock) {
+        int yes = 1; // fail loudly instead of silently sharing a busy port
+        setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *) &yes, sizeof(yes));
     });
+#endif
 
     svr.Get("/", [&](const httplib::Request &, httplib::Response & res) {
         std::ifstream f(ui_path, std::ios::binary);
@@ -140,11 +207,13 @@ int main(int argc, char ** argv) {
     svr.Get("/stats", [&](const httplib::Request &, httplib::Response & res) {
         json hist = json::array();
         for (auto & s : eng.history()) hist.push_back(stats_json(s));
+        const trilane::lane_cost cost = eng.cost();
         res.set_content(dump({
             { "model", eng.model_name() }, { "split", eng.split() }, { "aliased", eng.aliased() },
             { "prefill_dev", eng.prefill_dev() }, { "phase", eng.live_phase() }, { "now_ms", eng.now_ms() },
+            { "max_seqs", eng.max_seqs() }, { "active", eng.active_slots() }, { "npu_queue", eng.npu_queue_len() },
             { "keepwarm_pings", eng.keepwarm_pings() },
-            { "router", { { "cpu_prefill_max", eng.cpu_prefill_max() }, { "cpu_fixed_ms", eng.cost().cpu_fixed_ms }, { "cpu_tps", eng.cost().cpu_tps }, { "npu_fixed_ms", eng.cost().npu_fixed_ms }, { "npu_tps", eng.cost().npu_tps }, { "cpu_corr", eng.cost().cpu_corr }, { "npu_corr", eng.cost().npu_corr } } },
+            { "router", { { "cpu_prefill_max", eng.cpu_prefill_max() }, { "cpu_fixed_ms", cost.cpu_fixed_ms }, { "cpu_tps", cost.cpu_tps }, { "npu_fixed_ms", cost.npu_fixed_ms }, { "npu_tps", cost.npu_tps }, { "cpu_corr", cost.cpu_corr }, { "npu_corr", cost.npu_corr } } },
             { "cache", { { "entries", eng.cache_entries() }, { "mb", eng.cache_bytes() / 1048576.0 } } },
             { "history", hist },
         }), "application/json");
@@ -154,24 +223,43 @@ int main(int argc, char ** argv) {
         json body;
         try { body = json::parse(req.body); } catch (...) { res.status = 400; res.set_content(R"({"error":"bad json"})", "application/json"); return; }
         std::vector<trilane::chat_msg> msgs;
-        for (auto & m : body.value("messages", json::array())) {
-            std::string content;
-            if (m["content"].is_string()) content = m["content"].get<std::string>();
-            else if (m["content"].is_array()) for (auto & part : m["content"]) if (part.value("type", "") == "text") content += part.value("text", "");
-            msgs.push_back({ m.value("role", "user"), content });
-        }
         trilane::gen_params gp;
-        gp.max_tokens  = body.value("max_tokens", body.value("max_completion_tokens", gp.max_tokens));
-        gp.temperature = body.value("temperature", gp.temperature);
-        gp.top_p       = body.value("top_p", gp.top_p);
-        gp.seed        = body.value("seed", gp.seed);
-        if (body.contains("trilane")) gp.route = body["trilane"].value("route", gp.route);
-        const bool stream = body.value("stream", false);
+        bool stream = false;
+        try {
+            if (!body.is_object()) throw std::runtime_error("body must be a JSON object");
+            for (auto & m : jv(body, "messages", json::array())) {
+                std::string content;
+                const json c = m.is_object() && m.contains("content") ? m["content"] : json();
+                if (c.is_string()) content = c.get<std::string>();
+                else if (c.is_array()) for (auto & part : c) if (part.is_object() && jv(part, "type", std::string()) == "text") content += jv(part, "text", std::string());
+                msgs.push_back({ m.is_object() ? jv(m, "role", std::string("user")) : std::string("user"), content });
+            }
+            gp.max_tokens  = jv(body, "max_tokens", jv(body, "max_completion_tokens", gp.max_tokens)); // <= 0 means "as many as fit"
+            gp.temperature = jv(body, "temperature", gp.temperature);
+            gp.top_p       = jv(body, "top_p", gp.top_p);
+            gp.seed        = jv(body, "seed", gp.seed);
+            if (body.contains("trilane") && body["trilane"].is_object()) gp.route = jv(body["trilane"], "route", gp.route);
+            stream = jv(body, "stream", false);
+        } catch (const std::exception & e) {
+            res.status = 400;
+            res.set_content(dump({ { "error", { { "message", std::string("bad request: ") + e.what() }, { "type", "invalid_request_error" } } } }), "application/json");
+            return;
+        }
+        if (msgs.empty()) {
+            res.status = 400;
+            res.set_content(dump({ { "error", { { "message", "messages is empty" }, { "type", "invalid_request_error" } } } }), "application/json");
+            return;
+        }
         const std::string model = eng.model_name();
 
         if (!stream) {
             std::string out;
-            auto st = eng.chat(msgs, gp, [&](const std::string & p) { out += p; return true; });
+            auto st = eng.chat(msgs, gp, [&](const std::string & p) { out += p; return !req.is_connection_closed(); });
+            if (is_error(st.stop_reason)) {
+                res.status = st.stop_reason == "context_overflow" ? 400 : 500;
+                res.set_content(dump({ { "error", { { "message", error_text(st.stop_reason) }, { "type", st.stop_reason } } }, { "trilane", stats_json(st) } }), "application/json");
+                return;
+            }
             res.set_content(dump({
                 { "id", "chatcmpl-" + std::to_string(st.id) }, { "object", "chat.completion" }, { "model", model },
                 { "choices", json::array({ { { "index", 0 }, { "message", { { "role", "assistant" }, { "content", out } } },
@@ -190,18 +278,27 @@ int main(int argc, char ** argv) {
             };
             send(chunk({ { "role", "assistant" } }, nullptr));
             auto st = eng.chat(msgs, gp, [&](const std::string & p) { return send(chunk({ { "content", p } }, nullptr)); });
+            static const char done[] = "data: [DONE]\n\n";
+            if (is_error(st.stop_reason)) {
+                send({ { "error", { { "message", error_text(st.stop_reason) }, { "type", st.stop_reason } } }, { "trilane", stats_json(st) } });
+                sink.write(done, sizeof(done) - 1);
+                sink.done();
+                return true;
+            }
             json last = chunk(json::object(), st.stop_reason == "stop" ? "stop" : "length");
             last["usage"] = { { "prompt_tokens", st.n_prompt }, { "completion_tokens", st.n_gen } };
             last["trilane"] = stats_json(st);
             send(last);
-            static const char done[] = "data: [DONE]\n\n";
             sink.write(done, sizeof(done) - 1);
             sink.done();
             return true;
         });
     });
 
+    if (!svr.bind_to_port(host, port)) {
+        fprintf(stderr, "[trilane] cannot listen on %s:%d (port in use?)\n", host.c_str(), port);
+        return 1;
+    }
     fprintf(stderr, "[trilane] serving %s on http://%s:%d  (UI: %s)\n", eng.model_name().c_str(), host.c_str(), port, ui_path.c_str());
-    svr.listen(host, port);
-    return 0;
+    return svr.listen_after_bind() ? 0 : 1;
 }
