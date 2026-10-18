@@ -14,6 +14,11 @@
 #include <string>
 #include <vector>
 
+static bool g_verbose = false;
+static void log_cb(ggml_log_level level, const char * text, void *) {
+    if (g_verbose || level >= GGML_LOG_LEVEL_WARN) fputs(text, stderr);
+}
+
 struct args {
     std::string model;
     std::string prefill_dev = "HTP0";
@@ -56,6 +61,7 @@ static args parse(int argc, char ** argv) {
         else if (k == "-tb")           a.threads_b = atoi(next());
         else if (k == "-r")            a.reps = atoi(next());
         else if (k == "--check")       a.check = true;
+        else if (k == "-v")            g_verbose = true;
         else usage();
     }
     if (a.model.empty()) usage();
@@ -202,6 +208,7 @@ static result run_once(llama_context * cp, llama_context * cd, const llama_vocab
 
 int main(int argc, char ** argv) {
     args a = parse(argc, argv);
+    llama_log_set(log_cb, nullptr);
     llama_backend_init();
     ggml_backend_load_all();
 
@@ -230,6 +237,8 @@ int main(int argc, char ** argv) {
         split ? "split" : "single", a.prefill_dev.c_str(), a.decode_dev.c_str(), rs[0].n_prompt, ng,
         pf, rs[0].n_prompt / (pf / 1000.0), xf, rs[0].xfer_bytes / 1048576.0, pf + xf, ng / (dc / 1000.0));
     if (a.check) printf("--- text ---\n%s\n", rs.back().text.c_str());
+    // a backend teardown exits without flushing stdio, so flush before freeing anything
+    fflush(stdout);
 
     if (split) { llama_free(cd); llama_model_free(md); }
     llama_free(cp);
