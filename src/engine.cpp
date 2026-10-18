@@ -204,7 +204,8 @@ bool engine::load(const engine_params & p) {
     // small models fit, and big ubatches can exceed per-op NPU buffer limits (e.g. a 248K-vocab head)
     if (params_.n_ubatch <= 0) params_.n_ubatch = llama_model_size(mp_) > (3ull << 30) ? 2048 : 512;
     params_.n_batch = std::max(params_.n_batch, params_.n_ubatch);
-    fprintf(stderr, "[trilane] n_ubatch = %d, decode slots = %d\n", params_.n_ubatch, params_.max_seqs);
+    if (mp_ == md_) params_.npu_decode_slots = 0;
+    fprintf(stderr, "[trilane] n_ubatch = %d, decode slots = %d CPU + %d NPU\n", params_.n_ubatch, params_.max_seqs, params_.npu_decode_slots);
 
     auto make_ctx = [&](llama_model * m, int threads, bool host_only, int n_seq) {
         llama_context_params cp = llama_context_default_params();
@@ -376,7 +377,30 @@ void engine::learn(bool on_npu, int n, double ms) {
     corr = 0.7 * corr + 0.3 * ratio;
 }
 
+void engine::set_live(const request_ptr & r, const std::string & lane, const char * phase) {
+    std::lock_guard<std::mutex> lk(live_mtx_);
+    live_[r->st.id] = { r->st.id, lane, phase, now_ms() };
+}
+
+void engine::clear_live(int64_t id) {
+    std::lock_guard<std::mutex> lk(live_mtx_);
+    live_.erase(id);
+}
+
+std::vector<live_seq> engine::live() const {
+    std::lock_guard<std::mutex> lk(live_mtx_);
+    std::vector<live_seq> v;
+    for (auto & kv : live_) v.push_back(kv.second);
+    return v;
+}
+
+// every finished request passes through here, errors included
 void engine::record(const request_ptr & r) {
+    clear_live(r->st.id);
+    if (r->st.n_gen_npu > 0 && r->st.route != "npu") {
+        const std::string npu = params_.prefill_dev.substr(0, params_.prefill_dev.find(','));
+        r->st.decode_dev = r->st.n_gen_npu >= r->st.n_gen ? npu : npu + "+CPU";
+    }
     std::lock_guard<std::mutex> lk(hist_mtx_);
     history_.push_back(r->st);
     if (history_.size() > 200) history_.erase(history_.begin());
@@ -463,22 +487,115 @@ void engine::emit(const request_ptr & r) {
     r->st.n_gen++;
 }
 
-// NPU lane: prefill one request at a time, then hand its state to the CPU lane (or decode on the NPU for route "npu")
+// an NPU-prefilled sequence waits in the CPU queue behind a full CPU lane: the idle NPU can decode it meanwhile
+// (call with q_mtx_ held) index of the oldest such sequence that will not get a CPU slot now, or -1
+int engine::steal_index() const {
+    if (params_.npu_decode_slots <= 0 || !split()) return -1;
+    for (int i = std::max(0, params_.max_seqs - n_active_); i < (int) cpu_inbox_.size(); i++) {
+        if (!cpu_inbox_[i]->blob.empty()) return i;
+    }
+    return -1;
+}
+
+// decode r on the NPU context (seq 0). As an overflow slot it yields as soon as the CPU lane has room for it
+// or a prompt waits for prefill: the sequence state goes to the front of the CPU queue, pos and sampler intact.
+// Returns false if the sequence moved to the CPU lane.
+bool engine::npu_decode(const request_ptr & r, bool overflow) {
+    if (!r->decoding) {
+        r->decoding = true;
+        r->pos = (int) r->toks.size();
+        r->st.ttft_ms = now_ms() - r->st.t_submit_ms;
+        r->t_decode0 = now_ms();
+        r->st.t_decode_start_ms = r->t_decode0;
+    }
+    { std::lock_guard<std::mutex> lk(live_mtx_); npu_phase_ = "decode #" + std::to_string(r->st.id); }
+    set_live(r, "NPU", "decode");
+    const double t0 = now_ms();
+    llama_batch b = llama_batch_init(1, 0, 1);
+    bool yield = false;
+    while (!should_stop(r)) {
+        if (overflow) {
+            std::lock_guard<std::mutex> lk(q_mtx_);
+            yield = !npu_queue_.empty() || n_active_ + (int) cpu_inbox_.size() < params_.max_seqs;
+            if (yield) break;
+        }
+        emit(r);
+        r->st.n_gen_npu++;
+        b.n_tokens = 1; b.token[0] = r->cur; b.pos[0] = r->pos++; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
+        if (llama_decode(cp_, b) != 0) { r->st.stop_reason = "decode_error"; break; }
+        r->cur = llama_sampler_sample(r->smpl, cp_, -1);
+    }
+    llama_batch_free(b);
+    r->st.npu_decode_ms += now_ms() - t0;
+    if (yield) {
+        clear_live(r->st.id);
+        r->blob.resize(llama_state_seq_get_size(cp_, 0));
+        llama_state_seq_get_data(cp_, r->blob.data(), r->blob.size(), 0);
+        {
+            std::lock_guard<std::mutex> lk(q_mtx_);
+            cpu_inbox_.push_front(r);
+        }
+        q_cv_.notify_all();
+        return false;
+    }
+    if (!r->pending.empty()) { r->push(r->pending); r->pending.clear(); }
+    r->st.decode_ms = now_ms() - r->t_decode0;
+    r->st.batch_peak = std::max(r->st.batch_peak, 1);
+    record(r);
+    r->finish(r->st.stop_reason);
+    return true;
+}
+
+// NPU decode slot: take a prefilled sequence the CPU lane has no slot for and decode it here until the CPU has room
+void engine::npu_overflow(const request_ptr & r) {
+    keepwarm_pause(true);
+    const double t0 = now_ms();
+    llama_memory_clear(llama_get_memory(cp_), true);
+    if (llama_state_seq_set_data(cp_, r->blob.data(), r->blob.size(), 0) == 0) {
+        // cannot restore here; leave it to the CPU lane
+        {
+            std::lock_guard<std::mutex> lk(q_mtx_);
+            cpu_inbox_.push_front(r);
+        }
+        q_cv_.notify_all();
+    } else {
+        r->st.handoff_ms += now_ms() - t0;
+        r->blob.clear();
+        r->blob.shrink_to_fit();
+        npu_decode(r, true);
+    }
+    keepwarm_pause(false);
+    { std::lock_guard<std::mutex> lk(live_mtx_); npu_phase_ = "idle"; }
+}
+
+// NPU lane: prefill one request at a time, then hand its state to the CPU lane (or decode on the NPU for route "npu").
+// With nothing to prefill it can serve as an extra decode slot (npu_decode_slots).
 void engine::npu_worker() {
     for (;;) {
         request_ptr r;
+        bool steal = false;
         {
             std::unique_lock<std::mutex> lk(q_mtx_);
-            q_cv_.wait(lk, [&] { return stop_ || !npu_queue_.empty(); });
+            q_cv_.wait(lk, [&] { return stop_ || !npu_queue_.empty() || steal_index() >= 0; });
             if (stop_) return;
-            r = npu_queue_.front();
-            npu_queue_.pop_front();
-            npu_busy_ = true;
+            if (!npu_queue_.empty()) {
+                r = npu_queue_.front();
+                npu_queue_.pop_front();
+                npu_busy_ = true;
+            } else {
+                // the oldest sequence still waiting for a CPU slot
+                const int i = steal_index();
+                r = cpu_inbox_[i];
+                cpu_inbox_.erase(cpu_inbox_.begin() + i);
+                steal = true;
+            }
         }
+        if (steal) { npu_overflow(r); continue; }
         if (r->cancelled) { r->finish("client"); record(r); npu_busy_ = false; continue; }
 
         keepwarm_pause(true);
         { std::lock_guard<std::mutex> lk(live_mtx_); npu_phase_ = "prefill #" + std::to_string(r->st.id); }
+        set_live(r, "NPU", "prefill");
         r->st.t_start_ms = now_ms();
         r->st.queue_ms   = r->st.t_start_ms - r->st.t_submit_ms;
         llama_memory_clear(llama_get_memory(cp_), true);
@@ -506,24 +623,11 @@ void engine::npu_worker() {
 
         if (r->st.route == "npu") {
             // comparison mode: decode on the NPU too
-            r->st.ttft_ms = now_ms() - r->st.t_submit_ms;
-            r->t_decode0 = now_ms();
-            r->st.t_decode_start_ms = r->t_decode0;
-            llama_batch b = llama_batch_init(1, 0, 1);
-            r->pos = (int) r->toks.size();
-            while (!should_stop(r)) {
-                emit(r);
-                b.n_tokens = 1; b.token[0] = r->cur; b.pos[0] = r->pos++; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
-                if (llama_decode(cp_, b) != 0) { r->st.stop_reason = "decode_error"; break; }
-                r->cur = llama_sampler_sample(r->smpl, cp_, -1);
-            }
-            llama_batch_free(b);
-            if (!r->pending.empty()) r->push(r->pending);
-            r->st.decode_ms = now_ms() - r->t_decode0;
-            r->st.batch_peak = 1;
-            record(r);
-            r->finish(r->st.stop_reason);
+            r->blob.clear();
+            r->blob.shrink_to_fit();
+            npu_decode(r, false);
         } else {
+            clear_live(r->st.id);
             {
                 std::lock_guard<std::mutex> lk(q_mtx_);
                 cpu_inbox_.push_back(r);
@@ -582,12 +686,13 @@ void engine::cpu_worker() {
                     continue;
                 }
                 r->st.handoff_mb = r->blob.size() / 1048576.0;
-                r->st.handoff_ms = now_ms() - t0;
+                r->st.handoff_ms += now_ms() - t0;
                 r->blob.clear();
                 r->blob.shrink_to_fit();
             } else {
                 // short prompt: prefill on the CPU lane (the other slots pause for this one call)
                 { std::lock_guard<std::mutex> lk(live_mtx_); cpu_phase_ = "prefill #" + std::to_string(r->st.id); }
+                set_live(r, "CPU" + std::to_string(s), "prefill");
                 r->st.t_start_ms = t0;
                 r->st.queue_ms   = t0 - r->st.t_submit_ms;
                 const bool restored = r->restore.empty() || llama_state_seq_set_data(cd_, r->restore.data(), r->restore.size(), s) > 0;
@@ -607,13 +712,19 @@ void engine::cpu_worker() {
                 r->restore.clear();
                 r->restore.shrink_to_fit();
             }
-            r->pos = (int) r->toks.size();
             r->st.slot = s;
-            r->st.ttft_ms = now_ms() - r->st.t_submit_ms;
-            r->t_decode0 = now_ms();
-            r->st.t_decode_start_ms = r->t_decode0;
+            r->st.t_cpu_join_ms = now_ms();
+            set_live(r, "CPU" + std::to_string(s), "decode");
+            if (!r->decoding) {
+                r->decoding = true;
+                r->pos = (int) r->toks.size();
+                r->st.ttft_ms = now_ms() - r->st.t_submit_ms;
+                r->t_decode0 = now_ms();
+                r->st.t_decode_start_ms = r->t_decode0;
+            }
             slots[s] = r;
             n_active_++;
+            if (params_.npu_decode_slots > 0) q_cv_.notify_all(); // a fuller CPU lane may leave work for the NPU
         }
 
         // step: emit each slot's pending token, stop finished ones, decode the rest together

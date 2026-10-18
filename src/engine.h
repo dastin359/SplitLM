@@ -11,6 +11,7 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -28,6 +29,7 @@ struct engine_params {
     int    n_batch          = 2048;
     int    n_ubatch         = 0;       // 0 = auto: 2048 for models beyond one NPU session window (fixed remap cost per ubatch), else 512
     int    max_seqs         = 4;       // concurrent decode slots on the CPU lane
+    int    npu_decode_slots = 0;       // 1 = the idle NPU decodes a sequence the full CPU lane cannot take yet
     int    keepwarm_ms      = 20;      // tiny NPU op cadence between prefills (0 = off)
     size_t prefix_cache_mb  = 2048;    // budget for cached sequence-state snapshots
     int    cpu_prefill_max  = 96;      // prompts with at most this many new tokens prefill on the CPU
@@ -73,10 +75,21 @@ struct gen_stats {
     double      handoff_ms  = 0;
     double      handoff_mb  = 0;
     double      ttft_ms     = 0;       // from submit to first token
-    double      t_decode_start_ms = 0; // engine clock when this sequence joined the CPU batch
+    double      t_decode_start_ms = 0; // engine clock of the first decode step (CPU batch or NPU decode slot)
+    double      t_cpu_join_ms = 0;     // engine clock when it (last) joined the CPU batch
     double      decode_ms   = 0;
     int         n_gen       = 0;
+    double      npu_decode_ms = 0;     // part of decode_ms spent in an NPU decode slot
+    int         n_gen_npu   = 0;       // tokens generated there
     std::string stop_reason;
+};
+
+// what one in-flight request is doing right now, for the dashboard
+struct live_seq {
+    int64_t     id    = 0;
+    std::string lane;          // "NPU" or "CPU<slot>"
+    std::string phase;         // "prefill" | "decode"
+    double      t0_ms = 0;     // engine clock when this phase started
 };
 
 struct chat_msg {
@@ -104,6 +117,7 @@ struct request {
     int                  pos  = 0;
     std::string          pending;       // incomplete UTF-8 tail
     double               t_decode0 = 0;
+    bool                 decoding  = false; // first token out; pos and timing carry over when the sequence changes lanes
 
     ~request();
     void push(std::string s);
@@ -130,10 +144,12 @@ class engine {
     bool        dense_aliased() const { return dense_aliased_; }
     std::string prefill_dev() const { return params_.prefill_dev; }
     int         max_seqs() const { return params_.max_seqs; }
+    int         npu_decode_slots() const { return params_.npu_decode_slots; }
     double      now_ms() const;
 
     std::vector<gen_stats> history() const;
     std::string            live_phase() const;
+    std::vector<live_seq>  live() const;
     int                    active_slots() const { return n_active_.load(); }
     int                    npu_queue_len() const;
     size_t                 cache_entries() const;
@@ -158,6 +174,9 @@ class engine {
     void calibrate();
 
     void npu_worker();
+    bool npu_decode(const request_ptr & r, bool overflow);
+    void npu_overflow(const request_ptr & r);
+    int  steal_index() const;
     void cpu_worker();
     void emit(const request_ptr & r);             // stream r->cur as text
     bool should_stop(const request_ptr & r) const;
@@ -195,6 +214,9 @@ class engine {
 
     mutable std::mutex live_mtx_;
     std::string npu_phase_ = "idle", cpu_phase_ = "idle";
+    std::map<int64_t, live_seq> live_;
+    void set_live(const request_ptr & r, const std::string & lane, const char * phase);
+    void clear_live(int64_t id);
 
     mutable std::mutex cache_mtx_;
     std::list<cache_entry> cache_;        // front = most recently used

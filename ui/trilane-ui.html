@@ -49,7 +49,7 @@ button:disabled { opacity: .5; cursor: default; }
 .tile .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
 .tile .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
 .tile .s { font-size: 12px; color: var(--muted); margin-top: 2px; }
-#lanes { margin: 4px 14px 0; border: 1px solid var(--line); border-radius: 10px; width: calc(100% - 28px); height: 150px; display: block; }
+#lanes { margin: 4px 14px 0; border: 1px solid var(--line); border-radius: 10px; width: calc(100% - 28px); height: 160px; display: block; }
 .legend { display: flex; gap: 14px; padding: 6px 14px 0; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
 .phase { padding: 8px 14px 0; font-size: 12px; color: var(--muted); font-family: var(--mono); }
 table { width: calc(100% - 28px); margin: 8px 14px 14px; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -82,6 +82,7 @@ th { color: var(--muted); font-weight: 600; }
         <label>Temp <input id="temp" type="number" value="0.7" min="0" max="2" step="0.1"></label>
         <span style="flex:1"></span>
         <button class="ghost" id="longprompt" title="Paste a long document to show NPU prefill">+ long doc</button>
+        <button class="ghost" id="burst" title="Send four long prompts at once to show both chips working together">burst ×4</button>
         <button class="ghost" id="clear">New chat</button>
         <button id="send">Send</button>
       </div>
@@ -198,46 +199,72 @@ async function send() {
   poll();
 }
 
+// one row for the NPU, one per CPU decode slot; finished requests from /stats history, in-flight ones from /stats live
 function drawLanes() {
   const cv = $('lanes');
+  const nslots = stats?.max_seqs || 1;
+  const rows = ['NPU'].concat(Array.from({ length: nslots }, (_, s) => nslots > 1 ? `CPU ${s}` : 'CPU'));
+  const wantH = 30 + rows.length * 26;
+  if (cv.style.height !== wantH + 'px') cv.style.height = wantH + 'px';
   const dpr = window.devicePixelRatio || 1;
   const W = cv.clientWidth, H = cv.clientHeight;
-  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
   const g = cv.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, W, H);
   const css = getComputedStyle(document.documentElement);
   const col = (v) => css.getPropertyValue(v).trim();
-  const lanes = [['NPU', col('--npu')], ['CPU', col('--cpu')]];
-  const left = 44, laneH = (H - 24) / 2, span = 60000;
+  const NPU = col('--npu'), CPU = col('--cpu');
+  const left = 50, top = 6, laneH = (H - 22 - top) / rows.length, span = 60000;
   const now = performance.now() + clockOffset;
   g.font = '11px system-ui'; g.fillStyle = col('--muted');
-  lanes.forEach(([name], i) => { g.fillText(name, 8, 14 + i * laneH + laneH / 2); });
+  rows.forEach((name, i) => { g.fillText(name, 8, top + i * laneH + laneH / 2 + 4); });
   g.strokeStyle = col('--line');
   for (let s = 0; s <= 60; s += 10) {
     const x = left + (W - left - 8) * (1 - s / 60);
-    g.beginPath(); g.moveTo(x, 6); g.lineTo(x, H - 16); g.stroke();
+    g.beginPath(); g.moveTo(x, top); g.lineTo(x, H - 16); g.stroke();
+    g.fillStyle = col('--muted');
     g.fillText(s === 0 ? 'now' : `-${s}s`, x - 10, H - 4);
   }
   const X = (t) => left + (W - left - 8) * (1 - (now - t) / span);
-  const laneOf = (d) => d && d.startsWith('HTP') ? 0 : 1;
-  function bar(lane, t0, t1, color, striped) {
-    if (t1 < now - span) return;
+  function bar(row, t0, t1, color, striped, label) {
+    if (t1 < now - span || t1 <= t0 - 1) return;
     const x0 = Math.max(left, X(t0)), x1 = Math.max(x0 + 2, X(t1));
-    const y = 8 + lane * laneH, h = laneH - 10;
+    const y = top + row * laneH + 2, h = laneH - 4;
     g.fillStyle = color;
-    if (!striped) { g.fillRect(x0, y, x1 - x0, h); return; }
-    g.globalAlpha = 0.35; g.fillRect(x0, y, x1 - x0, h); g.globalAlpha = 1;
-    g.save(); g.beginPath(); g.rect(x0, y, x1 - x0, h); g.clip();
-    g.strokeStyle = color; g.lineWidth = 2;
-    for (let sx = x0 - h; sx < x1; sx += 7) { g.beginPath(); g.moveTo(sx, y + h); g.lineTo(sx + h, y); g.stroke(); }
-    g.restore();
+    if (!striped) g.fillRect(x0, y, x1 - x0, h);
+    else {
+      g.globalAlpha = 0.3; g.fillRect(x0, y, x1 - x0, h); g.globalAlpha = 1;
+      g.save(); g.beginPath(); g.rect(x0, y, x1 - x0, h); g.clip();
+      g.strokeStyle = color; g.lineWidth = 2;
+      for (let sx = x0 - h; sx < x1; sx += 7) { g.beginPath(); g.moveTo(sx, y + h); g.lineTo(sx + h, y); g.stroke(); }
+      g.restore();
+    }
+    if (label && x1 - x0 > 30) {
+      g.font = '600 10px system-ui'; g.fillStyle = striped ? col('--ink') : '#fff';
+      g.fillText(label, x0 + 4, y + h / 2 + 4); g.font = '11px system-ui';
+    }
   }
+  function tick(row, t) {
+    if (t < now - span) return;
+    g.fillStyle = col('--hand'); g.fillRect(X(t) - 1, top + row * laneH, 3, laneH);
+  }
+  const cpuRow = (slot) => 1 + Math.min(nslots - 1, Math.max(0, slot));
   for (const s of (stats?.history || [])) {
-    const t0 = s.t_start_ms, tp = t0 + s.prefill_ms, th = tp + s.handoff_ms, te = th + s.decode_ms;
-    bar(laneOf(s.prefill_dev), t0, tp, lanes[laneOf(s.prefill_dev)][1], false);
-    if (s.handoff_mb > 0) { g.fillStyle = col('--hand'); g.fillRect(X(tp), 8, 2, H - 26); }
-    bar(laneOf(s.decode_dev), th, te, lanes[laneOf(s.decode_dev)][1], true);
+    const npuPre = (s.prefill_dev || '').startsWith('HTP');
+    const tp = s.t_start_ms + s.prefill_ms, tag = '#' + s.id;
+    if (s.prefill_ms > 0) bar(npuPre ? 0 : cpuRow(s.slot), s.t_start_ms, tp, npuPre ? NPU : CPU, false, tag);
+    const td = s.t_decode_start_ms || tp, te = td + s.decode_ms;
+    if (s.route === 'npu') { bar(0, td, te, NPU, true, tag); continue; }
+    if (s.n_gen_npu > 0) bar(0, td, td + s.npu_decode_ms, NPU, true, tag);
+    if (s.slot >= 0 && s.t_cpu_join_ms > 0) {
+      bar(cpuRow(s.slot), s.t_cpu_join_ms, te, CPU, true, tag);
+      if (s.handoff_mb > 0) tick(cpuRow(s.slot), s.t_cpu_join_ms);
+    }
+  }
+  for (const l of (stats?.live || [])) {
+    const row = l.lane === 'NPU' ? 0 : cpuRow(+l.lane.slice(3));
+    bar(row, l.t0_ms, now, l.lane === 'NPU' ? NPU : CPU, l.phase === 'decode', '#' + l.id);
   }
   requestAnimationFrame(drawLanes);
 }
@@ -268,11 +295,32 @@ const LONG_DOC = `Summarize the following report in five bullet points.\n\n` + A
   `Token generation multiplies each weight matrix by a single vector, so it is limited by memory bandwidth and per-operation overhead, which favors the CPU cores. ` +
   `Moving the attention cache and recurrent state between the two takes a few milliseconds because all processors share the same memory.`).join('\n\n');
 
+// four different long prompts at once: shows NPU prefill and the CPU decode batch overlapping
+async function burst() {
+  const btn = $('burst');
+  btn.disabled = true;
+  const t0 = performance.now();
+  const one = (k) => fetch('/v1/chat/completions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: `Request ${k + 1}. ` + LONG_DOC.slice(0, 1800 + 700 * k) }],
+                           max_tokens: 96, temperature: 0, trilane: { route: $('route').value } }),
+  }).then(r => r.json()).catch(() => null);
+  const res = await Promise.all([0, 1, 2, 3].map(one));
+  const wall = (performance.now() - t0) / 1000;
+  const ok = res.filter(r => r && r.trilane);
+  const gen = ok.reduce((a, r) => a + r.trilane.n_gen, 0);
+  const worst = Math.max(...ok.map(r => r.trilane.ttft_ms));
+  const div = addMsg('assistant', `Burst: ${ok.length} requests at once, ${gen} tokens in ${fmt(wall, 1)} s = ${fmt(gen / wall, 1)} t/s aggregate; worst TTFT ${fmt(worst)} ms.`);
+  div.style.fontFamily = 'var(--mono)'; div.style.fontSize = '12px';
+  btn.disabled = false;
+}
+
 $('send').onclick = send;
 $('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send(); });
 $('clear').onclick = () => { messages = []; $('chat').innerHTML = ''; };
 $('longprompt').onclick = () => { $('input').value = LONG_DOC; $('input').focus(); };
-setInterval(() => { if (!busy) poll(); }, 1000);
+$('burst').onclick = burst;
+setInterval(poll, 500);
 poll();
 requestAnimationFrame(drawLanes);
 </script>

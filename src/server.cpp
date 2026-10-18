@@ -24,12 +24,12 @@ static void log_cb(ggml_log_level level, const char * text, void *) {
 static json stats_json(const trilane::gen_stats & s) {
     return {
         { "id", s.id }, { "t_submit_ms", s.t_submit_ms }, { "t_start_ms", s.t_start_ms }, { "queue_ms", s.queue_ms },
-        { "t_decode_start_ms", s.t_decode_start_ms }, { "slot", s.slot }, { "batch_peak", s.batch_peak },
+        { "t_decode_start_ms", s.t_decode_start_ms }, { "t_cpu_join_ms", s.t_cpu_join_ms }, { "slot", s.slot }, { "batch_peak", s.batch_peak },
         { "n_prompt", s.n_prompt }, { "n_cached", s.n_cached }, { "n_prefill", s.n_prefill },
         { "route", s.route }, { "prefill_dev", s.prefill_dev }, { "decode_dev", s.decode_dev },
         { "prefill_ms", s.prefill_ms }, { "prefill_tps", s.prefill_ms > 0 ? s.n_prefill / (s.prefill_ms / 1000.0) : 0.0 },
         { "handoff_ms", s.handoff_ms }, { "handoff_mb", s.handoff_mb }, { "ttft_ms", s.ttft_ms },
-        { "decode_ms", s.decode_ms }, { "n_gen", s.n_gen },
+        { "decode_ms", s.decode_ms }, { "n_gen", s.n_gen }, { "npu_decode_ms", s.npu_decode_ms }, { "n_gen_npu", s.n_gen_npu },
         { "decode_tps", s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0 },
         { "stop", s.stop_reason },
     };
@@ -58,7 +58,7 @@ static void usage() {
     fprintf(stderr,
         "usage: trilane-server -m model.gguf [--prefill-dev HTP0|CPU] [--host 127.0.0.1] [--port 8080]\n"
         "       [-t decode_threads] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [--keepwarm-ms 20] [--cpu-prefill-max 24] [--no-alias]\n"
-        "       [--cache-mb 2048] [--ui path/to/index.html] [-v]\n");
+        "       [--cache-mb 2048] [--slots 4] [--npu-decode-slots 0|1] [--ui path/to/index.html] [-v]\n");
     exit(1);
 }
 
@@ -89,6 +89,7 @@ int main(int argc, char ** argv) {
         else if (k == "--bench-concurrent") bench_conc = atoi(next());
         else if (k == "--bench-words")     bench_words_conc = atoi(next());
         else if (k == "--slots")           ep.max_seqs = atoi(next());
+        else if (k == "--npu-decode-slots") ep.npu_decode_slots = atoi(next());
         else if (k == "-v")                g_verbose = true;
         else usage();
     }
@@ -168,9 +169,9 @@ int main(int argc, char ** argv) {
             for (int k = 0; k < bench_conc; k++) {
                 auto & s = st[k];
                 gen += s.n_gen; pre += s.n_prefill;
-                printf("  #%-3lld prompt %5d on %-5s queue %7.0f ms | TTFT %7.0f ms | decode %5.1f t/s (batch up to %d, slot %d) | %d tok\n",
+                printf("  #%-3lld prompt %5d on %-5s queue %7.0f ms | TTFT %7.0f ms | decode %5.1f t/s on %-8s (batch up to %d, slot %d) | %d tok (%d on NPU)\n",
                        (long long) s.id, s.n_prompt, s.route.c_str(), s.queue_ms, s.ttft_ms,
-                       s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0, s.batch_peak, s.slot, s.n_gen);
+                       s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0, s.decode_dev.c_str(), s.batch_peak, s.slot, s.n_gen, s.n_gen_npu);
                 std::string head = txt[k].substr(0, 70);
                 for (auto & ch : head) if (ch == '\n') ch = ' ';
                 printf("        text[%d] %s\n", k, head.c_str());
@@ -207,15 +208,17 @@ int main(int argc, char ** argv) {
     svr.Get("/stats", [&](const httplib::Request &, httplib::Response & res) {
         json hist = json::array();
         for (auto & s : eng.history()) hist.push_back(stats_json(s));
+        json live = json::array();
+        for (auto & l : eng.live()) live.push_back({ { "id", l.id }, { "lane", l.lane }, { "phase", l.phase }, { "t0_ms", l.t0_ms } });
         const trilane::lane_cost cost = eng.cost();
         res.set_content(dump({
             { "model", eng.model_name() }, { "split", eng.split() }, { "aliased", eng.aliased() },
             { "prefill_dev", eng.prefill_dev() }, { "phase", eng.live_phase() }, { "now_ms", eng.now_ms() },
-            { "max_seqs", eng.max_seqs() }, { "active", eng.active_slots() }, { "npu_queue", eng.npu_queue_len() },
+            { "max_seqs", eng.max_seqs() }, { "npu_decode_slots", eng.npu_decode_slots() }, { "active", eng.active_slots() }, { "npu_queue", eng.npu_queue_len() },
             { "keepwarm_pings", eng.keepwarm_pings() },
             { "router", { { "cpu_prefill_max", eng.cpu_prefill_max() }, { "cpu_fixed_ms", cost.cpu_fixed_ms }, { "cpu_tps", cost.cpu_tps }, { "npu_fixed_ms", cost.npu_fixed_ms }, { "npu_tps", cost.npu_tps }, { "cpu_corr", cost.cpu_corr }, { "npu_corr", cost.npu_corr } } },
             { "cache", { { "entries", eng.cache_entries() }, { "mb", eng.cache_bytes() / 1048576.0 } } },
-            { "history", hist },
+            { "history", hist }, { "live", live },
         }), "application/json");
     });
 
