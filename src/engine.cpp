@@ -135,7 +135,47 @@ bool engine::load(const engine_params & p) {
     fprintf(stderr, "[trilane] %s (%s), split=%d aliased=%d\n", model_name_.c_str(), desc, split(), aliased_);
 
     if (split() && p.keepwarm_ms > 0) keepwarm_start();
+    if (split() && p.calibrate) calibrate();
     return true;
+}
+
+// Times synthetic prefills of two lengths on each lane, fits t(n) = fixed + n/tps, and sets the routing threshold.
+void engine::calibrate() {
+    const int n_short = 32, n_long = std::min(512, params_.n_ubatch);
+    std::vector<llama_token> toks(n_long);
+    for (int i = 0; i < n_long; i++) toks[i] = (llama_token) (1000 + (i * 7919) % 20000);
+    auto time_prefill = [&](llama_context * c, int n, bool npu) {
+        std::vector<llama_token> t(toks.begin(), toks.begin() + n);
+        double best = 1e30;
+        for (int rep = 0; rep < 2; rep++) {
+            if (npu) keepwarm_pause(true);
+            llama_memory_clear(llama_get_memory(c), true);
+            double t0 = now_ms();
+            prefill(c, t, 0);
+            best = std::min(best, now_ms() - t0);
+            if (npu) keepwarm_pause(false);
+        }
+        return best;
+    };
+    auto fit = [&](double ts, double tl, double & fixed_ms, double & tps) {
+        const double per_tok = std::max((tl - ts) / (n_long - n_short), 1e-6); // ms per token
+        tps      = 1000.0 / per_tok;
+        fixed_ms = std::max(ts - n_short * per_tok, 0.0);
+    };
+    time_prefill(cp_, n_short, true); // warm both graphs
+    time_prefill(cd_, n_short, false);
+    fit(time_prefill(cd_, n_short, false), time_prefill(cd_, n_long, false), cost_.cpu_fixed_ms, cost_.cpu_tps);
+    fit(time_prefill(cp_, n_short, true), time_prefill(cp_, n_long, true), cost_.npu_fixed_ms, cost_.npu_tps);
+    llama_memory_clear(llama_get_memory(cp_), true);
+    llama_memory_clear(llama_get_memory(cd_), true);
+
+    // NPU wins when npu_fixed + n/npu_tps (+ handoff, small) < cpu_fixed + n/cpu_tps
+    const double gain_per_tok = 1000.0 / cost_.cpu_tps - 1000.0 / cost_.npu_tps;
+    const double extra_fixed  = cost_.npu_fixed_ms - cost_.cpu_fixed_ms + 5.0;
+    cost_.crossover = gain_per_tok > 0 ? (int) std::max(0.0, extra_fixed / gain_per_tok) : 1 << 30;
+    params_.cpu_prefill_max = cost_.crossover;
+    fprintf(stderr, "[trilane] lane cost model: CPU %.0f ms + n/%.0f t/s | NPU %.0f ms + n/%.0f t/s -> NPU prefill above %d new tokens\n",
+            cost_.cpu_fixed_ms, cost_.cpu_tps, cost_.npu_fixed_ms, cost_.npu_tps, cost_.crossover);
 }
 
 std::string engine::apply_template(const std::vector<chat_msg> & msgs) const {
@@ -237,7 +277,13 @@ gen_stats engine::chat(const std::vector<chat_msg> & msgs, const gen_params & gp
     // lane choice: long prefills on the NPU, short ones stay on the CPU (no NPU dispatch, no handoff)
     std::string route = gp.route;
     if (!split()) route = "cpu";
-    else if (route == "auto") route = st.n_prefill > params_.cpu_prefill_max ? "split" : "cpu";
+    else if (route == "auto") {
+        if (cost_.cpu_tps > 0 && cost_.npu_tps > 0) {
+            route = cost_.predict_npu(st.n_prefill) < cost_.predict_cpu(st.n_prefill) ? "split" : "cpu";
+        } else {
+            route = st.n_prefill > params_.cpu_prefill_max ? "split" : "cpu";
+        }
+    }
     st.route = route;
     llama_context * pre = route == "cpu" ? cd_ : cp_;
     llama_context * dec = route == "npu" ? cp_ : cd_;
@@ -266,6 +312,16 @@ gen_stats engine::chat(const std::vector<chat_msg> & msgs, const gen_params & gp
     llama_token tok = llama_sampler_sample(smpl, pre, -1);
     double t1 = now_ms();
     st.prefill_ms = t1 - t0;
+
+    // learn how far the calibrated model is off for this lane (warm contexts, cached prefixes, thermal state)
+    if (cost_.cpu_tps > 0 && cost_.npu_tps > 0) {
+        const bool on_npu = pre == cp_ && split();
+        const double base = on_npu ? cost_.npu_fixed_ms + 1000.0 * st.n_prefill / cost_.npu_tps
+                                   : cost_.cpu_fixed_ms + 1000.0 * st.n_prefill / cost_.cpu_tps;
+        const double ratio = std::clamp(st.prefill_ms / std::max(base, 1.0), 0.25, 4.0);
+        double & corr = on_npu ? cost_.npu_corr : cost_.cpu_corr;
+        corr = 0.7 * corr + 0.3 * ratio;
+    }
 
     // snapshot = handoff blob; it also becomes the prefix-cache entry for this prompt
     std::vector<uint8_t> snap(llama_state_seq_get_size(pre, 0));

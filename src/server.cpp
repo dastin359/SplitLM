@@ -39,7 +39,7 @@ static std::string dump(const json & j) {
 static void usage() {
     fprintf(stderr,
         "usage: trilane-server -m model.gguf [--prefill-dev HTP0|CPU] [--host 127.0.0.1] [--port 8080]\n"
-        "       [-t decode_threads] [-c n_ctx] [--keepwarm-ms 20] [--cpu-prefill-max 24] [--no-alias]\n"
+        "       [-t decode_threads] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [--keepwarm-ms 20] [--cpu-prefill-max 24] [--no-alias]\n"
         "       [--cache-mb 2048] [--ui path/to/index.html] [-v]\n");
     exit(1);
 }
@@ -57,9 +57,12 @@ int main(int argc, char ** argv) {
         else if (k == "--port")            port = atoi(next());
         else if (k == "-t")                ep.threads_decode = atoi(next());
         else if (k == "-c")                ep.n_ctx = atoi(next());
+        else if (k == "-ub")               ep.n_ubatch = atoi(next());
+        else if (k == "-b")                ep.n_batch = atoi(next());
         else if (k == "--keepwarm-ms")     ep.keepwarm_ms = atoi(next());
         else if (k == "--cpu-prefill-max") ep.cpu_prefill_max = atoi(next());
         else if (k == "--no-alias")        ep.alias_experts = false;
+        else if (k == "--no-calibrate")    ep.calibrate = false;
         else if (k == "--cache-mb")        ep.prefix_cache_mb = (size_t) atoll(next());
         else if (k == "--ui")              ui_path = next();
         else if (k == "-v")                g_verbose = true;
@@ -103,6 +106,7 @@ int main(int argc, char ** argv) {
             { "model", eng.model_name() }, { "split", eng.split() }, { "aliased", eng.aliased() },
             { "prefill_dev", eng.prefill_dev() }, { "phase", eng.live_phase() }, { "now_ms", eng.now_ms() },
             { "keepwarm_pings", eng.keepwarm_pings() },
+            { "router", { { "cpu_prefill_max", eng.cpu_prefill_max() }, { "cpu_fixed_ms", eng.cost().cpu_fixed_ms }, { "cpu_tps", eng.cost().cpu_tps }, { "npu_fixed_ms", eng.cost().npu_fixed_ms }, { "npu_tps", eng.cost().npu_tps }, { "cpu_corr", eng.cost().cpu_corr }, { "npu_corr", eng.cost().npu_corr } } },
             { "cache", { { "entries", eng.cache_entries() }, { "mb", eng.cache_bytes() / 1048576.0 } } },
             { "history", hist },
         }), "application/json");

@@ -21,11 +21,24 @@ struct engine_params {
     int    threads_prefill  = 4;       // host threads of the prefill context
     int    n_ctx            = 8192;
     int    n_batch          = 2048;
-    int    n_ubatch         = 512;
+    int    n_ubatch         = 2048;    // big models pay a fixed NPU weight-remap cost per ubatch, so go large
     int    keepwarm_ms      = 20;      // tiny NPU op cadence between prefills (0 = off)
     size_t prefix_cache_mb  = 2048;    // budget for cached sequence-state snapshots
-    int    cpu_prefill_max  = 24;      // prompts with at most this many new tokens prefill on the CPU
+    int    cpu_prefill_max  = 96;      // prompts with at most this many new tokens prefill on the CPU
     bool   alias_experts    = true;    // CPU decode reads the NPU's expert weights in place (MoE models)
+    bool   calibrate        = true;    // measure both lanes at startup and derive cpu_prefill_max
+};
+
+// prefill cost model per lane: t(n) = fixed_ms + n / tps * 1000
+struct lane_cost {
+    double cpu_fixed_ms = 0, cpu_tps = 0;
+    double npu_fixed_ms = 0, npu_tps = 0;
+    int    crossover    = 0;           // NPU wins above this many new tokens (cold context)
+    double cpu_corr     = 1.0;         // online actual/predicted ratios (EWMA), learned from real requests
+    double npu_corr     = 1.0;
+
+    double predict_cpu(int n) const { return cpu_corr * (cpu_fixed_ms + 1000.0 * n / cpu_tps); }
+    double predict_npu(int n) const { return npu_corr * (npu_fixed_ms + 1000.0 * n / npu_tps) + 5.0; } // + handoff
 };
 
 struct gen_params {
@@ -82,8 +95,12 @@ class engine {
     size_t                 cache_entries() const;
     size_t                 cache_bytes() const;
     int64_t                keepwarm_pings() const { return pings_.load(); }
+    lane_cost              cost() const { return cost_; }
+    int                    cpu_prefill_max() const { return params_.cpu_prefill_max; }
 
   private:
+    void calibrate();
+    lane_cost cost_;
     struct cache_entry {
         std::vector<llama_token> toks;
         std::vector<uint8_t>     state;
