@@ -1521,7 +1521,7 @@ index 2632ae3..662e7f1 100644
          int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
  
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 605c23c..495461f 100644
+index 605c23c..84e7760 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -152,6 +152,9 @@ static size_t opt_mbuf_total  = 0;                        // total buffer space
@@ -1534,7 +1534,7 @@ index 605c23c..495461f 100644
  static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  static int    opt_ar_select  = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
-@@ -166,6 +169,11 @@ static int opt_opqueue  = 8;   // max number of pending batches
+@@ -166,7 +169,15 @@ static int opt_opqueue  = 8;   // max number of pending batches
  static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
  static int opt_oppoll   = 0;    // polling for batch completions
  static int opt_opfusion  = 1;    // enable/disable op fusion
@@ -1542,11 +1542,15 @@ index 605c23c..495461f 100644
 +static int opt_mm_min_nchunks = 0; // HMX 2D matmuls: split N into at least this many chunks (0 = solver choice)
 +static int opt_mmid_stream = 1;    // HMX MUL_MAT_ID(_NX): 1 = streamed expert kernel (async HMX, double buffers), 0 = per-expert synchronous kernel
 +static int opt_nx_swiglu = 0;      // 1: SWIGLU in the gate/up MUL_MAT_NX epilogue (slower on v73: HVX is busy dequantizing)
++static int opt_conv_cb = 0;  // short-conv block: channels per block (0 = 128)
++static int opt_conv_tt = 0;  // short-conv block: tokens per time tile (0 = as many as fit)
 +static int opt_conv_block_silu = 1; // 0: leave the SILU after a fused short-conv block as its own op   // 1: MUL_MAT+ADD always reads src2 from DDR when the kernel allows it (testing)
  static int opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = quantized only (default), 2 = always
++static int opt_gdn_fuse  = 3;    // HMX chunked GATED_DELTA_NET absorbs: 1 = q/k L2 norms, 2 = gated output norm (Qwen3.5), 3 = both
  
  enum ggml_hexagon_fusion_flags {
-@@ -175,6 +183,12 @@ enum ggml_hexagon_fusion_flags {
+     GGML_HEXAGON_FUSE_ALLREDUCE_ADD = (1 << 1), // 2
+@@ -175,6 +186,12 @@ enum ggml_hexagon_fusion_flags {
      GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
      GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
      GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
@@ -1559,7 +1563,7 @@ index 605c23c..495461f 100644
  };
  
  static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
-@@ -1998,34 +2012,47 @@ struct ggml_hexagon_opbatch {
+@@ -1998,34 +2015,47 @@ struct ggml_hexagon_opbatch {
          const struct htp_mm_kernel_params * orig_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
          struct htp_mm_kernel_params kparams;
          ggml_hexagon_precompute_fused_matmul_add_params(sess, src0, src1, src2, node.dst(), &kparams);
@@ -1579,15 +1583,15 @@ index 605c23c..495461f 100644
 -        const int src1_nrows = src1->ne[1] * src1->ne[2] * src1->ne[3];
 -        const bool can_fuse = (kparams.n_hmx > 0) || (src1_nrows == 1);
 -        if (!can_fuse) return false;
-+            const int src1_nrows = src1->ne[1] * src1->ne[2] * src1->ne[3];
-+            if (kparams.n_hmx == 0 && src1_nrows != 1) return false;
- 
+-
 -        if ((size_t) kparams.vtcm_size > sess->vtcm_size) {
 -            HEX_VERBOSE("ggml-hex: %s skip MUL_MAT_ADD fusion: VTCM needed (%d) > budget (%zu)\n",
 -                        sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
 -            return false;
 -        }
--
++            const int src1_nrows = src1->ne[1] * src1->ne[2] * src1->ne[3];
++            if (kparams.n_hmx == 0 && src1_nrows != 1) return false;
+ 
 -        if (kparams.n_hmx > 0 && orig_kparams->n_hmx > 0) {
 -            if (kparams.m_chunk < orig_kparams->m_chunk ||
 -                kparams.n_chunk < orig_kparams->n_chunk ||
@@ -1630,7 +1634,7 @@ index 605c23c..495461f 100644
          }
  
          if (!try_fuse_common(src2, node.dst())) {
-@@ -2419,6 +2446,199 @@ struct ggml_hexagon_opbatch {
+@@ -2419,6 +2449,199 @@ struct ggml_hexagon_opbatch {
          return true;
      }
  
@@ -1830,7 +1834,7 @@ index 605c23c..495461f 100644
      bool try_fuse(const htp_opnode & node) {
          if (!opt_opfusion) return false;
          if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_ALLREDUCE_ADD) && try_fuse_allreduce_add(node)) return true;
-@@ -2427,6 +2647,10 @@ struct ggml_hexagon_opbatch {
+@@ -2427,6 +2650,10 @@ struct ggml_hexagon_opbatch {
          if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_NX)    && try_fuse_mul_mat_nx(node))    return true;
          if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_MUL_MAT_ID_NX) && try_fuse_mul_mat_id_nx(node)) return true;
          if (ggml_hexagon_is_fusion_enabled(GGML_HEXAGON_FUSE_GDN_CPY)       && try_fuse_gdn_cpy(node))       return true;
@@ -1841,7 +1845,7 @@ index 605c23c..495461f 100644
          return false;
      }
  };
-@@ -3548,7 +3772,8 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3548,7 +3775,8 @@ static bool ggml_hexagon_precompute_flash_attn_params(
      kparams->logit_softcap = logit_softcap;
  
      kparams->head_split = (opt_fa_head_split != 0) ? 1 : 0;
@@ -1851,7 +1855,7 @@ index 605c23c..495461f 100644
      kparams->G = G;
  
      const uint32_t n_head = q->ne[2];
-@@ -3565,7 +3790,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3565,7 +3793,7 @@ static bool ggml_hexagon_precompute_flash_attn_params(
          const uint32_t DK_pad = hex_round_up(DK, 64);
          const uint32_t DV_pad = hex_round_up(DV, 64);
          size_t Br = 0, Bc = 0;
@@ -1860,7 +1864,7 @@ index 605c23c..495461f 100644
          if (ret == 0) {
              kparams->kernel_type = HTP_FA_KERNEL_HMX;
              if (logit_softcap == 0.0f) {
-@@ -3889,10 +4114,22 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3889,10 +4117,22 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
          if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, m_for_solver_padded, cost_m, n_threads, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
              return false;
          }
@@ -1884,7 +1888,7 @@ index 605c23c..495461f 100644
      kparams->m_chunk = m_chunk;
      kparams->n_chunk = n_chunk;
      kparams->n_threads = n_threads;
-@@ -4504,6 +4741,12 @@ static void ggml_hexagon_precompute_unary_params(
+@@ -4504,6 +4744,12 @@ static void ggml_hexagon_precompute_unary_params(
      kparams->vtcm_dst_size  = L.dst_bytes * n_threads;
  
      kparams->block = col_tile ? 0 : ((L.src0_bytes / 2) / src0_row_size_aligned);
@@ -1897,7 +1901,7 @@ index 605c23c..495461f 100644
  
      const uint32_t tiles_per_row = col_tile > 0 ? (src0->ne[0] + col_tile - 1) / col_tile : 1;
      kparams->div_ne01  = init_fastdiv_values(src0->ne[1]);
-@@ -6905,6 +7148,160 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
+@@ -6905,6 +7151,368 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
      return true;
  }
  
@@ -2019,6 +2023,202 @@ index 605c23c..495461f 100644
 +    return true;
 +}
 +
++// GATED_DELTA_NET (HMX chunked kernel) with its Qwen3.5 neighbours:
++//   q = SCALE(RMS_NORM(q_raw)), k = SCALE(RMS_NORM(k_raw))            -> IN_NORM (normalized per chunk in VTCM)
++//   CPY(view(gdn, state tail), cache)                                  -> state written to the cache
++//   out = MUL(MUL(RMS_NORM(view(gdn, attn)), w), SILU(z))              -> OUT_NORM (gated norm before the output DMA)
++// All of it runs at the position of the GATED_DELTA_NET node.
++struct ggml_hexagon_gdn_fuse {
++    int   fuse = 0;          // HTP_GDN_FUSE_*
++    const ggml_tensor * q_raw = nullptr;
++    const ggml_tensor * k_raw = nullptr;
++    const ggml_tensor * w     = nullptr;
++    const ggml_tensor * z     = nullptr;
++    float in_eps = 0.f, in_scale = 0.f, out_eps = 0.f;
++    int   cpy = -1, rms = -1, mul_w = -1, silu = -1, mul_z = -1;
++    int   in_nodes[4] = { -1, -1, -1, -1 }; // q rms, q scale, k rms, k scale
++};
++
++static bool ggml_hexagon_used_only_by_nodes(const ggml_cgraph * graph, const ggml_tensor * t, std::initializer_list<const ggml_tensor *> users) {
++    if (t->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
++    for (int j = 0; j < graph->n_nodes; j++) {
++        const ggml_tensor * n = graph->nodes[j];
++        if (ggml_op_is_empty(n->op)) continue;
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            const ggml_tensor * src = n->src[s];
++            if (!src) continue;
++            if (src == t || src->view_src == t) {
++                bool ok = false;
++                for (const ggml_tensor * u : users) ok = ok || (u == n);
++                if (!ok) return false;
++            }
++        }
++    }
++    return true;
++}
++
++// q or k input of the GDN: SCALE(RMS_NORM(raw)) with raw rows contiguous
++static bool ggml_hexagon_match_gdn_l2(const ggml_cgraph * graph, const ggml_tensor * gdn, const ggml_tensor * sc,
++                                      const ggml_tensor *& raw, float & eps, float & scale) {
++    if (!sc || sc->op != GGML_OP_SCALE || sc->type != GGML_TYPE_F32) return false;
++    float bias = 0.f;
++    memcpy(&scale, (const float *) sc->op_params + 0, sizeof(float));
++    memcpy(&bias,  (const float *) sc->op_params + 1, sizeof(float));
++    if (bias != 0.f) return false;
++    const ggml_tensor * rn = sc->src[0];
++    if (!rn || rn->op != GGML_OP_RMS_NORM || rn->type != GGML_TYPE_F32) return false;
++    memcpy(&eps, rn->op_params, sizeof(float));
++    raw = rn->src[0];
++    if (!raw || raw->type != GGML_TYPE_F32 || !ggml_are_same_shape(raw, sc) || raw->nb[0] != sizeof(float)) return false;
++    if (!ggml_is_contiguous(rn) || !ggml_is_contiguous(sc)) return false;
++    return ggml_hexagon_used_only_by_nodes(graph, rn, { sc }) && ggml_hexagon_used_only_by_nodes(graph, sc, { gdn });
++}
++
++static bool ggml_hexagon_match_gdn_fuse(const ggml_cgraph * graph, int i, const std::unordered_map<const ggml_tensor *, int> & idx,
++                                        ggml_hexagon_gdn_fuse & m) {
++    const ggml_tensor * gdn = graph->nodes[i];
++    m = {};
++    if (opt_gdn_fuse <= 0 || gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32) return false;
++    if (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) return false;
++
++    const ggml_tensor * v = gdn->src[2];
++    const int64_t S_v = v->ne[0], H = v->ne[1], T = v->ne[2], n_seqs = v->ne[3];
++    const int64_t K   = ggml_get_op_params_i32(gdn, 0);
++    if (K != 1 || S_v % 32 != 0) return false;
++
++    auto index_of = [&](const ggml_tensor * t) { auto it = idx.find(t); return it == idx.end() ? -1 : it->second; };
++
++    // the state CPY (same rules as the GATED_DELTA_NET+CPY fusion) and the norm of the attention rows
++    const size_t tail_off = (size_t) S_v * H * T * n_seqs * sizeof(float);
++    const ggml_tensor * attn = nullptr; // view of the attention rows
++    for (int j = i + 1; j < graph->n_nodes; j++) {
++        const ggml_tensor * n = graph->nodes[j];
++        if (ggml_op_is_empty(n->op)) continue;
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            const ggml_tensor * src = n->src[s];
++            if (!src || (src != gdn && src->view_src != gdn)) continue;
++            if (n->op == GGML_OP_CPY && s == 0 && m.cpy < 0 && src->op == GGML_OP_VIEW && src->view_offs == tail_off &&
++                ggml_is_contiguous(src) && n->type == GGML_TYPE_F32 && n->src[1] && n->src[1]->ne[0] == S_v * S_v * H &&
++                n->src[1]->ne[1] == n_seqs && n->src[1]->nb[0] == sizeof(float) &&
++                (n_seqs == 1 || n->src[1]->nb[1] == (size_t) S_v * S_v * H * sizeof(float)) && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++                m.cpy = j;
++            } else if (n->op == GGML_OP_RMS_NORM && s == 0 && m.rms < 0 && src->view_src == gdn && src->view_offs == 0 &&
++                       src->ne[0] == S_v && src->ne[1] == H && src->ne[2] == T && src->ne[3] == n_seqs && ggml_is_contiguous(src)) {
++                m.rms = j;
++                attn  = src;
++            } else {
++                return false;
++            }
++        }
++    }
++    if (m.cpy < 0) return false;
++
++    if ((opt_gdn_fuse & HTP_GDN_FUSE_OUT_NORM) && m.rms >= 0) {
++        const ggml_tensor * rn = graph->nodes[m.rms];
++        const ggml_tensor * mw = nullptr, * sl = nullptr, * mz = nullptr;
++        for (int j = m.rms + 1; j < graph->n_nodes && !mw; j++) {
++            const ggml_tensor * n = graph->nodes[j];
++            if (n->op == GGML_OP_MUL && (n->src[0] == rn || n->src[1] == rn)) mw = n;
++        }
++        if (mw) {
++            const ggml_tensor * w = mw->src[0] == rn ? mw->src[1] : mw->src[0];
++            for (int j = index_of(mw) + 1; j < graph->n_nodes && !mz; j++) {
++                const ggml_tensor * n = graph->nodes[j];
++                if (n->op == GGML_OP_MUL && (n->src[0] == mw || n->src[1] == mw)) mz = n;
++            }
++            if (mz) {
++                sl = mz->src[0] == mw ? mz->src[1] : mz->src[0];
++            }
++            const ggml_tensor * z = sl ? sl->src[0] : nullptr;
++            const bool ok =
++                w && w->type == GGML_TYPE_F32 && w->ne[0] == S_v && ggml_nelements(w) == S_v && ggml_is_contiguous(w) &&
++                sl && sl->op == GGML_OP_UNARY && ggml_get_unary_op(sl) == GGML_UNARY_OP_SILU && sl->type == GGML_TYPE_F32 &&
++                z && z->type == GGML_TYPE_F32 && ggml_are_same_shape(z, attn) && z->nb[0] == sizeof(float) &&
++                mz->type == GGML_TYPE_F32 && ggml_are_same_shape(mz, attn) && ggml_is_contiguous(mz) &&
++                rn->type == GGML_TYPE_F32 && mw->type == GGML_TYPE_F32 && ggml_are_same_shape(mw, attn) &&
++                !(mz->flags & GGML_TENSOR_FLAG_OUTPUT) &&
++                index_of(sl) > i && index_of(mz) > i &&
++                ggml_hexagon_used_only_by_nodes(graph, rn, { mw }) &&
++                ggml_hexagon_used_only_by_nodes(graph, mw, { mz }) &&
++                ggml_hexagon_used_only_by_nodes(graph, sl, { mz });
++            if (ok) {
++                m.mul_w = index_of(mw);
++                m.silu  = index_of(sl);
++                m.mul_z = index_of(mz);
++                m.w     = w;
++                m.z     = z;
++                memcpy(&m.out_eps, rn->op_params, sizeof(float));
++                m.fuse |= HTP_GDN_FUSE_OUT_NORM;
++            }
++        }
++    }
++
++    if (opt_gdn_fuse & HTP_GDN_FUSE_IN_NORM) {
++        const ggml_tensor * qr = nullptr, * kr = nullptr;
++        float qe = 0, qs = 0, ke = 0, ks = 0;
++        if (ggml_hexagon_match_gdn_l2(graph, gdn, gdn->src[0], qr, qe, qs) &&
++            ggml_hexagon_match_gdn_l2(graph, gdn, gdn->src[1], kr, ke, ks) && qe == ke && qs == ks &&
++            index_of(gdn->src[0]) >= 0 && index_of(gdn->src[1]) >= 0 &&
++            index_of(gdn->src[0]->src[0]) >= 0 && index_of(gdn->src[1]->src[0]) >= 0) {
++            m.q_raw       = qr;
++            m.k_raw       = kr;
++            m.in_eps      = qe;
++            m.in_scale    = qs;
++            m.in_nodes[0] = index_of(gdn->src[0]->src[0]);
++            m.in_nodes[1] = index_of(gdn->src[0]);
++            m.in_nodes[2] = index_of(gdn->src[1]->src[0]);
++            m.in_nodes[3] = index_of(gdn->src[1]);
++            m.fuse |= HTP_GDN_FUSE_IN_NORM;
++        }
++    }
++
++    if (!m.fuse) return false;
++
++    // hazards: everything now runs at position i. The fused output must not overlap any input of the op or of
++    // the nodes between the first and last absorbed node; the raw q/k must not be written between their norm
++    // and i; z must not be written between i and the gated mul.
++    const ggml_tensor * out = (m.fuse & HTP_GDN_FUSE_OUT_NORM) ? graph->nodes[m.mul_z] : nullptr;
++    int first = i, last = m.cpy;
++    if (m.fuse & HTP_GDN_FUSE_IN_NORM) first = std::min({ m.in_nodes[0], m.in_nodes[2] });
++    if (out) last = std::max(last, m.mul_z);
++    auto absorbed = [&](int j) {
++        if (j == i || j == m.cpy) return true;
++        if (out && (j == m.rms || j == m.mul_w || j == m.silu || j == m.mul_z)) return true;
++        if (m.fuse & HTP_GDN_FUSE_IN_NORM) {
++            for (int k = 0; k < 4; k++) if (j == m.in_nodes[k]) return true;
++        }
++        return false;
++    };
++    if (out) {
++        const ggml_tensor * ins[] = { m.q_raw ? m.q_raw : gdn->src[0], m.k_raw ? m.k_raw : gdn->src[1], gdn->src[2],
++                                      gdn->src[3], gdn->src[4], gdn->src[5], graph->nodes[m.cpy]->src[1], m.w };
++        for (const ggml_tensor * t : ins) {
++            if (ggml_hexagon_ranges_overlap(out, t)) return false;
++        }
++        // z may be updated in place (same rows), nothing else
++        if (ggml_hexagon_ranges_overlap(out, m.z) &&
++            (out->data != m.z->data || out->nb[1] != m.z->nb[1] || out->nb[2] != m.z->nb[2] || out->nb[3] != m.z->nb[3])) {
++            return false;
++        }
++    }
++    for (int j = first; j <= last; j++) {
++        if (absorbed(j)) continue;
++        const ggml_tensor * n = graph->nodes[j];
++        if (ggml_op_is_empty(n->op)) continue;
++        if (out) {
++            if (ggml_hexagon_ranges_overlap(out, n)) return false;
++            for (int s = 0; s < GGML_MAX_SRC; s++) {
++                if (ggml_hexagon_ranges_overlap(out, n->src[s])) return false;
++            }
++            if (j > i && ggml_hexagon_ranges_overlap(n, m.z)) return false;
++        }
++        if (j < i && (m.fuse & HTP_GDN_FUSE_IN_NORM)) {
++            if (ggml_hexagon_ranges_overlap(n, m.q_raw) || ggml_hexagon_ranges_overlap(n, m.k_raw)) return false;
++        }
++    }
++    return true;
++}
++
 +static bool ggml_hexagon_precompute_ssm_conv_tc_params(const struct ggml_hexagon_session * sess, uint32_t d_conv,
 +                                                      uint32_t d_inner, uint32_t n_t, bool silu, bool state_out,
 +                                                      struct htp_ssm_conv_kernel_params * kparams) {
@@ -2027,14 +2227,25 @@ index 605c23c..495461f 100644
 +    const uint32_t n_threads = (std::min)((uint32_t) sess->n_threads, d_inner / 32);
 +    if (n_threads == 0) return false;
 +
-+    uint32_t cb = 0;
++    // channel block cb (DMA rows of cb floats) x time tiles of tt tokens: wide DMA rows matter more than
++    // long tiles (the K - 1 rows in front of a tile are copied from the previous one), so keep cb at 128
++    // and shorten the tile when the whole sequence does not fit
++    uint32_t cb = 0, tt = 0;
 +    struct htp_ssm_conv_tc_layout L;
-+    for (uint32_t c : { 128u, 96u, 64u, 32u }) {
-+        htp_ssm_conv_tc_layout_build(&L, d_conv, n_t, c);
-+        if ((size_t) L.total * n_threads <= sess->vtcm_size) {
-+            cb = c;
-+            break;
++    const uint32_t cb_req = opt_conv_cb > 0 ? (uint32_t) opt_conv_cb : 128u;
++    const uint32_t tt_req = opt_conv_tt > 0 ? (uint32_t) opt_conv_tt : n_t;
++    for (uint32_t c : { cb_req, 128u, 96u, 64u, 32u }) {
++        if (c % 32 != 0 || c > 512) continue;
++        for (uint32_t t = std::min(tt_req, n_t); t >= 16; t = (t + 1) / 2) {
++            htp_ssm_conv_tc_layout_build(&L, d_conv, t, c);
++            if ((size_t) L.total * n_threads <= sess->vtcm_size) {
++                cb = c;
++                tt = t;
++                break;
++            }
++            if (t == 16) break;
 +        }
++        if (cb) break;
 +    }
 +    if (cb == 0) return false;
 +
@@ -2052,13 +2263,14 @@ index 605c23c..495461f 100644
 +    kparams->fuse_silu    = silu ? 1 : 0;
 +    kparams->tc_mode      = 1;
 +    kparams->tc_state_out = state_out ? 1 : 0;
++    kparams->tc_t_tile    = tt < n_t ? tt : 0;
 +    return true;
 +}
 +
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -6929,7 +7326,16 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6929,7 +7537,16 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
              extra->flags &= ~GGML_HEXAGON_TENSOR_FUSEABLE;
  
@@ -2076,16 +2288,86 @@ index 605c23c..495461f 100644
                  extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
              } else if ((graph->nodes[i]->op == GGML_OP_MUL_MAT &&
                          ggml_get_op_params_i32(graph->nodes[i], 1) != GGML_HINT_SRC0_IS_HADAMARD) ||
-@@ -6943,12 +7349,45 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6943,12 +7560,115 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
 +        std::unordered_set<const ggml_tensor *> replaced; // nodes run as part of an earlier fused op
 +
++        // GATED_DELTA_NET fusions reach back to the q/k norms, so they are decided before the op loop
++        std::unordered_map<const ggml_tensor *, ggml_hexagon_gdn_fuse> gdn_fused;
++        if (opt_opfusion > 0 && opt_gdn_fuse > 0) {
++            std::unordered_map<const ggml_tensor *, int> node_idx;
++            bool any_gdn = false;
++            for (int i = 0; i < graph->n_nodes; ++i) {
++                node_idx[graph->nodes[i]] = i;
++                any_gdn = any_gdn || graph->nodes[i]->op == GGML_OP_GATED_DELTA_NET;
++            }
++            for (int i = 0; any_gdn && i < graph->n_nodes; ++i) {
++                ggml_tensor * n = graph->nodes[i];
++                if (n->op != GGML_OP_GATED_DELTA_NET) continue;
++                ggml_hexagon_gdn_fuse gf;
++                if (!ggml_hexagon_match_gdn_fuse(graph, i, node_idx, gf)) continue;
++                // only the HMX chunked kernel implements the fused stages
++                struct htp_gdn_kernel_params kp;
++                ggml_hexagon_precompute_gated_delta_net_params(sess, n, &kp);
++                if (kp.kernel_type != HTP_GDN_KERNEL_HMX_CHUNKED) continue;
++                // the fused node must still fit the VTCM budget (layout includes the z buffers)
++                if ((size_t) kp.vtcm_size > sess->vtcm_size) continue;
++                bool clash = false;
++                for (int j : { gf.cpy, gf.rms, gf.mul_w, gf.silu, gf.mul_z, gf.in_nodes[0], gf.in_nodes[1], gf.in_nodes[2], gf.in_nodes[3] }) {
++                    if (j >= 0 && replaced.count(graph->nodes[j])) clash = true;
++                }
++                if (clash) continue;
++                replaced.insert(graph->nodes[gf.cpy]);
++                if (gf.fuse & HTP_GDN_FUSE_OUT_NORM) {
++                    for (int j : { gf.rms, gf.mul_w, gf.silu, gf.mul_z }) replaced.insert(graph->nodes[j]);
++                }
++                if (gf.fuse & HTP_GDN_FUSE_IN_NORM) {
++                    for (int j : gf.in_nodes) replaced.insert(graph->nodes[j]);
++                }
++                gdn_fused[n] = gf;
++            }
++        }
++
          for (int i = 0; i < graph->n_nodes; ++i) {
              ggml_tensor * n = graph->nodes[i];
 -            if (!op_is_compute(n)) {
 +            if (!op_is_compute(n) || replaced.count(n)) {
++                continue;
++            }
++
++            if (n->op == GGML_OP_GATED_DELTA_NET && gdn_fused.count(n)) {
++                const ggml_hexagon_gdn_fuse & gf = gdn_fused[n];
++                ggml_tensor * cpy = graph->nodes[gf.cpy];
++                const bool in_norm  = (gf.fuse & HTP_GDN_FUSE_IN_NORM) != 0;
++                const bool out_norm = (gf.fuse & HTP_GDN_FUSE_OUT_NORM) != 0;
++
++                htp_opnode node(HTP_OP_GATED_DELTA_NET, n);
++                node.name    = std::string("GATED_DELTA_NET+CPY") + (in_norm ? "+L2" : "") + (out_norm ? "+GNORM" : "");
++                node.inputs  = { in_norm ? gf.q_raw : n->src[0], in_norm ? gf.k_raw : n->src[1], n->src[2], n->src[3], n->src[4], n->src[5] };
++                node.outputs = { n, cpy->src[1] };
++                node.fused   = { cpy };
++                if (out_norm) {
++                    node.inputs.push_back(gf.w);
++                    node.inputs.push_back(gf.z);
++                    node.outputs.push_back(graph->nodes[gf.mul_z]);
++                    for (int j : { gf.rms, gf.mul_w, gf.silu, gf.mul_z }) node.fused.push_back(graph->nodes[j]);
++                }
++                if (in_norm) {
++                    for (int j : gf.in_nodes) node.fused.push_back(graph->nodes[j]);
++                }
++
++                struct htp_gdn_kernel_params kp;
++                ggml_hexagon_precompute_gated_delta_net_params(sess, n, &kp);
++                kp.fuse     = (uint8_t) gf.fuse;
++                kp.in_eps   = gf.in_eps;
++                kp.in_scale = gf.in_scale;
++                kp.out_eps  = gf.out_eps;
++                memcpy(node.kernel_params, &kp, sizeof(kp));
++
++                HEX_VERBOSE("ggml-hex: %s fused %s at %s\n", sess->c_name(), node.name.c_str(), n->name);
++                computed_nodes.push_back(std::move(node));
                  continue;
              }
  
@@ -2123,7 +2405,7 @@ index 605c23c..495461f 100644
              htp_opnode node(HTP_OP_INVALID, n);
              node.opcode = op_remap_to_htp(n);
              if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID || node.opcode == HTP_OP_GET_ROWS) {
-@@ -6991,8 +7430,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6991,8 +7711,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                  auto inputs = node.get_inputs();
                  const struct ggml_tensor * src0 = inputs[0];
                  const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
@@ -2158,7 +2440,7 @@ index 605c23c..495461f 100644
                      (struct htp_unary_kernel_params *)node.kernel_params
                  );
              } else if (node.opcode == HTP_OP_GET_ROWS) {
-@@ -8369,6 +8833,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8369,7 +9114,15 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
      const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
      const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
@@ -2168,9 +2450,13 @@ index 605c23c..495461f 100644
 +    const char * str_nx_swiglu = getenv("GGML_HEXAGON_NX_SWIGLU");
 +    const char * str_conv_block_silu = getenv("GGML_HEXAGON_CONV_BLOCK_SILU");
      const char * str_rt_repack = getenv("GGML_HEXAGON_RT_REPACK");
++    const char * str_gdn_fuse  = getenv("GGML_HEXAGON_GDN_FUSE");
++    const char * str_conv_cb   = getenv("GGML_HEXAGON_CONV_CB");
++    const char * str_conv_tt   = getenv("GGML_HEXAGON_CONV_TT");
      const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
      const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
-@@ -8378,6 +8847,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
+@@ -8378,6 +9131,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
      const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
      const char * str_fa_head_split = getenv("GGML_HEXAGON_FA_HEAD_SPLIT");
@@ -2180,7 +2466,7 @@ index 605c23c..495461f 100644
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
-@@ -8427,6 +8899,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8427,6 +9183,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
      opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
      opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
@@ -2189,10 +2475,13 @@ index 605c23c..495461f 100644
 +    opt_mmid_stream    = str_mmid_stream    ? atoi(str_mmid_stream)       : opt_mmid_stream;
 +    opt_nx_swiglu = str_nx_swiglu ? atoi(str_nx_swiglu)                   : opt_nx_swiglu;
 +    opt_conv_block_silu = str_conv_block_silu ? atoi(str_conv_block_silu) : opt_conv_block_silu;
++    opt_gdn_fuse        = str_gdn_fuse        ? atoi(str_gdn_fuse)        : opt_gdn_fuse;
++    opt_conv_cb         = str_conv_cb         ? atoi(str_conv_cb)         : opt_conv_cb;
++    opt_conv_tt         = str_conv_tt         ? atoi(str_conv_tt)         : opt_conv_tt;
      opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
      opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
      opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
-@@ -8443,6 +8920,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8443,6 +9207,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
      opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
      opt_fa_head_split = str_fa_head_split ? atoi(str_fa_head_split)       : opt_fa_head_split;
@@ -2896,6 +3185,293 @@ index 0453884..d0bfc42 100644
      // Cost coefficients calibrated from profiling
      const size_t c_q_fixed    = 800;   // per-Q-block: q_load + epilogue o_update + o_norm + o_store
      const size_t c_iter_base  = 200;   // per-KV-iter base (HMX dot/update + DMA)
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index 1dd828d..0163621 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -17,6 +17,8 @@
+ #include "hmx-fa-kernels.h"
+ #include "hmx-queue.h"
+ #include "gated-delta-net-ops.h"
++#include "hvx-norm.h"
++#include "hvx-sigmoid.h"
+ 
+ #ifndef MIN
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+@@ -1441,6 +1443,24 @@ static inline void gdn_dma_push_chunk_inputs(
+     dma_queue_push(dma_q, dma_make_data(vtcm_v, v_dma), S_v * sizeof(float), v->nb[2], S_v * sizeof(float), chunk_size);
+ }
+ 
++// OUT_NORM: the z (gate) rows of one head for one chunk
++static inline void gdn_dma_push_chunk_z(dma_queue * dma_q, float * vtcm_z, const struct htp_tensor * z,
++                                        uint32_t iv3, uint32_t iv1, uint32_t t_chunk, uint32_t chunk_size, uint32_t S_v) {
++    const dma_addr_t z_dma = z->data + (uint64_t) iv3 * z->nb[3] + (uint64_t) t_chunk * z->nb[2] + (uint64_t) iv1 * z->nb[1];
++    dma_queue_push(dma_q, dma_make_data(vtcm_z, z_dma), S_v * sizeof(float), z->nb[2], S_v * sizeof(float), chunk_size);
++}
++
++// L2 norm of q/k rows in VTCM (same math as the RMS_NORM+SCALE op: 32-row rms norm with the scale folded in)
++static inline void gdn_rows_l2_norm(const float * x, float * y, uint32_t n_rows, uint32_t S_v, const struct htp_gdn_kernel_params * kp) {
++    const HVX_Vector inv_n_v = hvx_vec_inverse_f32(hvx_vec_splat_f32((float) S_v));
++    const HVX_Vector eps_v   = hvx_vec_splat_f32(kp->in_eps);
++    const HVX_Vector scale_v = hvx_vec_splat_f32(kp->in_scale);
++    for (uint32_t r = 0; r < n_rows; r += 32) {
++        hvx_rms_norm_rows32_f32((const uint8_t *) (x + r * S_v), S_v * sizeof(float), (uint8_t *) (y + r * S_v), S_v * sizeof(float),
++                                S_v / VLEN_FP32, MIN(32, n_rows - r), NULL, inv_n_v, eps_v, scale_v);
++    }
++}
++
+ static inline void gdn_dma_push_chunk_gb(
+     dma_queue * dma_q,
+     float * vtcm_g_raw,
+@@ -1490,6 +1510,7 @@ struct htp_gdn_head_ptrs {
+     float * g_f32[2];
+     float * b_f32[2];
+     float * o_f32[2];
++    float * z_f32[2];
+ 
+     float * v_inter_f32;
+     float * o_inter_f32;
+@@ -1583,6 +1604,8 @@ static inline void gdn_init_head_ptrs(
+     head->b_f32[1] = L->pipeline ? VTCM_LAYOUT_PTR(float, vtcm_base, L->off_b_f32[1] + h * dma_scalar_sz) : head->b_f32[0];
+     head->o_f32[0] = VTCM_LAYOUT_PTR(float, vtcm_base, L->off_o_f32[0] + h * L->dma_chunk_bytes);
+     head->o_f32[1] = L->pipeline ? VTCM_LAYOUT_PTR(float, vtcm_base, L->off_o_f32[1] + h * L->dma_chunk_bytes) : head->o_f32[0];
++    head->z_f32[0] = VTCM_LAYOUT_PTR(float, vtcm_base, L->off_z_f32[0] + h * L->dma_chunk_bytes);
++    head->z_f32[1] = L->pipeline ? VTCM_LAYOUT_PTR(float, vtcm_base, L->off_z_f32[1] + h * L->dma_chunk_bytes) : head->z_f32[0];
+ 
+     head->v_inter_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L->off_v_inter_f32 + h * L->dma_chunk_bytes);
+     head->o_inter_f32 = VTCM_LAYOUT_PTR(float, vtcm_base, L->off_o_inter_f32 + h * L->dma_chunk_bytes);
+@@ -1649,6 +1672,7 @@ struct htp_gdn_batch_context {
+     uint32_t                   n_batch;
+     uint32_t                   S_v;
+     float                      scale;
++    const float *              norm_w; // OUT_NORM weight in VTCM
+     struct htp_ops_context *   octx;
+     const struct htp_gdn_kernel_params * kparams;
+ };
+@@ -1758,8 +1782,18 @@ static void gdn_hvx_phase1a_worker(unsigned int n, unsigned int i, void * data)
+     hvx_vmem(head->lambda_init + 32) = v_l1;
+     hvx_vmem(head->lambda_init_f16)  = hvx_vec_f32_to_f16(v_l0, v_l1);
+ 
++    const float * k_src = head->k_f32[curr_buf];
++    if (bctx->kparams->fuse & HTP_GDN_FUSE_IN_NORM) {
++        // rows past valid_tokens are zero in both buffers (zero rows normalize to zero)
++        float * kn = head->v_inter_f32;
++        if (valid_tokens < 64) {
++            memset(kn + valid_tokens * S_v, 0, (64 - valid_tokens) * S_v * sizeof(float));
++        }
++        gdn_rows_l2_norm(head->k_f32[curr_buf], kn, valid_tokens, S_v, bctx->kparams);
++        k_src = kn;
++    }
+     gdn_f32_to_hmx_row_tiles_and_f16(head->k_row_tiles, head->k_prime_row_tiles, head->k_f16,
+-                                     head->k_f32[curr_buf], head->lambda_init_f16, 64, S_v);
++                                     k_src, head->lambda_init_f16, 64, S_v);
+     hmx_interleave_rows_to_tiles(head->k_col_tiles, head->k_f16, 64, S_v, S_v, 0, 64);
+ 
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_PREP, info);
+@@ -1776,8 +1810,18 @@ static void gdn_hvx_phase1b_worker(unsigned int n, unsigned int i, void * data)
+     const uint32_t curr_buf = bctx->curr_buf;
+     const uint32_t S_v = bctx->S_v;
+ 
++    const float * q_src = head->q_f32[curr_buf];
++    if (bctx->kparams->fuse & HTP_GDN_FUSE_IN_NORM) {
++        const uint32_t valid_tokens = hex_smin(64, bctx->kparams->n_tokens - bctx->c * 64);
++        float * qn = head->o_inter_f32;
++        if (valid_tokens < 64) {
++            memset(qn + valid_tokens * S_v, 0, (64 - valid_tokens) * S_v * sizeof(float));
++        }
++        gdn_rows_l2_norm(head->q_f32[curr_buf], qn, valid_tokens, S_v, bctx->kparams);
++        q_src = qn;
++    }
+     gdn_f32_to_hmx_row_tiles_and_f16(head->q_row_tiles, head->q_prime_row_tiles, NULL,
+-                                     head->q_f32[curr_buf], head->lambda_init_f16, 64, S_v);
++                                     q_src, head->lambda_init_f16, 64, S_v);
+ 
+     hmx_interleave_cols_to_tiles(head->k_col_tiles_64x128, head->k_f16, 64, S_v, S_v, 2, 0, 64);
+ 
+@@ -1983,6 +2027,24 @@ static void gdn_hvx_phase5_worker(unsigned int n, unsigned int i, void * data) {
+         hvx_vmem(head->o_f32[curr_buf] + j * 32) = hvx_vec_mul_f32_f32(hvx_vec_add_f32_f32(vi, va), vscale);
+     }
+ 
++    if (bctx->kparams->fuse & HTP_GDN_FUSE_OUT_NORM) {
++        // gated norm, same math as the RMS_NORM+MUL and SILU+MUL ops it replaces: o = silu(z) * (rms_norm(o) * w)
++        const uint32_t valid_tokens = hex_smin(64, bctx->kparams->n_tokens - bctx->c * 64);
++        const HVX_Vector inv_n_v = hvx_vec_inverse_f32(hvx_vec_splat_f32((float) S_v));
++        const HVX_Vector eps_v   = hvx_vec_splat_f32(bctx->kparams->out_eps);
++        const HVX_Vector one_v   = hvx_vec_splat_f32(1.f);
++        float * on = head->o_intra_f32; // free after the sum above
++        for (uint32_t r = 0; r < valid_tokens; r += 32) {
++            hvx_rms_norm_rows32_f32((const uint8_t *) (head->o_f32[curr_buf] + r * S_v), S_v * sizeof(float),
++                                    (uint8_t *) (on + r * S_v), S_v * sizeof(float), S_v / VLEN_FP32,
++                                    MIN(32, valid_tokens - r), (const uint8_t *) bctx->norm_w, inv_n_v, eps_v, one_v);
++        }
++        for (uint32_t t = 0; t < valid_tokens; ++t) {
++            hvx_swiglu_f32_qf32_aa((uint8_t *) (head->o_f32[curr_buf] + t * S_v), (const uint8_t *) (head->z_f32[curr_buf] + t * S_v),
++                                   (const uint8_t *) (on + t * S_v), S_v);
++        }
++    }
++
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_GDN_OUT, info);
+ }
+ 
+@@ -2041,6 +2103,14 @@ static int gated_delta_net_f32_hmx_chunked(
+     const uint32_t n_chunks   = kparams->n_chunks;
+     const uint32_t n_sv_tiles = S_v / 32;
+ 
++    const bool out_norm = (kparams->fuse & HTP_GDN_FUSE_OUT_NORM) != 0;
++    const struct htp_tensor * z_t   = out_norm ? octx->src[7]  : NULL;
++    const struct htp_tensor * out_t = out_norm ? octx->dsts[2] : NULL;
++    const uint32_t n_in = out_norm ? 4 : 3; // DMA descriptors per head per chunk: q, k, v (, z)
++    if (out_norm && (!octx->src[6] || !z_t || !out_t)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++
+     struct htp_gdn_hmx_vtcm_layout L;
+     htp_gdn_hmx_vtcm_layout_build(&L, S_v, chunk_size, kparams->n_heads_batch, kparams->n_threads, kparams->pipeline != 0);
+ 
+@@ -2066,9 +2136,19 @@ static int gated_delta_net_f32_hmx_chunked(
+     dma_queue *  dma_q = octx->ctx->dma[0];
+     work_queue_t wp    = octx->ctx->work_queue;
+ 
++    float * vtcm_norm_w = VTCM_LAYOUT_PTR(float, vtcm_base, L.off_norm_w);
++    if (out_norm) {
++        dma_queue_push(dma_q, dma_make_data(vtcm_norm_w, octx->src[6]->data), 0, 0, S_v * sizeof(float), 1);
++        dma_queue_pop(dma_q);
++    }
++
+     struct htp_gdn_head_ptrs heads[8];
+     struct htp_gdn_hmx_gemm_task gemm_tasks[8][9];
+ 
++    // ~7 dependent HMX rounds per 64-token chunk: keep the HMX thread polling instead of paying a futex
++    // sleep/wake per round (v73 queue otherwise sleeps as soon as it drains)
++    hmx_queue_spin_begin(hmx_q);
++
+     uint32_t n_batch = 1;
+     for (uint32_t r = row_start; r < row_start + nrows; r += n_batch) {
+         const uint32_t head_in_seq         = fastmodulo(r, H, &kparams->div_H);
+@@ -2091,6 +2171,7 @@ static int gated_delta_net_f32_hmx_chunked(
+         bctx.n_batch    = n_batch;
+         bctx.S_v        = S_v;
+         bctx.scale      = scale;
++        bctx.norm_w     = vtcm_norm_w;
+         bctx.octx       = octx;
+         bctx.kparams    = kparams;
+ 
+@@ -2110,6 +2191,9 @@ static int gated_delta_net_f32_hmx_chunked(
+                 gdn_dma_push_chunk_inputs(dma_q, heads[h].q_f32[0], heads[h].k_f32[0], heads[h].v_f32[0],
+                                           q, k, v, heads[h].iq3, heads[h].iq1, heads[h].ik3, heads[h].ik1,
+                                           heads[h].iv3, heads[h].iv1, 0, chunk0_tokens, S_v);
++                if (out_norm) {
++                    gdn_dma_push_chunk_z(dma_q, heads[h].z_f32[0], z_t, heads[h].iv3, heads[h].iv1, 0, chunk0_tokens, S_v);
++                }
+             }
+             gdn_dma_push_chunk_gb(dma_q, vtcm_g_raw[0], vtcm_b_raw[0], g, beta, iv3, head_in_seq, 0, chunk0_tokens, n_batch);
+         }
+@@ -2124,9 +2208,7 @@ static int gated_delta_net_f32_hmx_chunked(
+             bctx.vtcm_g_raw = vtcm_g_raw[curr_buf];
+             bctx.vtcm_b_raw = vtcm_b_raw[curr_buf];
+ 
+-            for (uint32_t h = 0; h < n_batch; ++h) {
+-                dma_queue_pop(dma_q);
+-                dma_queue_pop(dma_q);
++            for (uint32_t h = 0; h < n_batch * n_in; ++h) {
+                 dma_queue_pop(dma_q);
+             }
+             dma_queue_pop(dma_q);
+@@ -2139,6 +2221,9 @@ static int gated_delta_net_f32_hmx_chunked(
+                     gdn_dma_push_chunk_inputs(dma_q, heads[h].q_f32[next_buf], heads[h].k_f32[next_buf], heads[h].v_f32[next_buf],
+                                               q, k, v, heads[h].iq3, heads[h].iq1, heads[h].ik3, heads[h].ik1,
+                                               heads[h].iv3, heads[h].iv1, next_t_chunk, next_tokens, S_v);
++                    if (out_norm) {
++                        gdn_dma_push_chunk_z(dma_q, heads[h].z_f32[next_buf], z_t, heads[h].iv3, heads[h].iv1, next_t_chunk, next_tokens, S_v);
++                    }
+                 }
+                 gdn_dma_push_chunk_gb(dma_q, vtcm_g_raw[next_buf], vtcm_b_raw[next_buf],
+                                       g, beta, iv3, head_in_seq, next_t_chunk, next_tokens, n_batch);
+@@ -2237,6 +2322,13 @@ static int gated_delta_net_f32_hmx_chunked(
+ 
+             const uint32_t valid_tokens = hex_smin(chunk_size, n_tokens - t_chunk);
+             for (uint32_t h = 0; h < n_batch; ++h) {
++                if (out_norm) {
++                    const dma_addr_t out_chunk_dma = out_t->data + (uint64_t) heads[h].iv3 * out_t->nb[3] +
++                        (uint64_t) t_chunk * out_t->nb[2] + (uint64_t) heads[h].iv1 * out_t->nb[1];
++                    dma_queue_push(dma_q, dma_make_data(out_chunk_dma, heads[h].o_f32[curr_buf]),
++                                   out_t->nb[2], S_v * sizeof(float), S_v * sizeof(float), valid_tokens);
++                    continue;
++                }
+                 const dma_addr_t attn_chunk_dma = dst->data +
+                     ((uint64_t) heads[h].iv3 * n_tokens * H + (uint64_t) t_chunk * H + heads[h].iv1) * S_v * sizeof(float);
+                 dma_queue_push(dma_q, dma_make_data(attn_chunk_dma, heads[h].o_f32[curr_buf]),
+@@ -2266,6 +2358,7 @@ static int gated_delta_net_f32_hmx_chunked(
+     }
+ 
+     dma_queue_flush(dma_q);
++    hmx_queue_spin_end(hmx_q);
+     return HTP_STATUS_OK;
+ }
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
+index 32fb7d2..cbf57b2 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
+@@ -22,10 +22,18 @@ enum htp_gdn_kernel_type {
+     HTP_GDN_KERNEL_HMX_CHUNKED   = 1,
+ };
+ 
++// fused neighbours of the HMX chunked kernel (Qwen3.5 linear attention):
++//   IN_NORM:  q/k arrive un-normalized and get the L2 norm (RMS_NORM(eps) * scale) per 64-token chunk in VTCM
++//   OUT_NORM: the attention output gets RMS_NORM(eps) * w then * silu(z) (gated norm) before it leaves VTCM;
++//             src[6] = w [S_v], src[7] = z [S_v, H, T, n_seqs], dsts[2] = gated-norm output
++#define HTP_GDN_FUSE_IN_NORM  1
++#define HTP_GDN_FUSE_OUT_NORM 2
++
+ struct htp_gdn_kernel_params {
+     uint8_t  kernel_type;
+     uint8_t  pipeline;
+-    uint16_t chunk_size;
++    uint8_t  chunk_size;
++    uint8_t  fuse;          // HTP_GDN_FUSE_*
+     uint16_t n_chunks;
+     uint16_t n_heads_batch;
+ 
+@@ -37,8 +45,8 @@ struct htp_gdn_kernel_params {
+     uint32_t K;
+ 
+     uint32_t total_rows;
+-    uint32_t row_start;
+-    uint32_t nrows;
++    float    in_scale;      // IN_NORM: scale after the rms norm
++    float    in_eps;        // IN_NORM: rms norm epsilon
+     uint32_t rows_per_thread;
+ 
+     uint32_t kda;
+@@ -56,6 +64,8 @@ struct htp_gdn_kernel_params {
+     struct fastdiv_values div_rq3;
+     struct fastdiv_values div_rk3;
+     struct fastdiv_values div_n_threads;
++
++    float    out_eps;       // OUT_NORM: rms norm epsilon
+ };
+ 
+ #if defined(__cplusplus)
+@@ -96,6 +106,8 @@ struct htp_gdn_hmx_vtcm_layout {
+     size_t off_g_raw[2];
+     size_t off_b_raw[2];
+     size_t off_o_f32[2];
++    size_t off_z_f32[2];
++    size_t off_norm_w;
+ 
+     size_t off_v_inter_f32;
+     size_t off_o_inter_f32;
+@@ -215,6 +227,9 @@ static inline void htp_gdn_hmx_vtcm_layout_build(
+     VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_b_raw[1], raw_gb_sz, pipeline);
+     VTCM_LAYOUT_ALLOC(off, off_o_f32[0], bh * dma_chunk_sz);
+     VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_o_f32[1], bh * dma_chunk_sz, pipeline);
++    VTCM_LAYOUT_ALLOC(off, off_z_f32[0], bh * dma_chunk_sz);
++    VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_z_f32[1], bh * dma_chunk_sz, pipeline);
++    VTCM_LAYOUT_ALLOC(off, off_norm_w, hex_round_up(S_v * sizeof(float), 128));
+ 
+     VTCM_LAYOUT_ALLOC(off, off_v_inter_f32, bh * dma_chunk_sz);
+     VTCM_LAYOUT_ALLOC(off, off_o_inter_f32, bh * dma_chunk_sz);
 diff --git a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
 index 65f90c1..787605c 100644
 --- a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
@@ -3139,6 +3715,74 @@ index 65f90c1..787605c 100644
      struct htp_thread_trace * traces;
  } output_transfer_task_state_t;
  
+diff --git a/ggml/src/ggml-hexagon/htp/hmx-queue.c b/ggml/src/ggml-hexagon/htp/hmx-queue.c
+index c369d3d..556a1ae 100644
+--- a/ggml/src/ggml-hexagon/htp/hmx-queue.c
++++ b/ggml/src/ggml-hexagon/htp/hmx-queue.c
+@@ -72,13 +72,18 @@ static void hmx_queue_thread(void * arg) {
+     while (!killed) {
+         unsigned int seqn = atomic_load(&q->seqn);
+         if (seqn == prev_seqn) {
++            if (atomic_load(&q->spin)) { hex_pause(); continue; }
+             // drop HVX context while spinning
+             if (poll_cnt > 1 && poll_cnt == HMX_QUEUE_POLL_COUNT) {
+                 qurt_hvx_unlock();
+             }
+             if (--poll_cnt) { hex_pause(); continue; }
+             FARF(HIGH, "hmx-queue-thread: sleeping");
+-            qurt_futex_wait(&q->seqn, prev_seqn);
++            atomic_store(&q->sleeping, 1);
++            if (atomic_load(&q->seqn) == prev_seqn && !atomic_load(&q->spin)) {
++                qurt_futex_wait(&q->seqn, prev_seqn);
++            }
++            atomic_store(&q->sleeping, 0);
+             poll_cnt = HMX_QUEUE_POLL_COUNT;
+             continue;
+         }
+diff --git a/ggml/src/ggml-hexagon/htp/hmx-queue.h b/ggml/src/ggml-hexagon/htp/hmx-queue.h
+index c2b1859..2d8e7de 100644
+--- a/ggml/src/ggml-hexagon/htp/hmx-queue.h
++++ b/ggml/src/ggml-hexagon/htp/hmx-queue.h
+@@ -48,6 +48,8 @@ struct hmx_queue_s {
+     uint32_t         capacity;
+ 
+     atomic_uint      seqn;      // incremented for all pushes, used with futex
++    atomic_uint      sleeping;  // consumer is (about to be) blocked on the seqn futex
++    atomic_uint      spin;      // >0: consumer polls instead of sleeping (ops with many short dependent HMX jobs)
+     qurt_thread_t    thread;
+     void *           stack;
+     uint32_t         hap_rctx;
+@@ -83,9 +85,12 @@ static inline bool hmx_queue_push(hmx_queue_t q, struct hmx_queue_desc d) {
+ 
+     q->desc[iw] = d;
+     atomic_store(&q->idx_write, (iw + 1) & q->idx_mask);
+-    // wake up our thread
++    // wake up our thread; skip the futex syscall while it is awake (polling)
++    // (seq_cst: the seqn update before the sleeping check pairs with sleeping=1 before the seqn re-check in the consumer)
+     atomic_fetch_add(&q->seqn, 1);
+-    qurt_futex_wake(&q->seqn, 1);
++    if (atomic_load(&q->sleeping)) {
++        qurt_futex_wake(&q->seqn, 1);
++    }
+ 
+     return true;
+ }
+@@ -149,6 +154,15 @@ static inline void hmx_queue_wakeup(hmx_queue_t q) {
+     hmx_queue_signal(q, HMX_QUEUE_WAKEUP);
+ }
+ 
++// keep the consumer thread polling between jobs (no futex sleep/wake per job); calls nest
++static inline void hmx_queue_spin_begin(hmx_queue_t q) {
++    atomic_fetch_add(&q->spin, 1);
++}
++
++static inline void hmx_queue_spin_end(hmx_queue_t q) {
++    atomic_fetch_sub(&q->spin, 1);
++}
++
+ static inline void hmx_queue_suspend(hmx_queue_t q) {
+     hmx_queue_signal(q, HMX_QUEUE_SUSPEND);
+ }
 diff --git a/ggml/src/ggml-hexagon/htp/hvx-norm.h b/ggml/src/ggml-hexagon/htp/hvx-norm.h
 index 7ea945a..4ae5f72 100644
 --- a/ggml/src/ggml-hexagon/htp/hvx-norm.h
@@ -3426,7 +4070,7 @@ index b72ef2b..a0ca32f 100644
                  drop_mmap(ctx, ctx->mmap + i);
              }
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index 9af3129..ad99252 100644
+index 9af3129..fd26a10 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -1978,7 +1978,7 @@ static void transfer_output_chunk_worker_fn(unsigned int n, unsigned int i, void
@@ -3802,7 +4446,7 @@ index 9af3129..ad99252 100644
          FARF(ERROR, "hmx-mm-id-2d: VTCM too small : m %d k %d n %d budget %zu", m_core_padded, k, n, vtcm_budget);
          return -1;
      }
-@@ -3603,62 +3757,404 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3603,62 +3757,568 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
      htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
  
      hmx_matmul_job_t job;
@@ -3847,22 +4491,15 @@ index 9af3129..ad99252 100644
 -            const uint32_t height = is_tiled ? hmx_ceil_div(n_cols, 32) * n_weight_tiles : n_cols;
 -            dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[0], weight),
 -                           dma_dst_stride, dma_src_stride, dma_width_bytes, height);
--        }
 +        for (int w = 0; w < n_w; ++w) {
 +            for (int i = 0; i < n_chunk_cnt; ++i, ++item) {
 +                const size_t nc = (size_t) i * n_chunk_n_cols;
 +                const size_t n_cols = hex_smin((size_t) n - nc, n_chunk_n_cols);
 +                const size_t n_col_tiles = hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS);
- 
--        for (int i = 0; i < n_chunk_cnt; ++i) {
--            const size_t nc = (size_t) i * n_chunk_n_cols;
--            const size_t n_cols = hex_smin((size_t) n - nc, n_chunk_n_cols);
--            const size_t n_col_tiles = hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS);
++
 +                // A: Wait for weight DMA
 +                void * curr_raw = (void *) dma_queue_pop(weight_dma).dst;
- 
--            // A: Wait for weight DMA
--            void * curr_raw = (void *) dma_queue_pop(weight_dma).dst;
++
 +                // B: Weight Dequantize (Threaded)
 +                dequantize_tiled_weight_chunk_to_fp16_tiles(
 +                    ctx, vtcm_weight_bufs[item % 2], curr_raw,
@@ -3900,6 +4537,30 @@ index 9af3129..ad99252 100644
 +                        }
 +                    }
 +                }
++
++                // C: HMX Compute (Queue-based)
++                hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, (__fp16 *) vtcm_weight_bufs[item % 2], vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
++                hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
++                hmx_queue_pop(ctx->hmx_queue);
++
++                // D: Output Store
++                transfer_output_chunk_scattered_threaded(
++                    ctx, dsts[w] + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
++                    matrix_rows, cur_a, mapping_stride, dst_nb1s[w], dst_nb2s[w], cne1, n_threads);
++            }
+         }
++    }
+ 
+-        for (int i = 0; i < n_chunk_cnt; ++i) {
+-            const size_t nc = (size_t) i * n_chunk_n_cols;
+-            const size_t n_cols = hex_smin((size_t) n - nc, n_chunk_n_cols);
+-            const size_t n_col_tiles = hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS);
++#undef HMX_MMID_DMA_HEIGHT
+ 
+-            // A: Wait for weight DMA
+-            void * curr_raw = (void *) dma_queue_pop(weight_dma).dst;
++    return 0;
++}
  
 -            // B: Weight Dequantize (Threaded)
 -            dequantize_tiled_weight_chunk_to_fp16_tiles(
@@ -3907,42 +4568,13 @@ index 9af3129..ad99252 100644
 -                n_cols, k, row_stride, weight_type,
 -                n_k_tiles, n_k_tiles_div, dequant_worker_fn, n_threads
 -            );
-+                // C: HMX Compute (Queue-based)
-+                hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, (__fp16 *) vtcm_weight_bufs[item % 2], vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
-+                hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
-+                hmx_queue_pop(ctx->hmx_queue);
- 
--            // Start weight DMA for the next chunk early
--            const size_t nc_next = nc + n_chunk_n_cols;
--            if (nc_next < (size_t) n) {
--                const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
--                const uint32_t height_next = is_tiled ? hmx_ceil_div(n_cols_next, 32) * n_weight_tiles : n_cols_next;
--                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[(i + 1) % 2], weight + nc_next * weight_stride),
--                               dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
-+                // D: Output Store
-+                transfer_output_chunk_scattered_threaded(
-+                    ctx, dsts[w] + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
-+                    matrix_rows, cur_a, mapping_stride, dst_nb1s[w], dst_nb2s[w], cne1, n_threads);
-             }
-+        }
-+    }
- 
--            // C: HMX Compute (Queue-based)
--            hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, (__fp16 *) vtcm_weight_bufs[i % 2], vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
--            hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
--            hmx_queue_pop(ctx->hmx_queue);
-+#undef HMX_MMID_DMA_HEIGHT
-+
-+    return 0;
-+}
-+
 +// --- Streamed expert kernel (single device) ---
 +//
 +// One flat item stream over the whole op: (expert, M-chunk, weight, N-chunk). Two raw weight buffers, two
 +// fp16 weight buffers, two activation buffers and two output buffers, with async HMX:
-+//   iteration i: [gather the activation rows of a new expert / M-chunk] -> wait DMA(i) -> dequant(i) ->
-+//                DMA(i + 2) into the raw buffer just freed -> push HMX(i) -> pop HMX(i - 1) -> scatter(i - 1)
-+// so HMX(i) runs under scatter(i - 1), the next gather and dequant(i + 1), across expert boundaries.
++//   item j: wait DMA(j) -> pop HMX(j - 2) -> one HVX step [scatter(j - 2) | gather of a new expert / M-chunk |
++//           dequant(j)] -> DMA(j + 2) into the raw buffer just freed -> push HMX(j)
++// HMX always has the previous item queued while HVX runs the step, across expert boundaries.
 +// Arithmetic is unchanged: every output tile is still one HMX job over the full k with the same dequant.
 +
 +// experts with rows, in order
@@ -3993,13 +4625,19 @@ index 9af3129..ad99252 100644
 +    if (p->mr < p->m_end) return;
 +    hmx_mmid_pos_next_expert(p);
 +}
- 
--            // D: Output Store
++
 +// The gather threads write whole 32-row tiles from their first row on, so the last ones can write up to 31 rows
 +// past the M-chunk. The synchronous kernel lets that spill into its idle output area; here the next buffer is
 +// live (the other activation buffer or a pending output), so each activation buffer gets one spare tile row.
 +#define HMX_MMID_ACT_SLACK_ROWS 32
-+
+ 
+-            // Start weight DMA for the next chunk early
+-            const size_t nc_next = nc + n_chunk_n_cols;
+-            if (nc_next < (size_t) n) {
+-                const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
+-                const uint32_t height_next = is_tiled ? hmx_ceil_div(n_cols_next, 32) * n_weight_tiles : n_cols_next;
+-                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[(i + 1) % 2], weight + nc_next * weight_stride),
+-                               dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
 +static inline size_t hmx_mmid_stream_vtcm_size(size_t mc, size_t nc, size_t w_col_bytes, size_t vec_dot_size) {
 +    return 2 * hex_align_up(nc * w_col_bytes, HTP_MM_HMX_TILE_SIZE) +
 +           2 * hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE) +
@@ -4049,6 +4687,115 @@ index 9af3129..ad99252 100644
 +    *nc_out   = best_nc;
 +    *used_out = best_used;
 +    return 0;
++}
++
++// HVX work of one pipeline step of the streamed expert kernel as one shared task list (one fork-join per item):
++// scatter of an older item, gather of a new expert / M-chunk and dequant of the next item. Tasks are taken
++// dynamically and interleaved by type, so memory-bound (gather, scatter) and VTCM-bound (dequant) tasks run
++// on different HVX threads at the same time.
++enum { HMX_MMID_T_GATHER = 0, HMX_MMID_T_SCATTER = 1, HMX_MMID_T_DEQUANT = 2 };
++
++#define HMX_MMID_MAX_TASKS 96
++#define HMX_MMID_MAX_G     24  // gather tasks: multiples of 32 rows (the tile padding stays inside the task)
++#define HMX_MMID_MAX_S     32  // scatter tasks: multiples of 16 rows
++#define HMX_MMID_MAX_D     32  // dequant tasks
++
++typedef struct {
++    struct htp_thread_trace       * traces;
++    atomic_uint                     next;
++    uint32_t                        n_tasks;
++    uint8_t                         type[HMX_MMID_MAX_TASKS];
++    uint8_t                         idx[HMX_MMID_MAX_TASKS];
++
++    const struct mmid_row_mapping * matrix_rows;
++    uint32_t                        mapping_stride;
++
++    // gather: rows [g_mr, g_mr + g_n_rows) of expert g_a into g_dst
++    __fp16                        * g_dst;
++    const float                   * g_src;
++    uint32_t                        g_a, g_cne1, g_mr, g_n_rows, g_task_rows, k, k_valid, ne11;
++    struct fastdiv_values           ne11_div;
++    size_t                          nb11, nb12;
++
++    // scatter: rows [s_mr, s_mr + s_n_rows) of expert s_a from s_src
++    float                         * s_dst;
++    const __fp16                  * s_src;
++    uint32_t                        s_a, s_cne1, s_mr, s_n_rows, s_task_rows, s_n_cols;
++    size_t                          s_nb1, s_nb2;
++
++    // dequant
++    tiled_dequantize_state_t        dq;
++} hmx_mmid_hvx_step_t;
++
++static void hmx_mmid_hvx_step_worker(unsigned int n, unsigned int i, void * data) {
++    (void) n;
++    hmx_mmid_hvx_step_t * st = (hmx_mmid_hvx_step_t *) data;
++    struct htp_thread_trace * tr = &st->traces[i];
++
++    for (;;) {
++        const uint32_t t = atomic_fetch_add(&st->next, 1);
++        if (t >= st->n_tasks) break;
++        const uint32_t j = st->idx[t];
++        switch (st->type[t]) {
++            case HMX_MMID_T_GATHER: {
++                const uint32_t r0 = j * st->g_task_rows;
++                int rows = (int) st->g_cne1 - (int) (st->g_mr + r0);  // signed: hex_smin is unsigned
++                if (rows > (int) st->g_task_rows) rows = (int) st->g_task_rows;
++                if (rows <= 0) break;
++                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, j);
++                if (st->ne11 == 1) {
++                    transfer_activation_chunk_fp32_to_fp16_gathered_flat(
++                        st->g_dst, st->g_src, st->g_mr + r0, r0, (uint32_t) rows, st->k,
++                        st->matrix_rows, st->g_a, st->mapping_stride, st->nb12, st->g_cne1, st->k_valid);
++                } else {
++                    transfer_activation_chunk_fp32_to_fp16_gathered(
++                        st->g_dst, st->g_src, st->g_mr + r0, r0, (uint32_t) rows, st->k,
++                        st->matrix_rows, st->g_a, st->mapping_stride, st->ne11, &st->ne11_div,
++                        st->nb11, st->nb12, st->g_cne1, st->k_valid);
++                }
++                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, j);
++                break;
+             }
++            case HMX_MMID_T_SCATTER: {
++                const uint32_t r0 = j * st->s_task_rows;
++                int rows = (int) st->s_n_rows - (int) r0;
++                if (rows > (int) st->s_task_rows) rows = (int) st->s_task_rows;
++                if (rows <= 0 || st->s_mr + r0 >= st->s_cne1) break;
++                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, j);
++                transfer_output_chunk_fp16_to_fp32_scattered(
++                    st->s_dst, st->s_src, st->s_mr + r0, r0, (uint32_t) rows, st->s_n_cols,
++                    st->matrix_rows, st->s_a, st->mapping_stride, st->s_nb1, st->s_nb2, st->s_cne1);
++                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, j);
++                break;
++            }
++            default: {
++                const uint32_t start = j * st->dq.n_tiles_per_task;
++                const uint32_t end   = hex_smin(start + st->dq.n_tiles_per_task, st->dq.n_tot_tiles);
++                if (start >= end) break;
++                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, j);
++                st->dq.task_fn(&st->dq, start, end);
++                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_DEQUANT, j);
++                break;
++            }
++        }
++    }
++}
+ 
+-            // C: HMX Compute (Queue-based)
+-            hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, (__fp16 *) vtcm_weight_bufs[i % 2], vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
+-            hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
+-            hmx_queue_pop(ctx->hmx_queue);
++// task list: memory-bound tasks first and spread out, dequant tasks in between
++static void hmx_mmid_hvx_step_build(hmx_mmid_hvx_step_t * st, uint32_t n_g, uint32_t n_s, uint32_t n_d) {
++    uint32_t g = 0, s = 0, d = 0, t = 0;
++    assert(n_g <= HMX_MMID_MAX_G && n_s <= HMX_MMID_MAX_S && n_d <= HMX_MMID_MAX_D);
++    while (g < n_g || s < n_s || d < n_d) {
++        if (g < n_g) { st->type[t] = HMX_MMID_T_GATHER;  st->idx[t++] = (uint8_t) g++; }
++        if (s < n_s) { st->type[t] = HMX_MMID_T_SCATTER; st->idx[t++] = (uint8_t) s++; }
++        if (d < n_d) { st->type[t] = HMX_MMID_T_DEQUANT; st->idx[t++] = (uint8_t) d++; }
++    }
++    st->n_tasks = t;
++    atomic_store(&st->next, 0);
 +}
 +
 +// Returns 1 when the op cannot use the streamed kernel (nothing was done, use the per-expert kernel),
@@ -4158,80 +4905,141 @@ index 9af3129..ad99252 100644
 +        hmx_mmid_pos_advance(&ahead, n_w, n_chunk_cnt, (int) mc);
 +    }
 +
-+    hmx_matmul_job_t job_slots[2];
-+    struct {
++    hmx_mmid_hvx_step_t step;
++    step.traces         = ctx->trace;
++    step.matrix_rows    = matrix_rows;
++    step.mapping_stride = (uint32_t) mapping_stride;
++    step.g_src          = activation;
++    step.k              = (uint32_t) k;
++    step.k_valid        = (uint32_t) k_valid;
++    step.ne11           = (uint32_t) ne11;
++    step.ne11_div       = ne11 > 1 ? init_fastdiv_values(ne11) : (struct fastdiv_values){ 0, 0 };
++    step.nb11           = act_nb1;
++    step.nb12           = act_nb2;
++
++    tiled_dequantize_state_t * dq = &step.dq;
++    memset(dq, 0, sizeof(*dq));
++    dq->task_fn           = dequant_worker_fn;
++    dq->k_block           = k;
++    dq->row_stride        = row_stride;
++    dq->weight_type       = weight_type;
++    dq->n_k_tiles         = n_k_tiles;
++    dq->n_weight_tiles    = n_weight_tiles;
++    dq->n_k_tiles_div     = n_k_tiles_div;
++    dq->traces            = ctx->trace;
++    dq->ctx               = ctx;
++    dq->tile_size         = htp_tensor_get_tile_size(weight_type);
++    dq->aligned_tile_size = htp_tensor_get_tile_padded_size(weight_type);
++
++    // pending items for the scatter: [0] = item - 2, [1] = item - 1
++    struct hmx_mmid_out {
 +        float * dst;
 +        size_t  nb1, nb2;
 +        int     a, cne1, mr, n_rows, n_cols;
-+    } pend = { 0 };
-+    bool     have_pend = false;
++    } pend[2];
++    int      n_pend = 0;
 +    uint32_t item = 0;
 +    uint32_t seg  = 0;
++    hmx_matmul_job_t job_slots[2];
 +
++    // item j: pop DMA(j); pop HMX(j - 2); [scatter(j - 2) | gather(segment of j) | dequant(j)]; DMA(j + 2); push HMX(j)
 +    while (cur.valid) {
 +        const size_t n_rows = hex_smin((size_t) (cur.m_end - cur.mr), mc);
 +        const bool   new_seg = (cur.w == 0 && cur.i == 0);
-+        if (new_seg) {
-+            if (item > 0) ++seg;
-+            // HMX(item - 1) may still read act_bufs[(seg - 1) % 2]
-+            transfer_activation_chunk_gathered_threaded(
-+                ctx, act_bufs[seg % 2], activation, cur.mr, (int) n_rows, k,
-+                matrix_rows, cur.a, mapping_stride, ne11, act_nb1, act_nb2, cur.cne1, n_threads, k_valid);
-+        }
++        if (new_seg && item > 0) ++seg;
 +
 +        const size_t nc_cur = (size_t) cur.i * nc;
 +        const size_t n_cols = hex_smin((size_t) n - nc_cur, nc);
 +
-+        // A: weight chunk of this item
 +        void * curr_raw = (void *) dma_queue_pop(weight_dma).dst;
 +
-+        // B: dequant into the fp16 buffer HMX(item - 2) used (popped in the previous iteration)
-+        dequantize_tiled_weight_chunk_to_fp16_tiles(
-+            ctx, wf_bufs[item % 2], curr_raw,
-+            (int) n_cols, k, row_stride, weight_type,
-+            n_k_tiles, n_k_tiles_div, dequant_worker_fn, n_threads);
++        const bool do_scatter = (n_pend == 2);
++        if (do_scatter) {
++            hmx_queue_pop(ctx->hmx_queue);  // HMX(item - 2): frees wf/out[item % 2] and the act buffer of segment - 2
++        }
 +
++        uint32_t n_g = 0, n_s = 0;
++        if (new_seg) {
++            step.g_dst  = act_bufs[seg % 2];
++            step.g_a    = (uint32_t) cur.a;
++            step.g_cne1 = (uint32_t) cur.cne1;
++            step.g_mr   = (uint32_t) cur.mr;
++            step.g_n_rows = (uint32_t) n_rows;
++            step.g_task_rows = 32 * hmx_ceil_div((uint32_t) n_rows, 32 * HMX_MMID_MAX_G);
++            n_g = hmx_ceil_div((uint32_t) n_rows, step.g_task_rows);
++        }
++        if (do_scatter) {
++            const struct hmx_mmid_out * o = &pend[0];
++            step.s_dst    = o->dst;
++            step.s_src    = out_bufs[item % 2];
++            step.s_a      = (uint32_t) o->a;
++            step.s_cne1   = (uint32_t) o->cne1;
++            step.s_mr     = (uint32_t) o->mr;
++            step.s_n_rows = (uint32_t) o->n_rows;
++            step.s_n_cols = (uint32_t) o->n_cols;
++            step.s_nb1    = o->nb1;
++            step.s_nb2    = o->nb2;
++            step.s_task_rows = 16 * hmx_ceil_div((uint32_t) o->n_rows, 16 * HMX_MMID_MAX_S);
++            n_s = hmx_ceil_div((uint32_t) o->n_rows, step.s_task_rows);
++        }
++        {
++            const uint32_t n_tot_tiles = (uint32_t) hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS) * n_weight_tiles;
++            dq->dst              = wf_bufs[item % 2];
++            dq->src              = (const uint8_t *) curr_raw;
++            dq->n_cols           = (uint32_t) n_cols;
++            dq->n_tot_tiles      = n_tot_tiles;
++            dq->n_tiles_per_task = hmx_ceil_div(n_tot_tiles, 2 * (uint32_t) n_threads);
++            dq->n_tasks          = hmx_ceil_div(n_tot_tiles, dq->n_tiles_per_task);
++        }
++        hmx_mmid_hvx_step_build(&step, n_g, n_s, dq->n_tasks);
++        if (n_threads > 1) {
++            worker_pool_run_func(ctx->worker_pool, hmx_mmid_hvx_step_worker, &step, n_threads);
++        } else {
++            hmx_mmid_hvx_step_worker(1, 0, &step);
++        }
++
++        if (do_scatter) {
++            pend[0] = pend[1];
++            n_pend  = 1;
++        }
+ 
+-            // D: Output Store
+-            transfer_output_chunk_scattered_threaded(
+-                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
+-                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
 +        // the raw buffer is free again: weight chunk of item + 2
 +        if (ahead.valid) {
 +            HMX_MMID_DMA_PUSH(ahead, curr_raw);
 +            hmx_mmid_pos_advance(&ahead, n_w, n_chunk_cnt, (int) mc);
-+        }
+         }
 +
-+        // C: HMX(item), queued behind HMX(item - 1)
 +        hmx_matmul_job_init(&job_slots[item % 2], out_bufs[item % 2], act_bufs[seg % 2], wf_bufs[item % 2], vtcm_scales,
 +                            hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS), hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS),
 +                            k / HTP_MM_HMX_TILE_N_ROWS);
 +        hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job_slots[item % 2]));
 +
-+        // D: wait HMX(item - 1) and scatter its output while HMX(item) runs
-+        if (have_pend) {
-+            hmx_queue_pop(ctx->hmx_queue);
-             transfer_output_chunk_scattered_threaded(
--                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
--                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
-+                ctx, pend.dst, out_bufs[(item - 1) % 2], pend.mr, pend.n_rows, pend.n_cols,
-+                matrix_rows, pend.a, mapping_stride, pend.nb1, pend.nb2, pend.cne1, n_threads);
-         }
-+
-+        pend.dst    = dsts[cur.w] + nc_cur;
-+        pend.nb1    = dst_nb1s[cur.w];
-+        pend.nb2    = dst_nb2s[cur.w];
-+        pend.a      = cur.a;
-+        pend.cne1   = cur.cne1;
-+        pend.mr     = cur.mr;
-+        pend.n_rows = (int) n_rows;
-+        pend.n_cols = (int) n_cols;
-+        have_pend   = true;
++        struct hmx_mmid_out * o = &pend[n_pend++];
++        o->dst    = dsts[cur.w] + nc_cur;
++        o->nb1    = dst_nb1s[cur.w];
++        o->nb2    = dst_nb2s[cur.w];
++        o->a      = cur.a;
++        o->cne1   = cur.cne1;
++        o->mr     = cur.mr;
++        o->n_rows = (int) n_rows;
++        o->n_cols = (int) n_cols;
 +
 +        hmx_mmid_pos_advance(&cur, n_w, n_chunk_cnt, (int) mc);
 +        ++item;
      }
  
-+    if (have_pend) {
++    // epilogue: the last one or two items, oldest first
++    for (int p = 0; p < n_pend; ++p) {
 +        hmx_queue_pop(ctx->hmx_queue);
++        const struct hmx_mmid_out * o = &pend[p];
++        const uint32_t it = item - (uint32_t) n_pend + (uint32_t) p;
 +        transfer_output_chunk_scattered_threaded(
-+            ctx, pend.dst, out_bufs[(item - 1) % 2], pend.mr, pend.n_rows, pend.n_cols,
-+            matrix_rows, pend.a, mapping_stride, pend.nb1, pend.nb2, pend.cne1, n_threads);
++            ctx, o->dst, out_bufs[it % 2], o->mr, o->n_rows, o->n_cols,
++            matrix_rows, o->a, mapping_stride, o->nb1, o->nb2, o->cne1, n_threads);
 +    }
 +
 +#undef HMX_MMID_DMA_PUSH
@@ -4240,7 +5048,7 @@ index 9af3129..ad99252 100644
      return 0;
  }
  
-@@ -3857,43 +4353,89 @@ static int hmx_mm_op_matmul_id(
+@@ -3857,43 +4517,89 @@ static int hmx_mm_op_matmul_id(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -4270,11 +5078,6 @@ index 9af3129..ad99252 100644
 +        }
 +        // ret > 0: not eligible, per-expert kernel below
 +    }
-+
-+    // each expert call runs once the next one is known, so it can prefetch that call's first weight chunk
-+    struct hmx_mmid_prefetch pf = { 0 };
-+    bool    have_prev = false;
-+    int32_t prev_a = 0, prev_cne1 = 0, prev_m_start = 0, prev_m_end = 0;
  
 -        const int m_padded = hex_align_up(cne1, 32);
 -        int m_start = 0, m_end = m_padded;
@@ -4282,6 +5085,11 @@ index 9af3129..ad99252 100644
 -            const bool my_expert = (target_dev == octx->ctx->mdev.idx);
 -            if (++target_dev == octx->ctx->mdev.count) {
 -                target_dev = 0;
++    // each expert call runs once the next one is known, so it can prefetch that call's first weight chunk
++    struct hmx_mmid_prefetch pf = { 0 };
++    bool    have_prev = false;
++    int32_t prev_a = 0, prev_cne1 = 0, prev_m_start = 0, prev_m_end = 0;
++
 +    uint32_t target_dev = 0;
 +    for (uint32_t cur_a = 0; cur_a <= (uint32_t) n_as; ++cur_a) {
 +        const bool at_end = (cur_a == (uint32_t) n_as);
@@ -4362,7 +5170,7 @@ index 9af3129..ad99252 100644
  
      return HTP_STATUS_OK;
  }
-@@ -4016,49 +4558,126 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -4016,49 +4722,126 @@ static int hmx_mm_op_matmul_id_nx(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -4555,7 +5363,7 @@ index 09875a6..037d5b2 100644
      // Precomputed division values
      struct fastdiv_values div_ne12_ne1;
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
-index 0d28c89..4cc7550 100644
+index 0d28c89..0527641 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
 @@ -138,7 +138,15 @@ static inline void hvx_ssm_conv_unpack_to_T(const float * raw, float * T, uint32
@@ -4632,7 +5440,7 @@ index 0d28c89..4cc7550 100644
          // Writeback dst_tile VTCM -> DDR via 2D DMA
          dma_queue_push(dma_q,
                         dma_make_data(dst->data + i3 * dst_stride_seq_bytes + (ir0 + tile_off) * sizeof(float),
-@@ -542,6 +561,178 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
+@@ -542,6 +561,225 @@ static void ssm_conv_thread_f32_prefill(unsigned int nth, unsigned int ith, void
           dst->ne[2], dst->ne[3]);
  }
  
@@ -4642,16 +5450,37 @@ index 0d28c89..4cc7550 100644
 +static inline void ssm_conv_tc_push_in(dma_queue * q, const struct htp_ssm_conv_kernel_params * kp,
 +                                       const struct htp_ssm_conv_tc_layout * L, uint8_t * base, uint32_t buf,
 +                                       const struct htp_tensor * x, const struct htp_tensor * s,
-+                                       const struct htp_tensor * w, uint32_t c0, uint32_t cw) {
++                                       const struct htp_tensor * w, uint32_t c0, uint32_t cw, uint32_t t0, uint32_t tl) {
 +    const uint32_t K  = kp->d_conv;
 +    const uint32_t cb = kp->d_inner_tile;
 +
 +    uint8_t * xin = base + L->off_x[buf] + (K - 1) * cb * sizeof(float);
 +    uint8_t * raw = base + L->off_raw[buf];
 +
-+    dma_queue_push(q, dma_make_data(xin, x->data + c0 * sizeof(float)), cb * sizeof(float), x->nb[0], cw * sizeof(float), kp->n_t);
-+    dma_queue_push(q, dma_make_data(raw, s->data + c0 * s->nb[1]), 0, 0, cw * (K - 1) * sizeof(float), 1);
-+    dma_queue_push(q, dma_make_data(raw + cb * (K - 1) * sizeof(float), w->data + c0 * w->nb[1]), 0, 0, cw * K * sizeof(float), 1);
++    dma_queue_push(q, dma_make_data(xin, x->data + (size_t) t0 * x->nb[0] + c0 * sizeof(float)), cb * sizeof(float), x->nb[0], cw * sizeof(float), tl);
++    if (t0 == 0) {
++        dma_queue_push(q, dma_make_data(raw, s->data + c0 * s->nb[1]), 0, 0, cw * (K - 1) * sizeof(float), 1);
++        dma_queue_push(q, dma_make_data(raw + cb * (K - 1) * sizeof(float), w->data + c0 * w->nb[1]), 0, 0, cw * K * sizeof(float), 1);
++    }
++}
++
++// work items of a thread: its channel blocks (ith, ith + nth, ...) x the time tiles of each block, in order
++struct ssm_conv_tc_item {
++    uint32_t c0, cw, t0, tl, first, last;
++};
++
++static inline struct ssm_conv_tc_item ssm_conv_tc_item_at(uint32_t it, uint32_t ith, uint32_t nth, uint32_t n_tiles,
++                                                          uint32_t tt, uint32_t T, uint32_t cb, uint32_t c_beg, uint32_t c_end) {
++    struct ssm_conv_tc_item r;
++    const uint32_t i = it / n_tiles;
++    const uint32_t j = it - i * n_tiles;
++    r.c0    = c_beg + (ith + i * nth) * cb;
++    r.cw    = MIN(cb, c_end - r.c0);
++    r.t0    = j * tt;
++    r.tl    = MIN(tt, T - r.t0);
++    r.first = (j == 0);
++    r.last  = (j + 1 == n_tiles);
++    return r;
 +}
 +
 +static void ssm_conv_thread_f32_tc(unsigned int nth, unsigned int ith, void * data) {
@@ -4667,6 +5496,7 @@ index 0d28c89..4cc7550 100644
 +
 +    const uint32_t K    = kp->d_conv;
 +    const uint32_t T    = kp->n_t;
++    const uint32_t TT   = (kp->tc_t_tile > 0 && kp->tc_t_tile < T) ? kp->tc_t_tile : T;
 +    const uint32_t cb   = kp->d_inner_tile;
 +    const uint32_t rs   = cb / VLEN_FP32; // VTCM row stride in vectors
 +    const bool     silu = kp->fuse_silu != 0;
@@ -4677,16 +5507,16 @@ index 0d28c89..4cc7550 100644
 +    if (ith >= n_blocks) {
 +        return;
 +    }
-+    const uint32_t n_mine = (n_blocks - ith + nth - 1) / nth; // blocks ith, ith + nth, ...
++    const uint32_t n_mine  = (n_blocks - ith + nth - 1) / nth; // blocks ith, ith + nth, ...
++    const uint32_t n_tiles = (T + TT - 1) / TT;
++    const uint32_t n_items = n_mine * n_tiles;
 +
 +    struct htp_ssm_conv_tc_layout L;
-+    htp_ssm_conv_tc_layout_build(&L, K, T, cb);
++    htp_ssm_conv_tc_layout_build(&L, K, TT, cb);
 +
 +    uint8_t *   base = octx->src0_spad.data + ith * octx->src0_spad.size_per_thread;
 +    float *     wT   = (float *) (base + L.off_w);
 +    dma_queue * q    = octx->ctx->dma[ith];
-+
-+    const uint32_t n_out = st ? 2 : 1; // DMA descriptors pushed per output block
 +
 +    // gather/scatter byte offsets of channel l in [c][K - 1] (state) and [c][K] (weights) rows
 +    int32_t offs[2][32] __attribute__((aligned(128)));
@@ -4699,28 +5529,29 @@ index 0d28c89..4cc7550 100644
 +
 +    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
 +
-+    ssm_conv_tc_push_in(q, kp, &L, base, 0, x, s, w, c_beg + ith * cb, MIN(cb, c_end - (c_beg + ith * cb)));
++    {
++        const struct ssm_conv_tc_item n0 = ssm_conv_tc_item_at(0, ith, nth, n_tiles, TT, T, cb, c_beg, c_end);
++        ssm_conv_tc_push_in(q, kp, &L, base, 0, x, s, w, n0.c0, n0.cw, n0.t0, n0.tl);
++    }
 +
-+    for (uint32_t i = 0; i < n_mine; i++) {
-+        const uint32_t buf = i % 2;
-+        const uint32_t c0  = c_beg + (ith + i * nth) * cb;
-+        const uint32_t cw  = MIN(cb, c_end - c0);
++    for (uint32_t it = 0; it < n_items; it++) {
++        const uint32_t buf = it % 2;
++        const struct ssm_conv_tc_item c = ssm_conv_tc_item_at(it, ith, nth, n_tiles, TT, T, cb, c_beg, c_end);
++        const uint32_t cw = c.cw;
 +
-+        if (i >= 2) {
++        if (it >= 2) {
++            // outputs of item it - 2 (frees this buffer's y/st)
++            const struct ssm_conv_tc_item p2 = ssm_conv_tc_item_at(it - 2, ith, nth, n_tiles, TT, T, cb, c_beg, c_end);
++            const uint32_t n_out = 1 + ((st && p2.last) ? 1 : 0);
 +            for (uint32_t d = 0; d < n_out; d++) {
-+                dma_queue_pop(q); // output of block i - 2 (frees y/st buffers)
++                dma_queue_pop(q);
 +            }
 +        }
 +        dma_queue_pop(q); // x
-+        dma_queue_pop(q); // state
-+        dma_queue_pop(q); // weights
-+
-+        if (i + 1 < n_mine) {
-+            const uint32_t nc0 = c_beg + (ith + (i + 1) * nth) * cb;
-+            ssm_conv_tc_push_in(q, kp, &L, base, buf ^ 1, x, s, w, nc0, MIN(cb, c_end - nc0));
++        if (c.first) {
++            dma_queue_pop(q); // state
++            dma_queue_pop(q); // weights
 +        }
-+
-+        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
 +
 +        float *       xb  = (float *) (base + L.off_x[buf]);
 +        float *       yb  = (float *) (base + L.off_y[buf]);
@@ -4729,48 +5560,72 @@ index 0d28c89..4cc7550 100644
 +
 +        const uint32_t nv = (cw + VLEN_FP32 - 1) / VLEN_FP32;
 +
-+        // state rows in front of x and weights transposed to [K][cb], with VTCM gathers (scalar VTCM
-+        // accesses are slow): lane l of vector v reads channel 32 v + l
-+        for (uint32_t v = 0; v < nv; v++) {
-+            for (uint32_t j = 0; j < K - 1; j++) {
-+                const HVX_Vector off = Q6_Vw_vadd_VwVw(off_s, Q6_V_vsplat_R((32 * v * (K - 1) + j) * sizeof(float)));
-+                Q6_vgather_ARMVw((HVX_Vector *) (xb + j * cb) + v, (size_t) sr, cw * (K - 1) * sizeof(float) - 1, off);
-+            }
-+            for (uint32_t k = 0; k < K; k++) {
-+                const HVX_Vector off = Q6_Vw_vadd_VwVw(off_w, Q6_V_vsplat_R((32 * v * K + k) * sizeof(float)));
-+                Q6_vgather_ARMVw((HVX_Vector *) (wT + k * cb) + v, (size_t) wr, cw * K * sizeof(float) - 1, off);
++        if (!c.first) {
++            // the K - 1 rows in front of this tile are the last K - 1 rows of the previous tile's [prefix | x]
++            // (still in the other buffer: the next DMA into it is pushed below)
++            const struct ssm_conv_tc_item p1 = ssm_conv_tc_item_at(it - 1, ith, nth, n_tiles, TT, T, cb, c_beg, c_end);
++            const HVX_Vector * restrict pv = (const HVX_Vector *) (base + L.off_x[buf ^ 1]) + p1.tl * rs;
++            HVX_Vector * restrict       xv = (HVX_Vector *) xb;
++            for (uint32_t r = 0; r < (K - 1) * rs; r++) {
++                xv[r] = pv[r];
 +            }
 +        }
-+        hvx_gather_sync(xb);
-+        hvx_gather_sync(wT);
++
++        if (it + 1 < n_items) {
++            const struct ssm_conv_tc_item n1 = ssm_conv_tc_item_at(it + 1, ith, nth, n_tiles, TT, T, cb, c_beg, c_end);
++            ssm_conv_tc_push_in(q, kp, &L, base, buf ^ 1, x, s, w, n1.c0, n1.cw, n1.t0, n1.tl);
++        }
++
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) it);
++
++        if (c.first) {
++            // state rows in front of x and weights transposed to [K][cb], with VTCM gathers (scalar VTCM
++            // accesses are slow): lane l of vector v reads channel 32 v + l
++            for (uint32_t v = 0; v < nv; v++) {
++                for (uint32_t j = 0; j < K - 1; j++) {
++                    const HVX_Vector off = Q6_Vw_vadd_VwVw(off_s, Q6_V_vsplat_R((32 * v * (K - 1) + j) * sizeof(float)));
++                    Q6_vgather_ARMVw((HVX_Vector *) (xb + j * cb) + v, (size_t) sr, cw * (K - 1) * sizeof(float) - 1, off);
++                }
++                for (uint32_t k = 0; k < K; k++) {
++                    const HVX_Vector off = Q6_Vw_vadd_VwVw(off_w, Q6_V_vsplat_R((32 * v * K + k) * sizeof(float)));
++                    Q6_vgather_ARMVw((HVX_Vector *) (wT + k * cb) + v, (size_t) wr, cw * K * sizeof(float) - 1, off);
++                }
++            }
++            hvx_gather_sync(xb);
++            hvx_gather_sync(wT);
++        }
 +
 +        const HVX_Vector * restrict xv = (const HVX_Vector *) xb;
 +        HVX_Vector * restrict       yv = (HVX_Vector *) yb;
 +        const HVX_Vector * restrict wv = (const HVX_Vector *) wT;
++        const uint32_t              tl = c.tl;
 +
-+        if (K == 4 && nv == 4) {
-+            // the 4 x 4 weight vectors stay in registers; all columns of a time step are independent
-+            HVX_Vector w[4][4];
-+            for (uint32_t k = 0; k < 4; k++) {
-+                for (uint32_t v = 0; v < 4; v++) {
-+                    w[k][v] = wv[k * rs + v];
++        if (K == 4 && nv % 4 == 0) {
++            // groups of 4 channel vectors: the 4 x 4 weight vectors stay in registers; all columns of a time
++            // step are independent
++            for (uint32_t g = 0; g < nv; g += 4) {
++                HVX_Vector wg[4][4];
++                for (uint32_t k = 0; k < 4; k++) {
++                    for (uint32_t v = 0; v < 4; v++) {
++                        wg[k][v] = wv[k * rs + g + v];
++                    }
 +                }
-+            }
-+            #pragma unroll(2)
-+            for (uint32_t t = 0; t < T; t++) {
-+                const HVX_Vector * restrict xr = xv + t * rs;
-+                HVX_Vector * restrict       yr = yv + t * rs;
-+                #pragma unroll
-+                for (uint32_t v = 0; v < 4; v++) {
-+                    const HVX_Vector s01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(xr[v], w[0][v]),
-+                                                                    Q6_Vqf32_vmpy_VsfVsf(xr[rs + v], w[1][v]));
-+                    const HVX_Vector s23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(xr[2 * rs + v], w[2][v]),
-+                                                                    Q6_Vqf32_vmpy_VsfVsf(xr[3 * rs + v], w[3][v]));
-+                    yr[v] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(s01, s23));
++                #pragma unroll(2)
++                for (uint32_t t = 0; t < tl; t++) {
++                    const HVX_Vector * restrict xr = xv + t * rs + g;
++                    HVX_Vector * restrict       yr = yv + t * rs + g;
++                    #pragma unroll
++                    for (uint32_t v = 0; v < 4; v++) {
++                        const HVX_Vector s01 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(xr[v], wg[0][v]),
++                                                                        Q6_Vqf32_vmpy_VsfVsf(xr[rs + v], wg[1][v]));
++                        const HVX_Vector s23 = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(xr[2 * rs + v], wg[2][v]),
++                                                                        Q6_Vqf32_vmpy_VsfVsf(xr[3 * rs + v], wg[3][v]));
++                        yr[v] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(s01, s23));
++                    }
 +                }
 +            }
 +        } else {
-+            for (uint32_t t = 0; t < T; t++) {
++            for (uint32_t t = 0; t < tl; t++) {
 +                const HVX_Vector * restrict xr = xv + t * rs;
 +                HVX_Vector * restrict       yr = yv + t * rs;
 +                for (uint32_t v = 0; v < nv; v++) {
@@ -4784,24 +5639,24 @@ index 0d28c89..4cc7550 100644
 +        }
 +
 +        if (silu) {
-+            hvx_silu_f32_qf32_aa((uint8_t *) yb, (const uint8_t *) yb, T * cb);
++            hvx_silu_f32_qf32_aa((uint8_t *) yb, (const uint8_t *) yb, tl * cb);
 +        }
 +
-+        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) i);
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) it);
 +
-+        dma_queue_push(q, dma_make_data(y->data + c0 * sizeof(float), yb), y->nb[1], cb * sizeof(float), cw * sizeof(float), T);
++        dma_queue_push(q, dma_make_data(y->data + (size_t) c.t0 * y->nb[1] + c.c0 * sizeof(float), yb), y->nb[1], cb * sizeof(float), cw * sizeof(float), tl);
 +
-+        if (st) {
++        if (st && c.last) {
 +            // new state = the last K - 1 rows of [state | x], channel-major like the CPY it replaces
 +            float * so = (float *) (base + L.off_st[buf]);
 +            for (uint32_t v = 0; v < nv; v++) {
 +                for (uint32_t j = 0; j < K - 1; j++) {
 +                    const HVX_Vector off = Q6_Vw_vadd_VwVw(off_s, Q6_V_vsplat_R((32 * v * (K - 1) + j) * sizeof(float)));
-+                    Q6_vscatter_RMVwV((size_t) so, cw * (K - 1) * sizeof(float) - 1, off, ((const HVX_Vector *) (xb + (T + j) * cb))[v]);
++                    Q6_vscatter_RMVwV((size_t) so, cw * (K - 1) * sizeof(float) - 1, off, ((const HVX_Vector *) (xb + (tl + j) * cb))[v]);
 +                }
 +            }
 +            hvx_gather_sync(so);
-+            dma_queue_push(q, dma_make_data(st->data + c0 * (K - 1) * sizeof(float), so), 0, 0, cw * (K - 1) * sizeof(float), 1);
++            dma_queue_push(q, dma_make_data(st->data + c.c0 * (K - 1) * sizeof(float), so), 0, 0, cw * (K - 1) * sizeof(float), 1);
 +        }
 +    }
 +
@@ -4811,7 +5666,7 @@ index 0d28c89..4cc7550 100644
  int op_ssm_conv_f32(struct htp_ops_context * octx) {
      const struct htp_tensor * src0 = octx->src[0];
      const struct htp_tensor * src1 = octx->src[1];
-@@ -553,6 +744,10 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
+@@ -553,6 +791,10 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
  
      const struct htp_ssm_conv_kernel_params * kparams = (const struct htp_ssm_conv_kernel_params *) octx->kernel_params;
  
@@ -4822,7 +5677,7 @@ index 0d28c89..4cc7550 100644
  
      if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
          return HTP_STATUS_INVAL_PARAMS;
-@@ -617,7 +812,9 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
+@@ -617,7 +859,9 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
           dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
           kparams->n_t == 1 ? "decode" : "prefill");
  
@@ -4834,10 +5689,10 @@ index 0d28c89..4cc7550 100644
      } else {
          work_queue_run(octx->ctx->work_queue, ssm_conv_thread_f32_prefill, &scctx, n_threads);
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.h b/ggml/src/ggml-hexagon/htp/ssm-conv.h
-index a071d74..4786caf 100644
+index a071d74..0f27dab 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.h
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.h
-@@ -22,8 +22,43 @@ struct htp_ssm_conv_kernel_params {
+@@ -22,8 +22,44 @@ struct htp_ssm_conv_kernel_params {
      uint32_t vtcm_src1_size;
      uint32_t vtcm_dst_size;
      uint32_t vtcm_size;
@@ -4851,6 +5706,7 @@ index a071d74..4786caf 100644
 +    //   dsts[0] = output [d_inner, n_t], dsts[1] = new state (last d_conv - 1 columns) if tc_state_out
 +    uint32_t tc_mode;
 +    uint32_t tc_state_out;
++    uint32_t tc_t_tile;    // tokens per time tile (0 = all n_t); the VTCM layout is built for this many rows
  };
  
 +// per-thread VTCM bytes of the tc_mode kernel for a block of cb channels
