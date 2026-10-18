@@ -201,14 +201,19 @@ bool engine::load(const engine_params & p) {
     if (!mp_) mp_ = md_;
 
     // models larger than an HTP session's ~3 GB window remap weights once per ubatch, so they want big ubatches;
-    // small models fit, and big ubatches can exceed per-op NPU buffer limits (e.g. a 248K-vocab head)
-    if (params_.n_ubatch <= 0) params_.n_ubatch = llama_model_size(mp_) > (3ull << 30) ? 2048 : 512;
+    // small models fit, and big ubatches can exceed per-op NPU buffer limits (e.g. a 248K-vocab head).
+    // 4096 rather than 2048: the HTP flash attention skips the fully masked (causal) KV blocks, so a bigger
+    // ubatch no longer pays for the masked half of its attention square.
+    if (params_.n_ubatch <= 0) params_.n_ubatch = llama_model_size(mp_) > (3ull << 30) ? 4096 : 512;
     params_.n_batch = std::max(params_.n_batch, params_.n_ubatch);
     if (mp_ == md_) params_.npu_decode_slots = 0;
     fprintf(stderr, "[trilane] n_ubatch = %d, decode slots = %d CPU + %d NPU\n", params_.n_ubatch, params_.max_seqs, params_.npu_decode_slots);
 
-    auto make_ctx = [&](llama_model * m, int threads, bool host_only, int n_seq) {
+    // prefill_only: the context only ever asks for one output per sequence (the last prompt token, or one NPU
+    // decode step), so cap n_outputs_max instead of reserving an n_batch x n_vocab logits buffer (2 GB at 2048)
+    auto make_ctx = [&](llama_model * m, int threads, bool host_only, int n_seq, bool prefill_only) {
         llama_context_params cp = llama_context_default_params();
+        if (prefill_only) cp.n_outputs_max = (uint32_t) std::max(1, n_seq);
         cp.n_ctx           = params_.n_ctx * n_seq;
         cp.n_batch         = params_.n_batch;
         cp.n_ubatch        = params_.n_ubatch;
@@ -220,8 +225,8 @@ bool engine::load(const engine_params & p) {
         cp.op_offload      = !host_only;
         return llama_init_from_model(m, cp);
     };
-    cd_ = make_ctx(md_, params_.threads_decode, true, params_.max_seqs);
-    cp_ = mp_ != md_ ? make_ctx(mp_, params_.threads_prefill, false, 1) : cd_;
+    cd_ = make_ctx(md_, params_.threads_decode, true, params_.max_seqs, false);
+    cp_ = mp_ != md_ ? make_ctx(mp_, params_.threads_prefill, false, 1, true) : cd_;
     if (!cd_ || !cp_) return false;
 
     vocab_ = llama_model_get_vocab(mp_);
