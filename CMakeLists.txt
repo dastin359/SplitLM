@@ -26,3 +26,9 @@ target_link_libraries(trilane-server PRIVATE llama trilane-httplib)
 # E1: CPU read bandwidth of HTP0 rpcmem vs heap
 add_executable(trilane-rpcmem-bw src/rpcmem_bw.cpp)
 target_link_libraries(trilane-rpcmem-bw PRIVATE llama)
+
+# Lane 2: NPU prefill + CPU decode with MTP speculative decoding (links llama.cpp's common library)
+find_library(LLAMA_COMMON_LIB NAMES llama-common PATHS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib NO_DEFAULT_PATH)
+add_executable(trilane-spec src/spec_tool.cpp)
+target_include_directories(trilane-spec PRIVATE ${LLAMA_SRC}/common ${LLAMA_VENDOR})
+target_link_libraries(trilane-spec PRIVATE llama ${LLAMA_COMMON_LIB})
