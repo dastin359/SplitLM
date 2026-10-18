@@ -29,16 +29,20 @@ static void log_cb(ggml_log_level level, const char * text, void *) {
 static double now_ms() { return llama_time_us() / 1000.0; }
 
 struct args {
-    std::string model, prompt_file, mode = "spec", prefill_dev = "HTP0", alias = "auto";
+    std::string model, prompt_file, mode = "spec", prefill_dev = "HTP0", alias = "auto", spec_type = "draft-mtp";
+    int ngram_n = 3;
     int n_gen = 128, n_ctx = 2048, threads = 8, nmax = 3, ubatch = 512;
+    double gb_per_tok = 0; // bytes read per plain decode token (GB), for GB/s-equivalent reporting
     std::vector<int> batches = { 1, 2, 3, 4, 5, 8 };
     bool check = false;
+    bool share = true;              // decode model borrows the prefill model's CPU-resident weights (--no-share: own copies)
+    std::string p_cpu = "none";     // --prefill-cpu none|output|nonq4: non-Q4_0 weights the prefill model keeps on CPU for sharing
     bool prefill_on_decode = false; // run the prompt through the CPU decode context (exercises batched CPU kernels)
 };
 
 static void usage() {
     fprintf(stderr, "usage: trilane-spec -m model.gguf -f prompt.txt [--mode spec|batchcost] [--prefill-dev HTP0|CPU] [--nmax K (0 = no spec)]\n"
-                    "       [-n n_gen] [-c n_ctx] [-t threads] [-ub ubatch] [--alias auto|on|off] [--batches 1,2,4,8] [--check] [-v]\n");
+                    "       [-n n_gen] [-c n_ctx] [-t threads] [-ub ubatch] [--alias auto|on|off] [--no-share] [--batches 1,2,4,8] [--check] [-v]\n");
     exit(1);
 }
 
@@ -51,6 +55,55 @@ static void * resolve_from_model(const char * name, const ggml_tensor * t, void 
     const ggml_tensor * src = llama_model_get_tensor((const llama_model *) user, name);
     if (!src || src->type != t->type || ggml_nelements(src) != ggml_nelements(t)) return nullptr;
     return src->data;
+}
+
+typedef const ggml_tensor * (*shared_resolver_t)(const char * name, const ggml_tensor * t, void * user);
+typedef void (*shared_set_resolver_t)(shared_resolver_t fn, void * user);
+
+static const ggml_tensor * resolve_tensor_from_model(const char * name, const ggml_tensor * t, void * user) {
+    const ggml_tensor * src = llama_model_get_tensor((const llama_model *) user, name);
+    if (!src || src->type != t->type || ggml_nbytes(src) != ggml_nbytes(t)) return nullptr;
+    return src;
+}
+
+// weights the prefill model keeps in CPU memory (types the NPU cannot run, token embeddings): the decode model borrows them
+static std::vector<std::string> shared_candidates(const std::string & path, const llama_model * mp, size_t * bytes) {
+    std::vector<std::string> out;
+    *bytes = 0;
+    gguf_init_params gp = { true, nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) return out;
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+        const std::string name = gguf_get_tensor_name(g, i);
+        const ggml_tensor * t = llama_model_get_tensor(mp, name.c_str());
+        if (!t || !t->buffer || ggml_nbytes(t) < (1u << 20)) continue;
+        const std::string buf = ggml_backend_buffer_name(t->buffer);
+        if (buf != "CPU" && buf != "CPU_REPACK") continue;
+        out.push_back(name);
+        *bytes += ggml_nbytes(t);
+    }
+    gguf_free(g);
+    return out;
+}
+
+// weights the NPU would tile in formats the CPU kernels cannot read (Q6_K, Q5_K, Q4_1, ...): keeping them in the
+// prefill model's CPU memory instead lets the decode model share them. "output" moves only the LM head, which costs
+// prefill nothing (no prompt logits); "nonq4" also moves per-layer matmuls, which then run on the CPU during prefill.
+static std::vector<std::string> prefill_cpu_names(const std::string & path, const std::string & mode) {
+    std::vector<std::string> out;
+    if (mode != "output" && mode != "nonq4") return out;
+    gguf_init_params gp = { true, nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) return out;
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+        const std::string name = gguf_get_tensor_name(g, i);
+        const ggml_type type = gguf_get_tensor_type(g, i);
+        if (name.rfind("token_embd", 0) == 0 || type == GGML_TYPE_Q4_0 || gguf_get_tensor_size(g, i) < (1u << 20)) continue;
+        if (mode == "output" && name != "output.weight") continue;
+        out.push_back(name);
+    }
+    gguf_free(g);
+    return out;
 }
 
 static bool has_experts(const llama_model * m) {
@@ -102,13 +155,18 @@ int main(int argc, char ** argv) {
         else if (k == "--mode") a.mode = next();
         else if (k == "--prefill-dev") a.prefill_dev = next();
         else if (k == "--alias") a.alias = next();
+        else if (k == "--no-share") a.share = false;
+        else if (k == "--prefill-cpu") a.p_cpu = next();
         else if (k == "--nmax") a.nmax = atoi(next());
+        else if (k == "--spec-type") a.spec_type = next();
+        else if (k == "--ngram-n") a.ngram_n = atoi(next());
         else if (k == "-n") a.n_gen = atoi(next());
         else if (k == "-c") a.n_ctx = atoi(next());
         else if (k == "-t") a.threads = atoi(next());
         else if (k == "-ub") a.ubatch = atoi(next());
         else if (k == "--batches") { a.batches.clear(); std::stringstream ss(next()); for (std::string s; std::getline(ss, s, ',');) a.batches.push_back(atoi(s.c_str())); }
         else if (k == "--check") a.check = true;
+        else if (k == "--gb-per-token") a.gb_per_tok = atof(next());
         else if (k == "--prefill-on-decode") a.prefill_on_decode = true;
         else if (k == "-v") g_verbose = true;
         else usage();
@@ -123,6 +181,8 @@ int main(int argc, char ** argv) {
     const bool use_npu = a.prefill_dev != "CPU";
     llama_model * mp = nullptr;
     std::vector<ggml_backend_dev_t> npu_devs;
+    std::vector<std::string> p_cpu_pats;
+    std::vector<llama_model_tensor_buft_override> p_cpu_ovr;
     if (use_npu) {
         ggml_backend_dev_t d = ggml_backend_dev_by_name(a.prefill_dev.c_str());
         if (!d) { fprintf(stderr, "device %s not found\n", a.prefill_dev.c_str()); return 1; }
@@ -131,6 +191,14 @@ int main(int argc, char ** argv) {
         pp.load_mode = LLAMA_LOAD_MODE_NONE;
         pp.devices = npu_devs.data();
         pp.n_gpu_layers = -1;
+        if (a.share && a.alias != "off") {
+            p_cpu_pats = exact_name_patterns(prefill_cpu_names(a.model, a.p_cpu));
+            for (auto & p : p_cpu_pats) p_cpu_ovr.push_back({ p.c_str(), ggml_backend_cpu_buffer_type() });
+            if (!p_cpu_ovr.empty()) {
+                p_cpu_ovr.push_back({ nullptr, nullptr });
+                pp.tensor_buft_overrides = p_cpu_ovr.data();
+            }
+        }
         double t0 = now_ms();
         mp = llama_model_load_from_file(a.model.c_str(), pp);
         if (!mp) return 1;
@@ -142,10 +210,10 @@ int main(int argc, char ** argv) {
     dp.load_mode = LLAMA_LOAD_MODE_NONE;
     dp.devices = no_devs.data();
     dp.n_gpu_layers = 0;
-    dp.load_mtp = a.nmax > 0 && a.mode == "spec";
+    dp.load_mtp = a.nmax > 0 && a.mode == "spec" && a.spec_type == "draft-mtp";
     std::vector<std::string> pats;
     std::vector<llama_model_tensor_buft_override> ovr;
-    int n_alias = 0;
+    int n_alias = 0, n_shared = 0;
     if (use_npu && a.alias != "off") {
         ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU");
         auto set_resolver = (htptile_set_resolver_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_set_resolver");
@@ -156,12 +224,26 @@ int main(int argc, char ** argv) {
         if (set_resolver && get_buft && !names.empty()) {
             set_resolver(resolve_from_model, (void *) mp);
             pats = exact_name_patterns(names);
-            for (auto & p : pats) ovr.push_back({ p.c_str(), get_buft() });
+            const size_t n_tile_pats = pats.size();
+            n_alias = (int) names.size();
+
+            auto set_shared = (shared_set_resolver_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_shared_set_resolver");
+            auto get_shared = (htptile_buft_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_shared_buffer_type");
+            if (a.share && set_shared && get_shared) {
+                size_t bytes = 0;
+                const auto shared = shared_candidates(a.model, mp, &bytes);
+                if (!shared.empty()) {
+                    set_shared(resolve_tensor_from_model, (void *) mp);
+                    for (auto & p : exact_name_patterns(shared)) pats.push_back(p);
+                    n_shared = (int) shared.size();
+                    fprintf(stderr, "[spec] %d CPU-resident prefill-model tensors shared with the decode model (%.2f GiB)\n", n_shared, bytes / 1073741824.0);
+                }
+            }
+            for (size_t i = 0; i < pats.size(); i++) ovr.push_back({ pats[i].c_str(), i < n_tile_pats ? get_buft() : get_shared() });
             ovr.push_back({ nullptr, nullptr });
             dp.tensor_buft_overrides = ovr.data();
             dp.load_mode = LLAMA_LOAD_MODE_MMAP;
             _putenv_s("LLAMA_MMAP_NO_PREFETCH", "1");
-            n_alias = (int) names.size();
         }
     }
     double t0 = now_ms();
@@ -180,6 +262,11 @@ int main(int argc, char ** argv) {
     cpp.op_offload = true;
     llama_context_params cpd = ctx_params(a.threads);
     cpd.op_offload = false;
+    cpd.n_outputs_max_per_seq = 0;                       // verify batches need k+1 outputs per sequence
+    cpd.n_rs_seq = a.mode == "spec" ? (uint32_t) std::max(a.nmax, 0) : 0; // bounded recurrent rollback, as common does
+    if (use_npu && !a.prefill_on_decode) {
+        cpd.n_batch = cpd.n_ubatch = 64; // decode context only sees verify batches: a small compute buffer (~0.5 GB less on 27B)
+    }
     llama_context * cd = llama_init_from_model(md, cpd);
     llama_context * cp = mp != md ? llama_init_from_model(mp, cpp) : cd;
     if (!cd || !cp) return 1;
@@ -230,22 +317,31 @@ int main(int argc, char ** argv) {
     llama_context * cm = nullptr;
     common_speculative * spec = nullptr;
     if (a.nmax > 0) {
-        llama_context_params cpm = ctx_params(a.threads);
-        cpm.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        cpm.n_rs_seq = 0;
-        cpm.ctx_other = cd;
-        cpm.op_offload = false;
-        cm = llama_init_from_model(md, cpm);
-        if (!cm) { fprintf(stderr, "failed to create MTP context\n"); return 1; }
         common_params_speculative sp;
-        sp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        sp.types = common_speculative_types_from_names({ a.spec_type });
         sp.draft.n_max = a.nmax;
         sp.draft.ctx_tgt = cp;   // prompt hidden states come from the prefill context
-        sp.draft.ctx_dft = cm;
         sp.draft.backend_sampling = false;
+        sp.ngram_simple.size_n = (uint16_t) a.ngram_n;
+        sp.ngram_simple.size_m = (uint16_t) a.nmax;
+        if (a.spec_type == "draft-mtp") {
+            llama_context_params cpm = ctx_params(a.threads);
+            cpm.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cpm.n_rs_seq = 0;
+            cpm.ctx_other = cd;
+            cpm.op_offload = false;
+            cm = llama_init_from_model(md, cpm);
+            if (!cm) { fprintf(stderr, "failed to create MTP context\n"); return 1; }
+            sp.draft.ctx_dft = cm;
+        }
         spec = common_speculative_init(sp, 1);
         if (!spec) { fprintf(stderr, "failed to init speculative decoding\n"); return 1; }
     }
+
+    // probe rollback support before the prompt: common_context_can_seq_rm clears the context memory to test it
+    const bool use_ckpt_tgt = common_context_can_seq_rm(cd) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const bool use_ckpt_dft = cm && common_context_can_seq_rm(cm) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    if (cp != cd) llama_memory_clear(llama_get_memory(cp), true);
 
     common_params_sampling sparams;
     sparams.temp = 0.0f;
@@ -265,18 +361,18 @@ int main(int argc, char ** argv) {
     }
     if (spec) common_speculative_set_ctx_tgt(spec, cd); // verification hidden states now come from the CPU context
     double t_handoff = now_ms();
-
     llama_token id_last = inp.back();
     llama_tokens prompt_tgt(inp.begin(), inp.end() - 1);
     int n_past = (int) inp.size() - 1;
     int n_predict = 0, n_drafted = 0, n_accept = 0, n_steps = 0;
+    double t_draft = 0, t_verify = 0, t_mtp_proc = 0;
+    double t_verify_by_n[16] = { 0 };
+    int    n_verify_by_n[16] = { 0 };
     double t_first = 0;
     std::string out;
     bool has_eos = false;
 
     if (spec) common_speculative_begin(spec, 0, prompt_tgt);
-    const bool use_ckpt_tgt = common_context_can_seq_rm(cd) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-    const bool use_ckpt_dft = cm && common_context_can_seq_rm(cm) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
     common_batch batch_tgt(cd);
     llama_tokens draft;
     common_prompt_checkpoint ckpt;
@@ -287,18 +383,29 @@ int main(int argc, char ** argv) {
             if (use_ckpt_dft) ckpt.update_dft(cm, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             int n_draft_max = std::max(0, std::min(a.n_ctx - n_past - 2, a.n_gen - n_predict - 1));
             common_speculative_get_draft_params(spec, 0) = { true, n_draft_max, n_past, id_last, &prompt_tgt, &draft };
+            const double td0 = now_ms();
             common_speculative_draft(spec);
+            t_draft += now_ms() - td0;
             if (!draft.empty() && use_ckpt_tgt) ckpt.update_tgt(cd, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            if (use_ckpt_dft) ckpt.load_dft(cm, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            llama_memory_seq_rm(llama_get_memory(cm), 0, ckpt.pos_max + 1, -1);
+            if (cm) {
+                if (use_ckpt_dft) ckpt.load_dft(cm, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                llama_memory_seq_rm(llama_get_memory(cm), 0, ckpt.pos_max + 1, -1);
+            }
         }
 
         batch_tgt.clear();
         batch_tgt.add(id_last, n_past++, 0, true);
         for (size_t i = 0; i < draft.size(); i++) batch_tgt.add(draft[i], n_past + (int) i, 0, true);
+        const double tv0 = now_ms();
         if (llama_process(cd, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) { fprintf(stderr, "verify decode failed\n"); break; }
+        llama_synchronize(cd);
+        const double tv1 = now_ms();
+        t_verify += tv1 - tv0;
+        t_verify_by_n[std::min<int>(batch_tgt.size(), 15)] += tv1 - tv0;
+        n_verify_by_n[std::min<int>(batch_tgt.size(), 15)]++;
         n_steps++;
         if (spec && !common_speculative_process(spec, batch_tgt)) { fprintf(stderr, "MTP process failed\n"); break; }
+        t_mtp_proc += now_ms() - tv1;
 
         common_sampler_ptr smpl_save;
         if (use_ckpt_tgt && !draft.empty()) smpl_save.reset(common_sampler_clone(smpl.get()));
@@ -335,11 +442,18 @@ int main(int argc, char ** argv) {
     }
     double t_end = now_ms();
 
-    printf("mode=%s prefill=%s nmax=%d alias=%d | prompt %zu tok | prefill %.0f ms (%.1f t/s) | handoff %.1f ms | TTFT %.0f ms | "
+    printf("mode=%s/%s prefill=%s nmax=%d alias=%d | prompt %zu tok | prefill %.0f ms (%.1f t/s) | handoff %.1f ms | TTFT %.0f ms | "
            "decode %d tok in %.0f ms = %.2f t/s | steps %d (%.2f tok/step) | drafted %d accepted %d (%.1f%%)\n",
-           a.mode.c_str(), a.prefill_dev.c_str(), a.nmax, n_alias, inp.size(), t_prefill - t_start, (inp.size() - 1) / ((t_prefill - t_start) / 1000.0),
+           a.mode.c_str(), a.nmax > 0 ? a.spec_type.c_str() : "plain", a.prefill_dev.c_str(), a.nmax, n_alias, inp.size(), t_prefill - t_start, (inp.size() - 1) / ((t_prefill - t_start) / 1000.0),
            t_handoff - t_prefill, t_first - t_start, n_predict, t_end - t_handoff, n_predict / ((t_end - t_handoff) / 1000.0),
            n_steps, n_steps ? (double) n_predict / n_steps : 0.0, n_drafted, n_accept, n_drafted ? 100.0 * n_accept / n_drafted : 0.0);
+    const double tps = n_predict / ((t_end - t_handoff) / 1000.0);
+    printf("time split: draft %.0f ms | verify %.0f ms | mtp catch-up %.0f ms | other %.0f ms", t_draft, t_verify, t_mtp_proc,
+           (t_end - t_handoff) - t_draft - t_verify - t_mtp_proc);
+    if (a.gb_per_tok > 0) printf(" | %.1f GB/s-equivalent (%.3f GB/token)", tps * a.gb_per_tok, a.gb_per_tok);
+    printf("\nverify ms by batch size:");
+    for (int i = 1; i < 16; i++) if (n_verify_by_n[i]) printf("  %d:%.1f(x%d)", i, t_verify_by_n[i] / n_verify_by_n[i], n_verify_by_n[i]);
+    printf("\n");
     if (a.check) printf("--- text ---\n%s\n--- end ---\n", out.c_str());
     fflush(stdout);
     if (spec) common_speculative_free(spec);
