@@ -128,8 +128,11 @@ bool engine::load(const engine_params & p) {
         ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU");
         auto set_resolver = (htptile_set_resolver_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_set_resolver");
         auto get_buft     = (htptile_buft_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_buffer_type");
-        const bool moe = has_experts(mp_);
-        const auto names = alias_candidates(p.model, mp_, moe);
+        // aliased decode is ~7% slower and its batched CPU prefill much slower, so only alias what memory forces:
+        // MoE experts always, dense weights only for models too big to hold twice next to the OS
+        const bool moe   = has_experts(mp_);
+        const bool dense = !moe && llama_model_size(mp_) > (6ull << 30);
+        const auto names = (moe || dense) ? alias_candidates(p.model, mp_, moe) : std::vector<std::string>();
         if (set_resolver && get_buft && !names.empty()) {
             set_resolver(resolve_from_model, (void *) mp_);
             alias_pats = exact_name_patterns(names);
@@ -152,11 +155,18 @@ bool engine::load(const engine_params & p) {
     }
     if (!mp_) mp_ = md_;
 
+    // models larger than an HTP session's ~3 GB window remap weights once per ubatch, so they want big ubatches;
+    // small models fit, and big ubatches can exceed per-op NPU buffer limits (e.g. a 248K-vocab head)
+    if (params_.n_ubatch <= 0) params_.n_ubatch = llama_model_size(mp_) > (3ull << 30) ? 2048 : 512;
+    params_.n_batch = std::max(params_.n_batch, params_.n_ubatch);
+    fprintf(stderr, "[trilane] n_ubatch = %d\n", params_.n_ubatch);
+    const engine_params & p2 = params_;
+
     auto make_ctx = [&](llama_model * m, int threads, bool host_only) {
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx           = p.n_ctx;
-        cp.n_batch         = p.n_batch;
-        cp.n_ubatch        = p.n_ubatch;
+        cp.n_batch         = p2.n_batch;
+        cp.n_ubatch        = p2.n_ubatch;
         cp.n_seq_max       = 1;
         cp.n_threads       = threads;
         cp.n_threads_batch = threads;

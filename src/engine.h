@@ -21,7 +21,7 @@ struct engine_params {
     int    threads_prefill  = 4;       // host threads of the prefill context
     int    n_ctx            = 8192;
     int    n_batch          = 2048;
-    int    n_ubatch         = 2048;    // big models pay a fixed NPU weight-remap cost per ubatch, so go large
+    int    n_ubatch         = 0;       // 0 = auto: 2048 for models beyond one NPU session window (fixed remap cost per ubatch), else 512
     int    keepwarm_ms      = 20;      // tiny NPU op cadence between prefills (0 = off)
     size_t prefix_cache_mb  = 2048;    // budget for cached sequence-state snapshots
     int    cpu_prefill_max  = 96;      // prompts with at most this many new tokens prefill on the CPU
