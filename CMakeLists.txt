@@ -9,3 +9,7 @@ find_package(llama REQUIRED)
 
 add_executable(trilane-split src/split_bench.cpp)
 target_link_libraries(trilane-split PRIVATE llama)
+
+# E1: CPU read bandwidth of HTP0 rpcmem vs heap
+add_executable(trilane-rpcmem-bw src/rpcmem_bw.cpp)
+target_link_libraries(trilane-rpcmem-bw PRIVATE llama)

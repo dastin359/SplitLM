@@ -3,15 +3,20 @@
 // With --prefill-dev == --decode-dev it runs the single-device baseline through the same code path.
 
 #include "llama.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 static bool g_verbose = false;
@@ -33,7 +38,51 @@ struct args {
     int threads_b  = 4;   // prefill threads (host side)
     int reps       = 3;
     bool check     = false; // print generated text
+    bool alias     = false; // decode model reads the prefill model's (HTP-tiled) experts in place
+    int gap_ms     = 0;     // idle time before each prefill (diagnostic)
+    int warm_ms    = 0;     // during the gap, ping the prefill device with a 1-token decode every warm_ms
+    int keepwarm_ms = 0;    // background thread runs a tiny op on the NPU every keepwarm_ms (paused during prefill)
 };
+
+// Keeps the NPU out of its idle low-power state between prefills: a 4 KB ADD on HTP0 every period_ms.
+struct npu_keepwarm {
+    std::atomic<bool> stop{false};
+    bool paused = false;
+    std::mutex mtx; // the HTP session is not thread-safe: no ping may run while the prefill context uses it
+    std::thread th;
+    int64_t pings = 0;
+
+    void pause(bool p) { std::lock_guard<std::mutex> lk(mtx); paused = p; }
+
+    void start(const char * dev_name, int period_ms) {
+        th = std::thread([this, dev_name, period_ms]() {
+            ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name);
+            ggml_backend_t be = dev ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+            if (!be) { fprintf(stderr, "[trilane] keepwarm: no %s backend\n", dev_name); return; }
+            ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+            ggml_context * ctx = ggml_init(ip);
+            ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024);
+            ggml_tensor * y = ggml_add(ctx, x, x);
+            ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, y);
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+            std::vector<float> ones(1024, 1.0f);
+            ggml_backend_tensor_set(x, ones.data(), 0, sizeof(float) * ones.size());
+            while (!stop) {
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    if (!paused) { ggml_backend_graph_compute(be, gf); pings++; }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
+            }
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(be);
+        });
+    }
+    void finish() { stop = true; if (th.joinable()) th.join(); }
+};
+static npu_keepwarm g_keepwarm;
 
 static void usage() {
     fprintf(stderr,
@@ -61,6 +110,10 @@ static args parse(int argc, char ** argv) {
         else if (k == "-tb")           a.threads_b = atoi(next());
         else if (k == "-r")            a.reps = atoi(next());
         else if (k == "--check")       a.check = true;
+        else if (k == "--alias-experts") a.alias = true;
+        else if (k == "--gap-ms")      a.gap_ms = atoi(next());
+        else if (k == "--warm-ms")     a.warm_ms = atoi(next());
+        else if (k == "--keepwarm-ms") a.keepwarm_ms = atoi(next());
         else if (k == "-v")            g_verbose = true;
         else usage();
     }
@@ -70,19 +123,48 @@ static args parse(int argc, char ** argv) {
 
 static double now_ms() { return llama_time_us() / 1000.0; }
 
-static llama_model * load_on(const std::string & path, const std::string & dev_name) {
+// --alias-experts: experts of the CPU decode model point at the HTP0 prefill model's tiled copy (CPU_HTPTILE)
+typedef void * (*htptile_resolver_t)(const char * name, const ggml_tensor * t, void * user);
+typedef void (*htptile_set_resolver_t)(htptile_resolver_t fn, void * user);
+typedef ggml_backend_buffer_type_t (*htptile_buft_t)(void);
+
+static void * resolve_from_model(const char * name, const ggml_tensor * t, void * user) {
+    const ggml_tensor * src = llama_model_get_tensor((const llama_model *) user, name);
+    if (!src || src->type != t->type || ggml_nelements(src) != ggml_nelements(t)) return nullptr;
+    return src->data;
+}
+
+static llama_model * load_on(const std::string & path, const std::string & dev_name, const llama_model * alias_src = nullptr) {
     llama_model_params mp = llama_model_default_params();
     mp.load_mode = LLAMA_LOAD_MODE_NONE; // read once; mmap + repack keeps two copies of the weights
+    static llama_model_tensor_buft_override overrides[2] = {};
+    if (alias_src) {
+        ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU");
+        auto set_resolver = (htptile_set_resolver_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_set_resolver");
+        auto get_buft     = (htptile_buft_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_buffer_type");
+        if (!set_resolver || !get_buft) { fprintf(stderr, "CPU backend lacks CPU_HTPTILE\n"); exit(1); }
+        set_resolver(resolve_from_model, (void *) alias_src);
+        overrides[0] = { "ffn_(gate|up|down)_exps", get_buft() };
+        overrides[1] = { nullptr, nullptr };
+        mp.tensor_buft_overrides = overrides;
+        mp.load_mode = LLAMA_LOAD_MODE_MMAP; // aliased experts are never read from the file
+        _putenv_s("LLAMA_MMAP_NO_PREFETCH", "1"); // and must not be prefetched into RAM either
+    }
     static std::vector<std::vector<ggml_backend_dev_t>> keep; // devices list must outlive the load call
     keep.emplace_back();
     auto & devs = keep.back();
     if (dev_name == "CPU") {
         mp.n_gpu_layers = 0;
     } else {
-        ggml_backend_dev_t d = ggml_backend_dev_by_name(dev_name.c_str());
-        if (!d) { fprintf(stderr, "device %s not found\n", dev_name.c_str()); exit(1); }
-        devs.push_back(d);
+        // comma list = layer split, e.g. HTP0,HTP1,HTP2,HTP3 (virtual NPU sessions, GGML_HEXAGON_DEVICES=4)
+        std::stringstream ss(dev_name);
+        for (std::string name; std::getline(ss, name, ',');) {
+            ggml_backend_dev_t d = ggml_backend_dev_by_name(name.c_str());
+            if (!d) { fprintf(stderr, "device %s not found\n", name.c_str()); exit(1); }
+            devs.push_back(d);
+        }
         mp.n_gpu_layers = -1;
+        mp.split_mode   = LLAMA_SPLIT_MODE_LAYER;
     }
     devs.push_back(nullptr);
     mp.devices = devs.data();
@@ -172,11 +254,28 @@ static result run_once(llama_context * cp, llama_context * cd, const llama_vocab
     r.n_prompt = (int) toks.size();
     llama_memory_clear(llama_get_memory(cp), true);
     if (cd != cp) llama_memory_clear(llama_get_memory(cd), true);
+    if (a.gap_ms > 0 && a.warm_ms > 0) {
+        // keep the prefill device busy with throwaway 1-token decodes, then drop that state
+        llama_batch wb = llama_batch_init(1, 0, 1);
+        const double t_end = now_ms() + a.gap_ms;
+        while (now_ms() < t_end) {
+            wb.n_tokens = 1; wb.token[0] = toks[0]; wb.pos[0] = 0; wb.n_seq_id[0] = 1; wb.seq_id[0][0] = 0; wb.logits[0] = 1;
+            llama_decode(cp, wb);
+            llama_synchronize(cp);
+            llama_memory_clear(llama_get_memory(cp), true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(a.warm_ms));
+        }
+        llama_batch_free(wb);
+    } else if (a.gap_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(a.gap_ms));
+    }
 
+    g_keepwarm.pause(true);
     double t0 = now_ms();
     prefill(cp, toks, a.n_batch);
     llama_token tok = greedy(cp, vocab);
     double t1 = now_ms();
+    g_keepwarm.pause(false);
     r.prefill_ms = t1 - t0;
 
     if (cd != cp) {
@@ -214,13 +313,15 @@ int main(int argc, char ** argv) {
 
     const bool split = a.prefill_dev != a.decode_dev;
     llama_model * mp = load_on(a.model, a.prefill_dev);
-    llama_model * md = split ? load_on(a.model, a.decode_dev) : mp;
+    if (a.alias && (!split || a.prefill_dev.rfind("HTP", 0) != 0 || a.decode_dev != "CPU")) { fprintf(stderr, "--alias-experts needs --prefill-dev HTP* --decode-dev CPU\n"); return 1; }
+    llama_model * md = split ? load_on(a.model, a.decode_dev, a.alias ? mp : nullptr) : mp;
     llama_context * cp = make_ctx(mp, a, a.threads_b, a.prefill_dev == "CPU");
     llama_context * cd = split ? make_ctx(md, a, a.threads, a.decode_dev == "CPU") : cp;
     if (!split) llama_set_n_threads(cp, a.threads, a.threads_b);
 
     const llama_vocab * vocab = llama_model_get_vocab(mp);
     auto toks = make_prompt(vocab, a);
+    if (a.keepwarm_ms > 0) g_keepwarm.start("HTP0", a.keepwarm_ms);
 
     // warmup: first graph build, NPU session setup, CPU repack touch
     { args w = a; w.n_gen = 4; w.check = false; run_once(cp, cd, vocab, std::vector<llama_token>(toks.begin(), toks.begin() + std::min<size_t>(64, toks.size())), w); }
@@ -238,7 +339,9 @@ int main(int argc, char ** argv) {
         pf, rs[0].n_prompt / (pf / 1000.0), xf, rs[0].xfer_bytes / 1048576.0, pf + xf, ng / (dc / 1000.0));
     if (a.check) printf("--- text ---\n%s\n", rs.back().text.c_str());
     // a backend teardown exits without flushing stdio, so flush before freeing anything
+    if (a.keepwarm_ms > 0) printf("keepwarm pings: %lld\n", (long long) g_keepwarm.pings);
     fflush(stdout);
+    g_keepwarm.finish();
 
     if (split) { llama_free(cd); llama_model_free(md); }
     llama_free(cp);
