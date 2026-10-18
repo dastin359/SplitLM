@@ -36,6 +36,7 @@ Each row is a same-session A/B against the build before the change, with greedy 
 | Causal key-block skipping in NPU flash attention | LFM2.5-24B-A2B | attention −32 to −35%; prefill at 4096 tokens (4096-token batches) 603 → 654 t/s (**+8.5%**) | identical perplexity |
 | All NPU fixes merged, vs stock NPU kernels at the same 2048-token batches | LFM2.5-24B-A2B | 537 → 651 t/s (**+21%**); 672 t/s with 4096-token batches | see Limitations |
 | In-place recurrent state (no per-token state copy) | Qwen3.5-2B | CPU decode 60.3 → 63.4 t/s (**+5%**) | identical text |
+| Single-token decode overhead: recurrent-state update fused with its copy, row-split CONCAT, 108 barriers per token elided between single-thread nodes | Qwen3.5-2B | CPU decode median 56.3 → 57.4 t/s (**+1.8%**), best 60.0 → 61.4 (+2.3%); state update 1.06 → 0.47 ms per token (interleaved runs on a throttling machine) | identical text and perplexity |
 | Speculative decoding with the model's MTP head, 3 drafted tokens | Qwen3.8-27B | decode 5.0-5.3 → 8.7-8.9 t/s (**1.7×**), 67% accepted | identical text |
 
 
@@ -90,7 +91,7 @@ Other measurements (Qwen3.5-2B, early build with stock NPU kernels): NPU prefill
 ### Changes to llama.cpp (`patches/`)
 
 - `ggml-hexagon` (NPU): fused element-wise kernels (sigmoid, conv block, norms, residual add in the matmul output), a streamed, pipelined MoE expert matmul (weight DMA overlapped with the activation gather, one gather for gate+up, matrix-unit work overlapped with dequant and scatter), causal key-block skipping in flash attention, and a 64-bit mapping-mask fix. New `test-backend-ops` cases cover the fused kernels, LFM-shaped expert matmuls and causal-mask attention; the mask fix is checked with the existing tests.
-- `ggml-cpu`: `CPU_HTPTILE` and `CPU_SHARED` buffer types, NEON kernels over NPU tiles, an i8mm kernel for 2-4-token speculative verification, a per-op and per-matmul-shape profiler (`GGML_CPU_PROF=N`), opt-in decode knobs (`GGML_GEMV_NOBAR`, `GGML_REPACK_CHUNKS`, `GGML_GEMV_PF`, default off).
+- `ggml-cpu`: `CPU_HTPTILE` and `CPU_SHARED` buffer types, NEON kernels over NPU tiles, an i8mm kernel for 2-4-token speculative verification, single-token decode fusions (recurrent-state update + copy, row-split CONCAT) and barrier elision (`GGML_CPU_GDN_CPY_FUSION=0` / `GGML_CPU_BAR_ELIDE=0` disable them), a per-op and per-matmul-shape profiler (`GGML_CPU_PROF=N`), opt-in decode knobs (`GGML_GEMV_NOBAR`, `GGML_REPACK_CHUNKS`, `GGML_GEMV_PF`, default off).
 - `llama`: recurrent states read in place instead of copied each step; `llama_model_get_tensor()`; `LLAMA_MMAP_NO_PREFETCH`. `common`: `common_speculative_set_ctx_tgt()`, so speculative decoding can prefill on one context and verify on another.
 
 ## The ExecuTorch path

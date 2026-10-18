@@ -93,10 +93,117 @@ index ad0e5cc..1eaf9e1 100644
              int8x16_t b1 = vld1q_s8((const int8_t *) b_ptr->qs + 16);
              int8x16_t b2 = vld1q_s8((const int8_t *) b_ptr->qs + 32);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index ab82e3d..787a074 100644
+index ab82e3d..5454e66 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -3098,6 +3098,106 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3063,6 +3063,93 @@ struct ggml_cplan ggml_graph_plan(
+ // Try to fuse the current node with subsequent nodes for better performance.
+ // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
+ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
++static bool ggml_cpu_gdn_cpy_fusion = true;   // trilane: GGML_CPU_GDN_CPY_FUSION=0 disables
++
++static int32_t cpu_tensor_use_count(const struct ggml_cgraph * cgraph, const struct ggml_tensor * t) {
++    if (cgraph->use_counts == NULL || cgraph->visited_hash_set.size == 0) {
++        return -1;
++    }
++    const size_t h = ggml_hash_find(&cgraph->visited_hash_set, t);
++    if (h == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, h) || cgraph->visited_hash_set.keys[h] != t) {
++        return -1;
++    }
++    return cgraph->use_counts[h];
++}
++
++static bool cpu_ranges_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
++    const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
++    const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
++    return a0 < b1 && b0 < a1;
++}
++
++// returns the offset (from node_n) of the state CPY that can be fused into the GATED_DELTA_NET at node_n, or 0
++static int ggml_cpu_gdn_cpy_fusable(const struct ggml_cgraph * cgraph, int node_n) {
++    const struct ggml_tensor * gdn = cgraph->nodes[node_n];
++    if (gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1 || !ggml_is_contiguous(gdn) ||
++        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || gdn->view_src != NULL) {
++        return 0;
++    }
++    // uses of the GDN result: the attention-output view and the new-state view, nothing else
++    if (cpu_tensor_use_count(cgraph, gdn) != 2) {
++        return 0;
++    }
++    const struct ggml_tensor * v = gdn->src[2];
++    const struct ggml_tensor * st = gdn->src[5];
++    const size_t attn_bytes  = (size_t) v->ne[0] * v->ne[1] * v->ne[2] * v->ne[3] * sizeof(float);
++    const size_t state_bytes = (size_t) v->ne[0] * v->ne[0] * v->ne[1] * v->ne[3] * sizeof(float);
++    if (ggml_nbytes(gdn) != attn_bytes + state_bytes) {
++        return 0;
++    }
++
++    int nx = node_n + 1;
++    while (nx < cgraph->n_nodes && (ggml_op_is_empty(cgraph->nodes[nx]->op) || (cgraph->nodes[nx]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
++        nx++;
++    }
++    if (nx >= cgraph->n_nodes) {
++        return 0;
++    }
++    const struct ggml_tensor * cpy = cgraph->nodes[nx];
++    const struct ggml_tensor * sv  = cpy->src[0];
++    if (cpy->op != GGML_OP_CPY || sv == NULL || sv->view_src != gdn || sv->view_offs != attn_bytes ||
++        sv->type != GGML_TYPE_F32 || cpy->type != GGML_TYPE_F32 || !ggml_is_contiguous(sv) || !ggml_is_contiguous(cpy) ||
++        ggml_nbytes(sv) != state_bytes || ggml_nbytes(cpy) != state_bytes || cpu_tensor_use_count(cgraph, sv) != 1 ||
++        (sv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return 0;
++    }
++    // the other use must be a view inside the attention part (found near the GDN, before its consumer)
++    int n_other = 0;
++    for (int j = node_n + 1; j < cgraph->n_nodes && j <= nx + 16; j++) {
++        const struct ggml_tensor * t = cgraph->nodes[j];
++        if (j == nx || t == sv) {
++            continue;
++        }
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            if (t->src[s] == gdn) {
++                if (t->op != GGML_OP_VIEW || t->view_src != gdn || t->view_offs + ggml_nbytes(t) > attn_bytes ||
++                    (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++                    return 0;
++                }
++                n_other++;
++            }
++        }
++    }
++    if (n_other != 1) {
++        return 0;
++    }
++    // the state may be updated in place (CPY destination == input state) or go to a disjoint buffer
++    const bool alias = cpy->data == st->data && ggml_is_contiguous(st) && ggml_nbytes(st) == state_bytes;
++    if (!alias) {
++        for (int s = 0; s < GGML_MAX_SRC; s++) {
++            if (gdn->src[s] && cpu_ranges_overlap(cpy, gdn->src[s])) {
++                return 0;
++            }
++        }
++    }
++    if (cpu_ranges_overlap(cpy, gdn)) {
++        return 0;
++    }
++    return nx - node_n;
++}
+ 
+ static int ggml_cpu_try_fuse_ops(
+         const struct ggml_cgraph * cgraph,
+@@ -3095,9 +3182,172 @@ static int ggml_cpu_try_fuse_ops(
+         }
+     }
+ 
++    if (node->op == GGML_OP_GATED_DELTA_NET && ggml_cpu_gdn_cpy_fusion) {
++        // GATED_DELTA_NET (K=1) + CPY of its new-state view into the state cache (build_recurrent_attn):
++        // the kernel writes the new state to the CPY destination and the CPY is skipped.
++        const int n = ggml_cpu_gdn_cpy_fusable(cgraph, node_n);
++        if (n > 0) {
++            ggml_compute_forward_gated_delta_net_cpy_fused(params, node, cgraph->nodes[node_n + n]);
++            return n;
++        }
++    }
++
      return 0;
  }
  
@@ -143,6 +250,59 @@ index ab82e3d..787a074 100644
 +    }
 +}
 +
++// trilane: barrier elision. Row-split element-wise ops on a single row run entirely on thread 0
++// (get_thread_range / ith-strided row loops give every other thread an empty range). Between two such
++// nodes the barrier only makes threads 1..n-1 wait for work they do not take part in, and thread 0 sees
++// its own writes, so the barrier can be skipped. A chain of skipped barriers ends at the first node that
++// is not thread-0-only, where the normal barrier runs. GGML_CPU_BAR_ELIDE=0 disables.
++static int     cpu_bar_elide = 1;
++static int64_t cpu_prof_elided = 0;
++
++static bool cpu_node_t0_only(const struct ggml_tensor * t) {
++    if (t->type != GGML_TYPE_F32 || t->src[0] == NULL || t->src[0]->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (ggml_nrows(t) != 1 || ggml_nrows(t->src[0]) != 1) {
++        return false;
++    }
++    switch (t->op) {
++        case GGML_OP_ADD:
++        case GGML_OP_SUB:
++        case GGML_OP_MUL:
++        case GGML_OP_DIV:
++            // binary_op: apply_binary_op splits the rows of src0
++            return t->src[1] != NULL && t->src[1]->type == GGML_TYPE_F32;
++        case GGML_OP_SCALE:    // scale_f32: rows of src0
++        case GGML_OP_RMS_NORM: // rms_norm_f32 (also fused with MUL): i01 = ith, ith+nth, ...
++            return true;
++        case GGML_OP_UNARY:
++            switch (ggml_get_unary_op(t)) {
++                case GGML_UNARY_OP_SILU:     // silu_f32: rows of src0
++                case GGML_UNARY_OP_SIGMOID:  // unary_op: get_thread_range(src0)
++                case GGML_UNARY_OP_SOFTPLUS:
++                    return true;
++                default:
++                    return false;
++            }
++        case GGML_OP_GLU:
++            // swiglu_f32: rows of src0 (split or fused gate/up)
++            return ggml_get_glu_op(t) == GGML_GLU_OP_SWIGLU &&
++                (t->src[1] == NULL || (t->src[1]->type == GGML_TYPE_F32 && ggml_nrows(t->src[1]) == 1));
++        default:
++            return false;
++    }
++}
++
++// index of the next node the compute loop will execute after node_n (same skip rules as the loop)
++static int cpu_next_compute_node(const struct ggml_cgraph * cgraph, int node_n) {
++    int j = node_n + 1;
++    while (j < cgraph->n_nodes &&
++           (ggml_op_is_empty(cgraph->nodes[j]->op) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
++        j++;
++    }
++    return j;
++}
++
 +static void cpu_prof_mm_add(const struct ggml_tensor * node, int64_t us_work, int64_t us_wait) {
 +    const struct ggml_tensor * w = node->src[0];
 +    double bytes = (double) ggml_nbytes(w);
@@ -171,9 +331,9 @@ index ab82e3d..787a074 100644
 +    int64_t tot_work = 0, tot_wait = 0, tot_n = 0;
 +    for (int i = 0; i < GGML_OP_COUNT; i++) { tot_work += cpu_prof_work_us[i]; tot_wait += cpu_prof_wait_us[i]; tot_n += cpu_prof_count[i]; }
 +    if (cpu_prof_graphs == 0 || tot_n == 0) return;
-+    fprintf(stderr, "[cpu-prof] graphs %lld | per graph: nodes %.0f, work %.3f ms, barrier-wait %.3f ms (%.1f%%), avg wait/node %.2f us\n",
++    fprintf(stderr, "[cpu-prof] graphs %lld | per graph: nodes %.0f, work %.3f ms, barrier-wait %.3f ms (%.1f%%), avg wait/node %.2f us, elided barriers %.1f\n",
 +        (long long) cpu_prof_graphs, (double) tot_n / cpu_prof_graphs, tot_work / 1000.0 / cpu_prof_graphs, tot_wait / 1000.0 / cpu_prof_graphs,
-+        100.0 * tot_wait / (double) (tot_work + tot_wait), (double) tot_wait / tot_n);
++        100.0 * tot_wait / (double) (tot_work + tot_wait), (double) tot_wait / tot_n, (double) cpu_prof_elided / cpu_prof_graphs);
 +    for (int k = 0; k < 12; k++) {
 +        int best = -1;
 +        for (int i = 0; i < GGML_OP_COUNT; i++) {
@@ -203,37 +363,59 @@ index ab82e3d..787a074 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3126,6 +3226,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3126,6 +3376,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
 +    int pf_done = -1; // next-weight prefetch: node already prefetched by this thread
 +
++    // barrier elision is off with an abort callback: thread 0 could stop at a node that threads past a
++    // skipped barrier have already passed, and their barrier counts would no longer match
++    const bool elide_ok = cpu_bar_elide && params.nth > 1 && cplan->abort_callback == NULL && !cplan->use_ref;
++
      for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
          struct ggml_tensor * node = cgraph->nodes[node_n];
  
-@@ -3138,6 +3240,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3138,6 +3394,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
 +        const bool prof = cpu_prof_every > 0 && state->ith == 0;
 +        const int64_t t_start = prof ? ggml_time_us() : 0;
++        const int node_first = node_n;
 +
          // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
          // Try fused ops, fall back to normal compute
          const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-@@ -3153,9 +3258,30 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3153,8 +3413,45 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              tp->ec    = GGML_STATUS_ABORTED;
          }
  
 +        const int64_t t_work = prof ? ggml_time_us() : 0;
 +
          if (node_n + 1 < cgraph->n_nodes) {
-+            if (cpu_pf_next_kb > 0) {
-+                cpu_prefetch_next_weights(cgraph, node_n, params.ith, params.nth, &pf_done);
+-            ggml_barrier(state->threadpool);
++            // every thread takes the same decision (pure function of the graph), so barrier counts match
++            bool elide = false;
++            if (elide_ok) {
++                elide = true;
++                for (int j = node_first; j <= node_n && elide; j++) {
++                    elide = cpu_node_t0_only(cgraph->nodes[j]);
++                }
++                if (elide) {
++                    const int nx = cpu_next_compute_node(cgraph, node_n);
++                    elide = nx < cgraph->n_nodes && cpu_node_t0_only(cgraph->nodes[nx]);
++                }
 +            }
-             ggml_barrier(state->threadpool);
-         }
++            if (!elide) {
++                if (cpu_pf_next_kb > 0) {
++                    cpu_prefetch_next_weights(cgraph, node_n, params.ith, params.nth, &pf_done);
++                }
++                ggml_barrier(state->threadpool);
++            } else if (prof) {
++                cpu_prof_elided++;
++            }
++        }
 +
 +        if (prof) {
 +            const int64_t t_end = ggml_time_us();
@@ -249,14 +431,17 @@ index ab82e3d..787a074 100644
 +    if (cpu_prof_every > 0 && state->ith == 0) {
 +        if (++cpu_prof_graphs % cpu_prof_every == 0) {
 +            cpu_prof_dump();
-+        }
+         }
      }
  
- #ifdef GGML_USE_OPENMP
-@@ -3935,6 +4061,15 @@ void ggml_cpu_init(void) {
+@@ -3933,6 +4230,19 @@ void ggml_cpu_init(void) {
+         {
+             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
              ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
-         }
- 
++            env = getenv("GGML_CPU_GDN_CPY_FUSION");
++            ggml_cpu_gdn_cpy_fusion = (env == NULL || atoi(env) != 0);
++        }
++
 +        {
 +            const char * env = getenv("GGML_CPU_PROF");
 +            cpu_prof_every = env ? atoi(env) : 0;
@@ -264,11 +449,11 @@ index ab82e3d..787a074 100644
 +            cpu_pf_next_kb = env ? atoi(env) : 0;
 +            env = getenv("GGML_REPACK_CHUNKS");
 +            cpu_pf_chunks = env ? MAX(1, atoi(env)) : 4;
-+        }
-+
-         is_first_call = false;
-     }
++            env = getenv("GGML_CPU_BAR_ELIDE");
++            cpu_bar_elide = env ? atoi(env) : 1;
+         }
  
+         is_first_call = false;
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
 index 81ff5d7..016fa5d 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.cpp
@@ -1068,6 +1253,194 @@ index 0000000..ef8543c
 +#ifdef __cplusplus
 +}
 +#endif
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 7a73e13..9df2825 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2055,25 +2055,41 @@ static void ggml_compute_forward_concat_f32(
+     int64_t o[4] = {0, 0, 0, 0};
+     o[dim] = src0->ne[dim];
+ 
+-    const float * x;
+-
+-    // TODO: smarter multi-theading
+-    for (int i3 = 0; i3 < ne3; i3++) {
+-        for (int i2 = ith; i2 < ne2; i2 += nth) {
+-            for (int i1 = 0; i1 < ne1; i1++) {
+-                for (int i0 = 0; i0 < ne0; i0++) {
+-                    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+-                        x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
+-                    } else {
+-                        x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
+-                    }
+-
+-                    float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
+-
+-                    *y = *x;
++    // trilane: split all dst rows (i1,i2,i3) across threads (the old i2-only split ran the whole
++    // single-sequence decode conv-state concat [3+1, 6144, 1] on thread 0), and copy each row as a
++    // src0 range plus a src1 range without a per-element branch. Pure copies: bit-identical.
++    const int64_t nr  = ne1*ne2*ne3;
++    const int64_t dr  = (nr + nth - 1)/nth;
++    const int64_t ir0 = MIN(nr, dr*ith);
++    const int64_t ir1 = MIN(nr, ir0 + dr);
++
++    for (int64_t ir = ir0; ir < ir1; ir++) {
++        const int64_t i3 = ir/(ne1*ne2);
++        const int64_t i2 = (ir - i3*ne1*ne2)/ne1;
++        const int64_t i1 = ir - i3*ne1*ne2 - i2*ne1;
++
++        char * yrow = (char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3;
++
++        // elements [0, n0) come from src0 when this row lies inside src0, the rest from src1
++        const bool in0 = i1 < ne01 && i2 < ne02 && i3 < ne03;
++        const int64_t n0 = in0 ? MIN(ne0, ne00) : 0;
++
++        if (n0 > 0) {
++            const char * xrow = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
++            if (nb00 == sizeof(float) && nb0 == sizeof(float)) {
++                memcpy(yrow, xrow, n0*sizeof(float));
++            } else {
++                for (int64_t i0 = 0; i0 < n0; i0++) {
++                    *(float *) (yrow + i0*nb0) = *(const float *) (xrow + i0*nb00);
+                 }
+             }
+         }
++        if (n0 < ne0) {
++            const char * xrow = (const char *) src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
++            for (int64_t i0 = n0; i0 < ne0; i0++) {
++                *(float *) (yrow + i0*nb0) = *(const float *) (xrow + (i0 - o[0])*nb10);
++            }
++        }
+     }
+ }
+ 
+@@ -11202,7 +11218,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     const ggml_compute_params * params,
+     ggml_tensor * dst,
+     int64_t ir0,
+-    int64_t ir1) {
++    int64_t ir1,
++    float * state_dst) {
+ 
+     ggml_tensor * src_q     = dst->src[0];
+     ggml_tensor * src_k     = dst->src[1];
+@@ -11282,18 +11299,64 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+ 
+         // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
+         // For K>1, work in scratch and copy out per-token when the slot is in range.
++        // trilane: with state_dst (GDN + state CPY fused), the K=1 state goes straight to the CPY destination.
+         float * s_out = (K > 1)
+             ? state_work
+-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
++            : (state_dst ? state_dst : state_out_base) + (iv3 * H + iv1) * S_v * S_v;
+ 
+         // copy input state into the working buffer and operate in-place
+         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
+         const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+ 
+         // attn output pointer for first token of this (head, seq)
+         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+ 
++        if (state_dst && n_tokens == 1 && K == 1) {
++            // trilane: single-token step in one pass over the state. Row j of the transposed state only
++            // depends on row j, so decay, delta, rank-1 update and readout run row by row while the row is
++            // in L1, with the same vec calls per row as the multi-pass loop below (bit-identical); the
++            // state is read once and written once (in place when state_dst aliases the input state).
++            const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + iq1 * nbq1);
++            const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + ik1 * nbk1);
++            const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + iv1 * nbv1);
++
++            const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + iv1 * nbb1);
++            const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + iv1 * nbg1);
++
++            float eg = 0.0f;
++            if (kda) {
++                for (int64_t i = 0; i < S_v; ++i) {
++                    delta[i] = expf(g_d[i]);
++                }
++            } else {
++                eg = expf(g_d[0]);
++            }
++
++            for (int64_t j = 0; j < S_v; ++j) {
++                float * row = &s_out[j * S_v];
++                if (row != &s_in[j * S_v]) {
++                    memcpy(row, &s_in[j * S_v], S_v * sizeof(float));
++                }
++                if (kda) {
++                    ggml_vec_mul_f32(S_v, row, row, delta);
++                } else {
++                    ggml_vec_scale_f32(S_v, row, eg);
++                }
++                float sum = 0.0f;
++                ggml_vec_dot_f32(S_v, &sum, 0, row, 0, k_d, 0, 1);
++                const float dj = (v_d[j] - sum) * beta_val;
++                ggml_vec_mad_f32(S_v, row, k_d, dj);
++                sum = 0.0f;
++                ggml_vec_dot_f32(S_v, &sum, 0, row, 0, q_d, 0, 1);
++                attn_data[j] = sum * scale;
++            }
++            continue;
++        }
++
++        if (s_out != s_in) {
++            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
++        }
++
+         for (int64_t t = 0; t < n_tokens; t++) {
+             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
+             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
+@@ -11354,7 +11417,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+ 
+ static void ggml_compute_forward_gated_delta_net_f32(
+         const ggml_compute_params * params,
+-        ggml_tensor * dst) {
++        ggml_tensor * dst,
++        float * state_dst = nullptr) {
+ 
+     ggml_tensor * V = dst->src[2];
+     int64_t nr = V->ne[1] * V->ne[3];
+@@ -11388,7 +11452,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+         const int64_t ir0 = dr * current_chunk;
+         const int64_t ir1 = MIN(ir0 + dr, nr);
+ 
+-        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
++        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1, state_dst);
+         current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+     }
+ }
+@@ -11410,6 +11474,17 @@ void ggml_compute_forward_gated_delta_net(
+     }
+ }
+ 
++// trilane: GATED_DELTA_NET (K=1) fused with the CPY of its new-state view into the recurrent state cache:
++// the kernel writes the new state straight to the CPY destination (the caller checked that nothing else
++// reads the state part of dst), saving the separate state copy node and its memory traffic.
++void ggml_compute_forward_gated_delta_net_cpy_fused(
++        const ggml_compute_params * params,
++        ggml_tensor * dst,
++        ggml_tensor * cpy) {
++    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
++    ggml_compute_forward_gated_delta_net_f32(params, dst, (float *) cpy->data);
++}
++
+ 
+ // ggml_compute_forward_dsv4_hc_comb
+ 
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 2728b08..b452acd 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -104,6 +104,7 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
+ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_gated_delta_net_cpy_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst, struct ggml_tensor * cpy);
+ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
 index 2632ae3..662e7f1 100644
 --- a/ggml/src/ggml-cpu/repack.cpp
