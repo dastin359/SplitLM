@@ -22,13 +22,14 @@ Full table with every chip, model and phase: https://claude.ai/artifact/WeygbBF4
 | Qwen3.5-2B, 404-token prompt | **0.30 s** | **57.5 t/s** | 0.80 s, 58.2 t/s | 0.29 s, 29.4 t/s |
 | Qwen3.5-2B, 3,328-token prompt | **2.12 s** | **51.2 t/s** | 8.27 s, 51.2 t/s | 2.11 s, 28.1 t/s |
 | LFM2.5-24B-A2B (MoE), 388-token prompt | **1.28 s** | **49.5 t/s** | 1.84 s, 50.2 t/s | 1.27 s, 19.9 t/s |
+| LFM2.5-24B-A2B (MoE), 3,686-token prompt | **6.14 s** | **39.1 t/s** | 15.9 s, 38.7 t/s | 5.72 s, 18.6 t/s |
 | Qwen3.8-27B (dense) + MTP drafting, 344-token prompt | **4.8-5.4 s** | **8.7-8.9 t/s** | ~12.6 s, 5.6 t/s (10.4 with MTP) | 3.85 s, 2.85 t/s |
 
 Tri-Lane gets NPU time to first token and CPU decode speed in the same request. On LFM2.5-24B-A2B the split fits in **14.7 GB**, and on Qwen3.8-27B in **19-20 GB**, because the CPU reads the NPU's copy of the weights in place (`CPU_HTPTILE`) and borrows its CPU-resident head and embeddings (`CPU_SHARED`). Two copies would need about 27 GB and 30 GB.
 
 Against Qualcomm's own runtime (GenieX 0.9.0, llama.cpp-based) on the byte-identical Qwen3.5-2B GGUF that AI Hub ships: NPU 0.41 s TTFT / 28.3 t/s, CPU 0.85 s / 47.7 t/s. Energy: NPU prefill costs 8 mJ per token vs 90 mJ on the CPU; CPU decode 0.81 J per token vs 0.21 J on the NPU (half the speed).
 
-How close to the hardware (details on the results page): NPU prefill reaches 38% of the 11.48 TFLOPS FP16 HMX peak on Qwen3.5-2B (was 29% with stock kernels); CPU decode streams 76-90 GB/s, 69-82% of the ~110 GB/s we could measure from DRAM.
+How close to the hardware (details on the results page): NPU prefill reaches 39% of the 11.48 TFLOPS FP16 HMX peak on Qwen3.5-2B (was 29% with stock kernels) and 26% on LFM2.5-24B-A2B at 4,096 tokens (679 t/s; was 20%); CPU decode streams 76-90 GB/s, 69-82% of the ~110 GB/s we could measure from DRAM.
 
 Concurrency: the server prefills on the NPU while the CPU decodes up to four sequences in one batch: 79 generated t/s aggregate for four simultaneous 400-550-token requests on Qwen3.5-2B, vs 55 for the same engine on the CPU alone. An optional NPU decode slot (`--npu-decode-slots 1`) lets the idle NPU decode a fifth sequence.
 
@@ -79,6 +80,9 @@ API: `POST /v1/chat/completions` (OpenAI format, `stream: true` for SSE). An opt
 - `src/llama-graph.cpp`: recurrent states are read in place when every state comes from its own cell, instead of a GET_ROWS copy (+5% Qwen3.5 decode; `LLAMA_RS_NO_IDENT=1` disables).
 - `ggml/src/ggml-cpu/htp-tile.cpp`: `CPU_SHARED` buffer type (decode model borrows another model's CPU-resident weights) and an i8mm multi-token tile kernel for speculative verification (lane 2).
 - `ggml/src/ggml-hexagon/`: NPU prefill fusions: single-pass sigmoid for SILU/SWIGLU, fused conv block (CONCAT + SSM_CONV + SILU + state copy), RMS_NORM+SCALE, residual ADD inside the matmul output stage, batched short-row norms (lane 3). Tests in `tests/test-backend-ops.cpp`.
+- `ggml/src/ggml-hexagon/htp/matmul-ops.c`: HMX expert matmul (MoE prefill) issues the next weight chunk's DMA during the activation gather and across experts, and gathers once for gate+up (LFM2.5 prefill +8-11%).
+- `ggml/src/ggml-hexagon/htp/flash-attn-ops.c`: HMX flash attention skips fully masked trailing key blocks (causal prefill; attention -32 to -35%). `GGML_HEXAGON_FA_KV_SKIP=0` disables it.
+- `ggml/src/ggml-hexagon/htp/main.c`: 64-bit mapping-reuse mask (slots 32-63 used an undefined 32-bit shift).
 
 ## Things we learned the hard way
 
@@ -94,3 +98,5 @@ API: `POST /v1/chat/completions` (OpenAI format, `stream: true` for SSE). An opt
 - Single-copy aliasing covers Q4_0 weights only. Qwen3.6-35B-A3B's IQ3_S experts cannot be tiled for the NPU.
 - CPU-lane prefill over aliased weights is a per-token GEMV, so dense aliased models always prefill on the NPU.
 - LFM2.5 on the fused NPU build shows a small logit shift against stock kernels (KLD 0.006, perplexity +0.66%); Qwen3.5-2B is unchanged (perplexity ratio 1.0008).
+- The causal key-block skip changes LFM2.5 greedy text after a few tokens: a fully masked block's update O = 1·O + 0·V is a no-op in exact arithmetic but rounds O to fp16 again, so skipping it moves the last bit. Perplexity is identical and Qwen3.5-2B text is unchanged; `GGML_HEXAGON_FA_KV_SKIP=0` restores the old text.
+- The HMX gated-delta-net kernel fails 16 of 43 `test-backend-ops` cases on HTP0 (errors 1e-6 to 6e-2 against a 1e-7 threshold) in every build, including stock; perplexity on Qwen3.5-2B is unaffected.
