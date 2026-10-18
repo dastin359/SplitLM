@@ -124,6 +124,7 @@ class engine {
     llama_context * cd_ = nullptr;
     const llama_vocab * vocab_ = nullptr;
     bool        aliased_ = false;
+    int         n_aliased_ = 0;
     std::string model_name_;
     std::string tmpl_;
 

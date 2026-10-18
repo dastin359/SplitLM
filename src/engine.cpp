@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +22,39 @@ static void * resolve_from_model(const char * name, const ggml_tensor * t, void 
     const ggml_tensor * src = llama_model_get_tensor((const llama_model *) user, name);
     if (!src || src->type != t->type || ggml_nelements(src) != ggml_nelements(t)) return nullptr;
     return src->data;
+}
+
+// Names of weights the decode model can read in place from the prefill model: Q4_0, tile-aligned, and
+// actually resident (hence tiled) in an HTP buffer. MoE models alias experts only, dense models every match.
+static std::vector<std::string> alias_candidates(const std::string & path, const llama_model * mp, bool experts_only) {
+    std::vector<std::string> out;
+    gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) return out;
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+        const std::string name = gguf_get_tensor_name(g, i);
+        if (name.rfind("token_embd", 0) == 0) continue;            // GET_ROWS needs the flat layout
+        if (experts_only && name.find("_exps") == std::string::npos) continue;
+        const ggml_tensor * t = llama_model_get_tensor(mp, name.c_str());
+        if (!t || t->type != GGML_TYPE_Q4_0 || t->ne[3] != 1 || t->ne[0] % 32 || t->ne[1] % 32 || !ggml_is_contiguous(t)) continue;
+        if (!t->buffer || !strstr(ggml_backend_buffer_name(t->buffer), "HTP")) continue;
+        out.push_back(name);
+    }
+    gguf_free(g);
+    return out;
+}
+
+// exact-name patterns, joined into a few alternations to keep the loader's regex pass cheap
+static std::vector<std::string> exact_name_patterns(const std::vector<std::string> & names) {
+    std::vector<std::string> pats;
+    std::string cur;
+    for (size_t i = 0; i < names.size(); i++) {
+        std::string esc;
+        for (char c : names[i]) { if (c == '.') esc += "\\."; else esc += c; }
+        cur += (cur.empty() ? "" : "|") + esc;
+        if ((i + 1) % 64 == 0 || i + 1 == names.size()) { pats.push_back("^(" + cur + ")$"); cur.clear(); }
+    }
+    return pats;
 }
 
 static bool has_experts(const llama_model * m) {
@@ -88,20 +122,28 @@ bool engine::load(const engine_params & p) {
     llama_model_params dp = base_mparams();
     dp.devices = no_devs.data();
     dp.n_gpu_layers = 0;
-    if (use_npu && p.alias_experts && has_experts(mp_)) {
+    static std::vector<std::string> alias_pats;
+    static std::vector<llama_model_tensor_buft_override> alias_ovr;
+    if (use_npu && p.alias_experts) {
         ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU");
         auto set_resolver = (htptile_set_resolver_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_set_resolver");
         auto get_buft     = (htptile_buft_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_buffer_type");
-        if (set_resolver && get_buft) {
+        const bool moe = has_experts(mp_);
+        const auto names = alias_candidates(p.model, mp_, moe);
+        if (set_resolver && get_buft && !names.empty()) {
             set_resolver(resolve_from_model, (void *) mp_);
-            overrides[0] = { "ffn_(gate|up|down)_exps", get_buft() };
-            overrides[1] = { nullptr, nullptr };
-            dp.tensor_buft_overrides = overrides;
-            dp.load_mode = LLAMA_LOAD_MODE_MMAP;          // aliased experts are never read from the file
+            alias_pats = exact_name_patterns(names);
+            for (auto & pat : alias_pats) alias_ovr.push_back({ pat.c_str(), get_buft() });
+            alias_ovr.push_back({ nullptr, nullptr });
+            dp.tensor_buft_overrides = alias_ovr.data();
+            dp.load_mode = LLAMA_LOAD_MODE_MMAP;          // aliased weights are never read from the file
             _putenv_s("LLAMA_MMAP_NO_PREFETCH", "1");     // nor prefetched into RAM
             aliased_ = true;
+            n_aliased_ = (int) names.size();
+            fprintf(stderr, "[trilane] aliasing %d %s tensors of the decode model to NPU memory\n", n_aliased_, moe ? "expert" : "dense");
         }
     }
+    GGML_UNUSED(overrides);
     {
         double t0 = now_ms();
         md_ = llama_model_load_from_file(p.model.c_str(), dp);
@@ -377,20 +419,23 @@ gen_stats engine::chat(const std::vector<chat_msg> & msgs, const gen_params & gp
 // Keeps the NPU out of its idle low-power state: a 4 KB ADD on the prefill device every keepwarm_ms.
 // Without it, a prefill after >1 s of NPU idle runs ~2.5x slower on big models.
 void engine::keepwarm_start() {
+    // setup happens here on the caller's thread, before any prefill can start: backend init and the
+    // buffer upload touch the same (not thread-safe) HTP session as the prefill context
     std::string dev_name = params_.prefill_dev.substr(0, params_.prefill_dev.find(','));
-    kw_thread_ = std::thread([this, dev_name]() {
-        ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name.c_str());
-        ggml_backend_t be = dev ? ggml_backend_dev_init(dev, nullptr) : nullptr;
-        if (!be) return;
-        ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
-        ggml_context * ctx = ggml_init(ip);
-        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024);
-        ggml_tensor * y = ggml_add(ctx, x, x);
-        ggml_cgraph * gf = ggml_new_graph(ctx);
-        ggml_build_forward_expand(gf, y);
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
-        std::vector<float> ones(1024, 1.0f);
-        ggml_backend_tensor_set(x, ones.data(), 0, sizeof(float) * ones.size());
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name.c_str());
+    ggml_backend_t be = dev ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+    if (!be) return;
+    ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024);
+    ggml_tensor * y = ggml_add(ctx, x, x);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+    std::vector<float> ones(1024, 1.0f);
+    ggml_backend_tensor_set(x, ones.data(), 0, sizeof(float) * ones.size());
+
+    kw_thread_ = std::thread([this, be, ctx, gf, buf]() {
         while (!kw_stop_) {
             {
                 std::lock_guard<std::mutex> lk(kw_mtx_);
@@ -398,6 +443,7 @@ void engine::keepwarm_start() {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(params_.keepwarm_ms));
         }
+        std::lock_guard<std::mutex> lk(kw_mtx_);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
         ggml_backend_free(be);

@@ -55,19 +55,20 @@ struct npu_keepwarm {
     void pause(bool p) { std::lock_guard<std::mutex> lk(mtx); paused = p; }
 
     void start(const char * dev_name, int period_ms) {
-        th = std::thread([this, dev_name, period_ms]() {
-            ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name);
-            ggml_backend_t be = dev ? ggml_backend_dev_init(dev, nullptr) : nullptr;
-            if (!be) { fprintf(stderr, "[trilane] keepwarm: no %s backend\n", dev_name); return; }
-            ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
-            ggml_context * ctx = ggml_init(ip);
-            ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024);
-            ggml_tensor * y = ggml_add(ctx, x, x);
-            ggml_cgraph * gf = ggml_new_graph(ctx);
-            ggml_build_forward_expand(gf, y);
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
-            std::vector<float> ones(1024, 1.0f);
-            ggml_backend_tensor_set(x, ones.data(), 0, sizeof(float) * ones.size());
+        // set up on the caller's thread so it cannot overlap a prefill on the same HTP session
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(dev_name);
+        ggml_backend_t be = dev ? ggml_backend_dev_init(dev, nullptr) : nullptr;
+        if (!be) { fprintf(stderr, "[trilane] keepwarm: no %s backend\n", dev_name); return; }
+        ggml_init_params ip = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1024);
+        ggml_tensor * y = ggml_add(ctx, x, x);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        std::vector<float> ones(1024, 1.0f);
+        ggml_backend_tensor_set(x, ones.data(), 0, sizeof(float) * ones.size());
+        th = std::thread([this, period_ms, be, ctx, gf, buf]() {
             while (!stop) {
                 {
                     std::lock_guard<std::mutex> lk(mtx);
@@ -288,6 +289,7 @@ static result run_once(llama_context * cp, llama_context * cd, const llama_vocab
     double t2 = now_ms();
     r.xfer_ms = t2 - t1;
 
+    if (cd == cp) g_keepwarm.pause(true); // NPU-only decode uses the session too
     llama_batch b = llama_batch_init(1, 0, 1);
     int pos = (int) toks.size();
     if (a.check) r.text += piece(vocab, tok);
@@ -301,6 +303,7 @@ static result run_once(llama_context * cp, llama_context * cd, const llama_vocab
     }
     llama_synchronize(cd);
     r.decode_ms = now_ms() - t2;
+    if (cd == cp) g_keepwarm.pause(false);
     llama_batch_free(b);
     return r;
 }
