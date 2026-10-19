@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -124,6 +125,10 @@ engine::~engine() {
     if (md_ && md_ != mp_) llama_model_free(md_);
     if (cp_) llama_free(cp_);
     if (mp_) llama_model_free(mp_);
+    if (tp_decode_) {
+        auto tp_free = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(ggml_backend_reg_by_name("CPU"), "ggml_threadpool_free");
+        if (tp_free) tp_free(tp_decode_);
+    }
 }
 
 double engine::now_ms() const { return llama_time_us() / 1000.0; }
@@ -228,6 +233,20 @@ bool engine::load(const engine_params & p) {
     cd_ = make_ctx(md_, params_.threads_decode, true, params_.max_seqs, false);
     cp_ = mp_ != md_ ? make_ctx(mp_, params_.threads_prefill, false, 1, true) : cd_;
     if (!cd_ || !cp_) return false;
+
+    // Without an attached thread pool, ggml creates and joins a new pool of worker threads for every graph,
+    // i.e. for every decode step. A persistent pool keeps them (polling between steps, like llama-bench).
+    if (params_.threadpool) {
+        ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU");
+        auto tp_new = cpu ? (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu, "ggml_threadpool_new") : nullptr;
+        if (tp_new) {
+            ggml_threadpool_params tpp = ggml_threadpool_params_default(params_.threads_decode);
+            tpp.prio = (enum ggml_sched_priority) params_.prio;
+            tp_decode_ = tp_new(&tpp);
+        }
+        if (tp_decode_) llama_attach_threadpool(cd_, tp_decode_, nullptr);
+        fprintf(stderr, "[trilane] decode thread pool: %s (%d threads, prio %d)\n", tp_decode_ ? "persistent" : "FAILED, per-step", params_.threads_decode, params_.prio);
+    }
 
     vocab_ = llama_model_get_vocab(mp_);
     char desc[256];
@@ -527,7 +546,9 @@ bool engine::npu_decode(const request_ptr & r, bool overflow) {
         emit(r);
         r->st.n_gen_npu++;
         b.n_tokens = 1; b.token[0] = r->cur; b.pos[0] = r->pos++; b.n_seq_id[0] = 1; b.seq_id[0][0] = 0; b.logits[0] = 1;
+        const double t_dec = now_ms();
         if (llama_decode(cp_, b) != 0) { r->st.stop_reason = "decode_error"; break; }
+        r->st.decode_llama_ms += now_ms() - t_dec;
         r->cur = llama_sampler_sample(r->smpl, cp_, -1);
     }
     llama_batch_free(b);
@@ -749,10 +770,13 @@ void engine::cpu_worker() {
             std::lock_guard<std::mutex> lk(live_mtx_);
             cpu_phase_ = "decode x" + std::to_string(b.n_tokens);
         }
+        const double t_dec = now_ms();
         if (llama_decode(cd_, b) != 0) {
             for (int s : in_batch) { slots[s]->st.stop_reason = "decode_error"; finish_slot(s); }
             continue;
         }
+        const double dt_dec = now_ms() - t_dec;
+        for (int s : in_batch) slots[s]->st.decode_llama_ms += dt_dec;
         for (int i = 0; i < (int) in_batch.size(); i++) {
             request_ptr & r = slots[in_batch[i]];
             r->cur = llama_sampler_sample(r->smpl, cd_, i);
