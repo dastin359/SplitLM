@@ -153,9 +153,10 @@ bool engine::load(const engine_params & p) {
         mp.n_gpu_layers = -1;
         mp.split_mode = LLAMA_SPLIT_MODE_LAYER;
         double t0 = now_ms();
-        mp_ = llama_model_load_from_file(p.model.c_str(), mp);
+        const std::string & pm = p.prefill_model.empty() ? p.model : p.prefill_model;
+        mp_ = llama_model_load_from_file(pm.c_str(), mp);
         if (!mp_) return false;
-        fprintf(stderr, "[trilane] prefill model on %s loaded in %.0f ms\n", p.prefill_dev.c_str(), now_ms() - t0);
+        fprintf(stderr, "[trilane] prefill model %s on %s loaded in %.0f ms\n", pm.c_str(), p.prefill_dev.c_str(), now_ms() - t0);
     }
 
     no_devs = { nullptr };
@@ -164,7 +165,8 @@ bool engine::load(const engine_params & p) {
     dp.n_gpu_layers = 0;
     static std::vector<std::string> alias_pats;
     static std::vector<llama_model_tensor_buft_override> alias_ovr;
-    if (use_npu && p.alias_experts) {
+    // a separate prefill file has its own tensor types, so the decode model cannot alias its weights
+    if (use_npu && p.alias_experts && p.prefill_model.empty()) {
         ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU");
         auto set_resolver = (htptile_set_resolver_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_set_resolver");
         auto get_buft     = (htptile_buft_t) ggml_backend_reg_get_proc_address(cpu, "ggml_backend_cpu_htptile_buffer_type");

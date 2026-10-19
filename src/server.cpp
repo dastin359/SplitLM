@@ -56,7 +56,7 @@ static std::string error_text(const std::string & stop) {
 
 static void usage() {
     fprintf(stderr,
-        "usage: trilane-server -m model.gguf [--prefill-dev HTP0|CPU] [--host 127.0.0.1] [--port 8080]\n"
+        "usage: trilane-server -m model.gguf [--prefill-model prefill.gguf] [--prefill-dev HTP0|CPU] [--host 127.0.0.1] [--port 8080]\n"
         "       [-t decode_threads] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [--keepwarm-ms 20] [--cpu-prefill-max 24] [--no-alias]\n"
         "       [--cache-mb 2048] [--slots 4] [--npu-decode-slots 0|1] [--ui path/to/index.html] [-v]\n");
     exit(1);
@@ -71,6 +71,7 @@ int main(int argc, char ** argv) {
         std::string k = argv[i];
         auto next = [&]() -> const char * { if (i + 1 >= argc) usage(); return argv[++i]; };
         if      (k == "-m")                ep.model = next();
+        else if (k == "--prefill-model")   ep.prefill_model = next();
         else if (k == "--prefill-dev")     ep.prefill_dev = next();
         else if (k == "--host")            host = next();
         else if (k == "--port")            port = atoi(next());
