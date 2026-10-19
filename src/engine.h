@@ -35,6 +35,8 @@ struct engine_params {
     int    cpu_prefill_max  = 96;      // prompts with at most this many new tokens prefill on the CPU
     bool   alias_experts    = true;    // CPU decode reads the NPU's copy of the weights in place when memory requires it
     bool   calibrate        = true;    // measure both lanes at startup and derive the routing threshold
+    bool   threadpool       = true;    // persistent decode threads (else ggml spawns a thread pool for every decode step)
+    int    prio             = 0;       // decode thread priority: 0 normal, 1 medium, 2 high, 3 realtime
 };
 
 // prefill cost model per lane: t(n) = fixed_ms + n / tps * 1000
@@ -78,6 +80,7 @@ struct gen_stats {
     double      t_decode_start_ms = 0; // engine clock of the first decode step (CPU batch or NPU decode slot)
     double      t_cpu_join_ms = 0;     // engine clock when it (last) joined the CPU batch
     double      decode_ms   = 0;
+    double      decode_llama_ms = 0;   // part of decode_ms inside llama_decode (the rest: sampling, streaming, joins)
     int         n_gen       = 0;
     double      npu_decode_ms = 0;     // part of decode_ms spent in an NPU decode slot
     int         n_gen_npu   = 0;       // tokens generated there
@@ -191,6 +194,7 @@ class engine {
     llama_model *   md_ = nullptr;  // decode model (CPU)
     llama_context * cp_ = nullptr;  // owned by the NPU worker after load
     llama_context * cd_ = nullptr;  // owned by the CPU worker after load
+    ggml_threadpool_t tp_decode_ = nullptr; // persistent threads of cd_
     const llama_vocab * vocab_ = nullptr;
     bool        aliased_ = false;
     bool        dense_aliased_ = false;

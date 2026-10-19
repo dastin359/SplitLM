@@ -58,7 +58,8 @@ static void usage() {
     fprintf(stderr,
         "usage: trilane-server -m model.gguf [--prefill-dev HTP0|CPU] [--host 127.0.0.1] [--port 8080]\n"
         "       [-t decode_threads] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [--keepwarm-ms 20] [--cpu-prefill-max 24] [--no-alias]\n"
-        "       [--cache-mb 2048] [--slots 4] [--npu-decode-slots 0|1] [--ui path/to/index.html] [-v]\n");
+        "       [--cache-mb 2048] [--slots 4] [--npu-decode-slots 0|1] [--ui path/to/index.html] [-v]\n"
+        "       [--prio 0-3] [--no-threadpool] [--bench-routes split,cpu,...]\n");
     exit(1);
 }
 
@@ -66,6 +67,7 @@ int main(int argc, char ** argv) {
     trilane::engine_params ep;
     std::string host = "127.0.0.1", ui_path;
     int bench_words = 0, bench_gen = 64, bench_conc = 0, bench_words_conc = 200;
+    std::string bench_routes; // --bench-routes: explicit route sequence (e.g. split,cpu,split,cpu), no follow-up turn
     int port = 8080;
     for (int i = 1; i < argc; i++) {
         std::string k = argv[i];
@@ -90,6 +92,9 @@ int main(int argc, char ** argv) {
         else if (k == "--bench-words")     bench_words_conc = atoi(next());
         else if (k == "--slots")           ep.max_seqs = atoi(next());
         else if (k == "--npu-decode-slots") ep.npu_decode_slots = atoi(next());
+        else if (k == "--prio")            ep.prio = atoi(next());
+        else if (k == "--no-threadpool")   ep.threadpool = false;
+        else if (k == "--bench-routes")    bench_routes = next();
         else if (k == "-v")                g_verbose = true;
         else usage();
     }
@@ -112,13 +117,21 @@ int main(int argc, char ** argv) {
         const char * words[] = { "the", "npu", "runs", "prompt", "prefill", "while", "cpu", "cores", "stream", "tokens", "from", "shared", "memory" };
         for (int i = 0; i < bench_words; i++) doc += std::string(words[(i * 7 + i / 13) % 13]) + ((i % 17 == 16) ? ".\n" : " ");
         auto show = [&](const char * tag, const trilane::gen_stats & s, const std::string & text) {
-            printf("%-14s prompt %5d cached %5d | prefill %5d tok on %-4s %7.1f ms (%6.1f t/s) | TTFT %7.1f ms | decode %5.2f t/s on %s (%d tok)\n",
+            printf("%-14s prompt %5d cached %5d | prefill %5d tok on %-4s %7.1f ms (%6.1f t/s) | TTFT %7.1f ms | decode %5.2f t/s on %s (%d tok) | llama_decode %5.2f t/s\n",
                    tag, s.n_prompt, s.n_cached, s.n_prefill, s.prefill_dev.c_str(), s.prefill_ms, s.prefill_ms > 0 ? s.n_prefill / (s.prefill_ms / 1000.0) : 0.0,
-                   s.ttft_ms, s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0, s.decode_dev.c_str(), s.n_gen);
+                   s.ttft_ms, s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0, s.decode_dev.c_str(), s.n_gen,
+                   s.decode_llama_ms > 0 ? s.n_gen / (s.decode_llama_ms / 1000.0) : 0.0);
             printf("               > %.100s\n", text.c_str());
             fflush(stdout);
         };
-        for (const char * route : { "split", "npu", "cpu" }) {
+        std::vector<std::string> routes = { "split", "npu", "cpu" };
+        if (!bench_routes.empty()) {
+            routes.clear();
+            std::stringstream ss(bench_routes);
+            for (std::string x; std::getline(ss, x, ',');) if (!x.empty()) routes.push_back(x);
+        }
+        for (const std::string & route_s : routes) {
+            const char * route = route_s.c_str();
             if (!eng.split() && strcmp(route, "cpu") != 0) continue;
             if (eng.dense_aliased() && strcmp(route, "cpu") == 0) {
                 printf("cpu            skipped: aliased dense weights make CPU batch prefill a per-token GEMV\n");
@@ -128,7 +141,7 @@ int main(int argc, char ** argv) {
             std::string out;
             auto st = eng.chat({ { "user", std::string("[") + route + "] " + doc } }, gp, [&](const std::string & p) { out += p; return true; });
             show(route, st, out);
-            if (strcmp(route, "split") == 0) {
+            if (strcmp(route, "split") == 0 && bench_routes.empty()) {
                 gp.route = "auto";
                 std::string out2;
                 auto st2 = eng.chat({ { "user", std::string("[") + route + "] " + doc }, { "assistant", out }, { "user", "Now give it a title." } }, gp,
