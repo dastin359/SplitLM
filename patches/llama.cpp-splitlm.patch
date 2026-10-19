@@ -92,11 +92,179 @@ index ad0e5cc..1eaf9e1 100644
              int8x16_t b0 = vld1q_s8((const int8_t *) b_ptr->qs);
              int8x16_t b1 = vld1q_s8((const int8_t *) b_ptr->qs + 16);
              int8x16_t b2 = vld1q_s8((const int8_t *) b_ptr->qs + 32);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-impl.h b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+index 0d48c9a..6835cd5 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu-impl.h
++++ b/ggml/src/ggml-cpu/ggml-cpu-impl.h
+@@ -27,8 +27,21 @@ struct ggml_compute_params {
+ 
+     // use reference implementation
+     bool use_ref;
++
++    // trilane: GGML_CPU_AB=mask paired A/B, odd graphs run with the masked trilane decode optimizations off
++    int ab_off;
+ };
+ 
++// trilane: GGML_CPU_AB mask bits
++#define GGML_CPU_AB_CONCAT   1  // CONCAT row split
++#define GGML_CPU_AB_GDN      2  // GATED_DELTA_NET + state CPY fusion
++#define GGML_CPU_AB_ELIDE    4  // barrier elision between thread-0-only nodes
++#define GGML_CPU_AB_ROWQ     8  // split single-row activation quantization (repack GEMV)
++#define GGML_CPU_AB_BARRIER2 16 // two-level barrier (GGML_CPU_BARRIER=2)
++#define GGML_CPU_AB_EMPTY    32 // skip zero-element nodes (no compute, no barrier)
++#define GGML_CPU_AB_CHUNKS   64 // GGML_REPACK_CHUNKS (odd graphs use the default 4)
++#define GGML_CPU_AB_BIGCHUNK 128 // GGML_REPACK_CHUNK_KB cap on repacked GEMV chunk size
++
+ 
+ #if defined(_MSC_VER)
+ 
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index ab82e3d..5454e66 100644
+index ab82e3d..cd34403 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -3063,6 +3063,93 @@ struct ggml_cplan ggml_graph_plan(
+@@ -491,6 +491,10 @@ struct ggml_threadpool {
+     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
+     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+ 
++    // trilane: two-level barrier (GGML_CPU_BARRIER=2): threads arrive on a per-group counter (groups of 4 by
++    // thread index), the last arrival of each group arrives on n_barrier; release stays on n_barrier_passed
++    struct { atomic_int GGML_CACHE_ALIGN n; } bar_grp[GGML_MAX_N_THREADS / 4];
++
+     // these are atomic as an annotation for thread-sanitizer
+     atomic_bool stop;         // Used for stopping the threadpool altogether
+     atomic_bool pause;        // Used for pausing the threadpool or individual threads
+@@ -502,6 +506,9 @@ struct ggml_threadpool {
+     uint32_t     poll;        // Polling level (0 - no polling)
+ 
+     enum ggml_status ec;
++
++    int ab_off;               // trilane: per-graph A/B switch (GGML_CPU_AB=mask), set before workers start
++    int ab_dec;               // trilane: this graph is a single-token decode graph (A/B accounting)
+ };
+ 
+ // Per-thread state
+@@ -573,6 +580,50 @@ struct ggml_state {
+ 
+ static struct ggml_state g_state = {0};
+ 
++static int cpu_barrier_mode = 0; // trilane: GGML_CPU_BARRIER=2 selects the two-level barrier
++static int64_t cpu_prof_plan_us = 0, cpu_prof_compute_us = 0, cpu_prof_compute_n = 0; // trilane: host-side graph overhead
++static int     cpu_prof_on = 0;
++static int64_t cpu_prof_last_wall = 0;   // thread 0: graph wall of the graph that just finished (us)
++#define CPU_PROF_HIST 8192
++static int32_t cpu_prof_ovh_hist[CPU_PROF_HIST]; // per graph: ggml_graph_compute call minus thread-0 graph wall (us)
++static int32_t cpu_prof_gap_hist[CPU_PROF_HIST]; // per graph: gap since the previous graph ended (us)
++static int64_t cpu_prof_ovh_n = 0, cpu_prof_gap_n = 0;
++static int64_t cpu_prof_t_entry[64], cpu_prof_t_arrive[64]; // per thread: compute_thread entry, final-barrier arrival
++static int32_t cpu_prof_fin_hist[CPU_PROF_HIST];  // per graph: last thread's final-barrier arrival minus thread 0's (us)
++static int32_t cpu_prof_wake_hist[CPU_PROF_HIST]; // per graph: last worker's entry minus thread 0's entry (us)
++static int32_t cpu_prof_last_ith[64];             // which thread arrived last at the final barrier
++static int64_t cpu_prof_fin_n = 0;
++static int64_t cpu_prof_mmc_nlast = 0, cpu_prof_mmc_nmin = 0, cpu_prof_mmc_nmax = 0;
++static int32_t cpu_prof_mmc_ckmax_hist[CPU_PROF_HIST], cpu_prof_mmc_lastck_hist[CPU_PROF_HIST], cpu_prof_mmc_start_hist[CPU_PROF_HIST];
++
++static int cpu_prof_cmp_i32(const void * a, const void * b) {
++    const int32_t x = *(const int32_t *) a, y = *(const int32_t *) b;
++    return (x > y) - (x < y);
++}
++
++static void cpu_prof_print_hist(const char * name, const int32_t * h, int64_t n) {
++    if (n <= 0) {
++        return;
++    }
++    const int64_t m = n < CPU_PROF_HIST ? n : CPU_PROF_HIST;
++    int32_t * tmp = (int32_t *) malloc(m * sizeof(int32_t));
++    memcpy(tmp, h, m * sizeof(int32_t));
++    qsort(tmp, m, sizeof(int32_t), cpu_prof_cmp_i32);
++    double sum = 0;
++    for (int64_t i = 0; i < m; i++) {
++        sum += tmp[i];
++    }
++    fprintf(stderr, "[cpu-prof]   %s: n %lld median %d us, p10 %d, p90 %d, max %d, mean %.1f us\n", name, (long long) m,
++        tmp[m / 2], tmp[m / 10], tmp[(m * 9) / 10], tmp[m - 1], sum / m);
++    free(tmp);
++}
++static _Thread_local int cpu_tls_ith = -1;
++// trilane profiler: per-thread chunk stats of the generic MUL_MAT (reset by each thread before the last graph node)
++static int     cpu_prof_mmc_on = 0;
++static int32_t cpu_prof_mmc_n[64];      // chunks this thread processed in the current node
++static int32_t cpu_prof_mmc_max[64];    // longest single chunk (us)
++static int64_t cpu_prof_mmc_t0[64];     // start of the current node's chunk loop
++
+ void ggml_barrier(struct ggml_threadpool * tp) {
+     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+     if (n_threads == 1) {
+@@ -584,6 +635,25 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+ #else
+     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
+ 
++    if (cpu_barrier_mode == 2 && cpu_tls_ith >= 0 && n_threads > 4 && !(tp->ab_off & GGML_CPU_AB_BARRIER2)) {
++        const int g       = cpu_tls_ith / 4;
++        const int n_grp   = (n_threads + 3) / 4;
++        const int g_size  = MIN(4, n_threads - g * 4);
++        if (atomic_fetch_add_explicit(&tp->bar_grp[g].n, 1, memory_order_acq_rel) == g_size - 1) {
++            atomic_store_explicit(&tp->bar_grp[g].n, 0, memory_order_relaxed);
++            if (atomic_fetch_add_explicit(&tp->n_barrier, 1, memory_order_acq_rel) == n_grp - 1) {
++                atomic_store_explicit(&tp->n_barrier, 0, memory_order_relaxed);
++                atomic_fetch_add_explicit(&tp->n_barrier_passed, 1, memory_order_seq_cst);
++                return;
++            }
++        }
++        while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
++            ggml_thread_cpu_relax();
++        }
++        atomic_thread_fence(memory_order_seq_cst);
++        return;
++    }
++
+     // enter barrier (full seq-cst fence)
+     int n_barrier = atomic_fetch_add_explicit(&tp->n_barrier, 1, memory_order_seq_cst);
+ 
+@@ -1442,6 +1512,10 @@ UseGgmlGemm2:;
+ 
+     // The first chunk comes from our thread_id, the rest will get auto-assigned.
+     int current_chunk = ith;
++    const bool mmc = cpu_prof_mmc_on && ith < 64;
++    if (mmc) {
++        cpu_prof_mmc_t0[ith] = ggml_time_us();
++    }
+ 
+     while (current_chunk < nchunk0 * nchunk1) {
+         const int64_t ith0 = current_chunk % nchunk0;
+@@ -1461,7 +1535,13 @@ UseGgmlGemm2:;
+         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
+             num_rows_per_vec_dot = 1;
+         }
++        const int64_t t_ck = mmc ? ggml_time_us() : 0;
+         ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
++        if (mmc) {
++            const int32_t dt = (int32_t) (ggml_time_us() - t_ck);
++            cpu_prof_mmc_n[ith]++;
++            if (dt > cpu_prof_mmc_max[ith]) cpu_prof_mmc_max[ith] = dt;
++        }
+ 
+         if (nth >= nchunk0 * nchunk1) {
+             break;
+@@ -2831,6 +2911,7 @@ struct ggml_cplan ggml_graph_plan(
+ #endif
+ 
+     size_t work_size = 0;
++    const int64_t t_plan0 = cpu_prof_on ? ggml_time_us() : 0;
+ 
+     struct ggml_cplan cplan;
+     memset(&cplan, 0, sizeof(struct ggml_cplan));
+@@ -3056,6 +3137,10 @@ struct ggml_cplan ggml_graph_plan(
+     cplan.work_size  = work_size;
+     cplan.work_data  = NULL;
+ 
++    if (cpu_prof_on) {
++        cpu_prof_plan_us += ggml_time_us() - t_plan0;
++    }
++
+     return cplan;
+ }
+ 
+@@ -3063,6 +3148,93 @@ struct ggml_cplan ggml_graph_plan(
  // Try to fuse the current node with subsequent nodes for better performance.
  // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
  static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
@@ -190,11 +358,11 @@ index ab82e3d..5454e66 100644
  
  static int ggml_cpu_try_fuse_ops(
          const struct ggml_cgraph * cgraph,
-@@ -3095,9 +3182,172 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3095,9 +3267,236 @@ static int ggml_cpu_try_fuse_ops(
          }
      }
  
-+    if (node->op == GGML_OP_GATED_DELTA_NET && ggml_cpu_gdn_cpy_fusion) {
++    if (node->op == GGML_OP_GATED_DELTA_NET && ggml_cpu_gdn_cpy_fusion && !(params->ab_off & GGML_CPU_AB_GDN)) {
 +        // GATED_DELTA_NET (K=1) + CPY of its new-state view into the state cache (build_recurrent_attn):
 +        // the kernel writes the new state to the CPY destination and the CPY is skipped.
 +        const int n = ggml_cpu_gdn_cpy_fusable(cgraph, node_n);
@@ -210,6 +378,11 @@ index ab82e3d..5454e66 100644
 +// trilane: per-op profile on thread 0 (GGML_CPU_PROF=N prints cumulative stats every N graphs)
 +static int     cpu_prof_every = 0;
 +static int64_t cpu_prof_graphs = 0;
++static int64_t cpu_prof_t_end_prev = 0;  // thread 0: end of the previous graph (us)
++static int64_t cpu_prof_gap_us = 0;      // time between graphs (outside ggml graph compute)
++static int64_t cpu_prof_graph_us = 0;    // thread 0: first node start to last node end
++static int     cpu_dump_graph = 0;       // GGML_CPU_DUMP_GRAPH=N: print the node list of the first graph with >= N nodes
++static int     cpu_barrier_bench = 0;    // GGML_CPU_BARRIER_BENCH=N: time N back-to-back barriers once (balanced arrivals)
 +static int64_t cpu_prof_count[GGML_OP_COUNT];
 +static int64_t cpu_prof_work_us[GGML_OP_COUNT];
 +static int64_t cpu_prof_wait_us[GGML_OP_COUNT];
@@ -257,6 +430,9 @@ index ab82e3d..5454e66 100644
 +// is not thread-0-only, where the normal barrier runs. GGML_CPU_BAR_ELIDE=0 disables.
 +static int     cpu_bar_elide = 1;
 +static int64_t cpu_prof_elided = 0;
++static int     cpu_ab = 0;          // GGML_CPU_AB=mask: odd graphs run with the masked trilane optimizations off (GGML_CPU_AB_*)
++static int64_t cpu_ab_graph = 0;
++static int64_t cpu_prof_ab_us[2], cpu_prof_ab_gap_us[2], cpu_prof_ab_n[2];
 +
 +static bool cpu_node_t0_only(const struct ggml_tensor * t) {
 +    if (t->type != GGML_TYPE_F32 || t->src[0] == NULL || t->src[0]->type != GGML_TYPE_F32) {
@@ -293,11 +469,22 @@ index ab82e3d..5454e66 100644
 +    }
 +}
 +
++// trilane: nodes the compute loop skips without a barrier: NOPs, nodes not flagged for compute and (skip_empty)
++// zero-element nodes, e.g. the recurrent-state zeroing view of build_rs when no state is cleared (2 per GDN layer
++// on Qwen3.5). A zero-element node reads and writes nothing (ggml_compute_forward returns early), so the barrier
++// after it orders nothing that the barrier before it did not. Off by default (paired A/B: -0.6%, noise level);
++// GGML_CPU_SKIP_EMPTY=1 enables.
++static int cpu_skip_empty = 0;
++static int64_t cpu_prof_skipped = 0;
++
++static inline bool cpu_node_skipped(const struct ggml_tensor * t, bool skip_empty) {
++    return ggml_op_is_empty(t->op) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || (skip_empty && ggml_is_empty(t));
++}
++
 +// index of the next node the compute loop will execute after node_n (same skip rules as the loop)
-+static int cpu_next_compute_node(const struct ggml_cgraph * cgraph, int node_n) {
++static int cpu_next_compute_node(const struct ggml_cgraph * cgraph, int node_n, bool skip_empty) {
 +    int j = node_n + 1;
-+    while (j < cgraph->n_nodes &&
-+           (ggml_op_is_empty(cgraph->nodes[j]->op) || (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0)) {
++    while (j < cgraph->n_nodes && cpu_node_skipped(cgraph->nodes[j], skip_empty)) {
 +        j++;
 +    }
 +    return j;
@@ -334,6 +521,35 @@ index ab82e3d..5454e66 100644
 +    fprintf(stderr, "[cpu-prof] graphs %lld | per graph: nodes %.0f, work %.3f ms, barrier-wait %.3f ms (%.1f%%), avg wait/node %.2f us, elided barriers %.1f\n",
 +        (long long) cpu_prof_graphs, (double) tot_n / cpu_prof_graphs, tot_work / 1000.0 / cpu_prof_graphs, tot_wait / 1000.0 / cpu_prof_graphs,
 +        100.0 * tot_wait / (double) (tot_work + tot_wait), (double) tot_wait / tot_n, (double) cpu_prof_elided / cpu_prof_graphs);
++    fprintf(stderr, "[cpu-prof]   skipped zero-element nodes %.1f per graph\n", (double) cpu_prof_skipped / cpu_prof_graphs);
++    fprintf(stderr, "[cpu-prof]   graph wall %.3f ms, gap between graphs %.3f ms (outside graph compute)\n",
++        cpu_prof_graph_us / 1000.0 / cpu_prof_graphs, cpu_prof_gap_us / 1000.0 / MAX(1, cpu_prof_graphs - 1));
++    fprintf(stderr, "[cpu-prof]   ggml_graph_plan %.4f ms, ggml_graph_compute call %.4f ms (minus thread-0 graph wall: %.4f ms)\n",
++        cpu_prof_plan_us / 1000.0 / MAX(1, cpu_prof_compute_n), cpu_prof_compute_us / 1000.0 / MAX(1, cpu_prof_compute_n),
++        (cpu_prof_compute_us - cpu_prof_graph_us) / 1000.0 / MAX(1, cpu_prof_compute_n));
++    cpu_prof_print_hist("graph_compute call overhead (call - thread-0 wall)", cpu_prof_ovh_hist, cpu_prof_ovh_n);
++    cpu_prof_print_hist("gap between graphs", cpu_prof_gap_hist, cpu_prof_gap_n);
++    cpu_prof_print_hist("final barrier: last arrival - thread 0", cpu_prof_fin_hist, cpu_prof_fin_n);
++    cpu_prof_print_hist("worker wake: last entry - thread 0 entry", cpu_prof_wake_hist, cpu_prof_fin_n);
++    if (cpu_prof_fin_n > 0) {
++        fprintf(stderr, "[cpu-prof]   last node chunks per thread: min %.1f max %.1f, last-arriving thread %.1f\n",
++            (double) cpu_prof_mmc_nmin / cpu_prof_fin_n, (double) cpu_prof_mmc_nmax / cpu_prof_fin_n, (double) cpu_prof_mmc_nlast / cpu_prof_fin_n);
++        cpu_prof_print_hist("last node longest chunk (any thread)", cpu_prof_mmc_ckmax_hist, cpu_prof_fin_n);
++        cpu_prof_print_hist("last node longest chunk (last-arriving thread)", cpu_prof_mmc_lastck_hist, cpu_prof_fin_n);
++        cpu_prof_print_hist("last node chunk-loop start spread", cpu_prof_mmc_start_hist, cpu_prof_fin_n);
++    }
++    fprintf(stderr, "[cpu-prof]   last to arrive at final barrier (by thread):");
++    for (int i = 0; i < 16; i++) {
++        fprintf(stderr, " %d", cpu_prof_last_ith[i]);
++    }
++    fprintf(stderr, "\n");
++    if (cpu_ab) {
++        const double on  = cpu_prof_ab_us[0] / 1000.0 / MAX(1, cpu_prof_ab_n[0]);
++        const double off = cpu_prof_ab_us[1] / 1000.0 / MAX(1, cpu_prof_ab_n[1]);
++        fprintf(stderr, "[cpu-prof]   A/B graph wall: opt ON %.4f ms (n %lld, gap %.4f) | opt OFF %.4f ms (n %lld, gap %.4f) | saved %.4f ms/graph (%.2f%%)\n",
++            on, (long long) cpu_prof_ab_n[0], cpu_prof_ab_gap_us[0] / 1000.0 / MAX(1, cpu_prof_ab_n[0]),
++            off, (long long) cpu_prof_ab_n[1], cpu_prof_ab_gap_us[1] / 1000.0 / MAX(1, cpu_prof_ab_n[1]), off - on, 100.0 * (off - on) / off);
++    }
 +    for (int k = 0; k < 12; k++) {
 +        int best = -1;
 +        for (int i = 0; i < GGML_OP_COUNT; i++) {
@@ -360,34 +576,109 @@ index ab82e3d..5454e66 100644
 +    }
 +}
 +
++static void cpu_dump_graph_nodes(const struct ggml_cgraph * cgraph) {
++    fprintf(stderr, "[cpu-graph] %d nodes\n", cgraph->n_nodes);
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const struct ggml_tensor * t = cgraph->nodes[i];
++        const bool empty = ggml_op_is_empty(t->op) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
++        if (empty) {
++            continue;
++        }
++        fprintf(stderr, "[cpu-graph] %4d %-16s %-28.28s [%lld,%lld,%lld,%lld] %s rows %lld t0 %d src0 %-24.24s src1 %-24.24s\n", i,
++            t->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(t)) : t->op == GGML_OP_GLU ? ggml_glu_op_name(ggml_get_glu_op(t)) : ggml_op_name(t->op),
++            t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], ggml_type_name(t->type),
++            (long long) ggml_nrows(t), cpu_node_t0_only(t) ? 1 : 0,
++            t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-");
++    }
++}
++
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3126,6 +3376,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3118,6 +3517,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         /*.wdata      =*/ cplan->work_data,
+         /*.threadpool =*/ tp,
+         /*.use_ref    =*/ cplan->use_ref,
++        /*.ab_off     =*/ tp->ab_off,
+     };
+ 
+ #ifdef GGML_USE_OPENMP
+@@ -3126,6 +3526,51 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
 +    int pf_done = -1; // next-weight prefetch: node already prefetched by this thread
++    cpu_tls_ith = state->ith;
++    if (cpu_prof_every > 0 && state->ith < 64) {
++        cpu_prof_t_entry[state->ith] = ggml_time_us();
++    }
++
++    if (cpu_prof_every > 0 && state->ith == 0) {
++        const int64_t t0 = ggml_time_us();
++        if (cpu_prof_t_end_prev > 0) {
++            cpu_prof_gap_us += t0 - cpu_prof_t_end_prev;
++            cpu_prof_gap_hist[cpu_prof_gap_n++ % CPU_PROF_HIST] = (int32_t) (t0 - cpu_prof_t_end_prev);
++            if (tp->ab_dec) {
++                cpu_prof_ab_gap_us[params.ab_off ? 1 : 0] += t0 - cpu_prof_t_end_prev;
++            }
++        }
++        cpu_prof_t_end_prev = -t0; // start time until the graph ends
++    }
++    if (cpu_dump_graph > 0 && state->ith == 0 && cgraph->n_nodes >= cpu_dump_graph) {
++        cpu_dump_graph_nodes(cgraph);
++        cpu_dump_graph = 0;
++    }
++    if (cpu_barrier_bench > 0 && cgraph->n_nodes >= 64) {
++        // every thread reads the same value here (set before the graph started), and thread 0 clears it only
++        // after the final barrier below, so all threads run the same number of barriers
++        const int n = cpu_barrier_bench;
++        ggml_barrier(tp);
++        const int64_t t0 = ggml_time_us();
++        for (int i = 0; i < n; i++) {
++            ggml_barrier(tp);
++        }
++        const int64_t t1 = ggml_time_us();
++        ggml_barrier(tp);
++        if (state->ith == 0) {
++            fprintf(stderr, "[cpu-prof] barrier bench: %d threads, %d barriers, %.3f us/barrier\n", params.nth, n, (double) (t1 - t0) / n);
++            cpu_barrier_bench = 0;
++        }
++        ggml_barrier(tp);
++    }
 +
 +    // barrier elision is off with an abort callback: thread 0 could stop at a node that threads past a
 +    // skipped barrier have already passed, and their barrier counts would no longer match
-+    const bool elide_ok = cpu_bar_elide && params.nth > 1 && cplan->abort_callback == NULL && !cplan->use_ref;
++    const bool elide_ok = cpu_bar_elide && params.nth > 1 && cplan->abort_callback == NULL && !cplan->use_ref && !(params.ab_off & GGML_CPU_AB_ELIDE);
++
++    const bool skip_empty = cpu_skip_empty && !(params.ab_off & GGML_CPU_AB_EMPTY);
 +
      for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
          struct ggml_tensor * node = cgraph->nodes[node_n];
  
-@@ -3138,6 +3394,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3138,6 +3583,22 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
++        if (skip_empty && ggml_is_empty(node)) {
++            if (cpu_prof_every > 0 && state->ith == 0) {
++                cpu_prof_skipped++;
++            }
++            continue;
++        }
++
 +        const bool prof = cpu_prof_every > 0 && state->ith == 0;
 +        const int64_t t_start = prof ? ggml_time_us() : 0;
 +        const int node_first = node_n;
++        if (cpu_prof_every > 0 && state->ith < 64) {
++            const bool last = node_n == cgraph->n_nodes - 1;
++            cpu_prof_mmc_n[state->ith] = 0; cpu_prof_mmc_max[state->ith] = 0; cpu_prof_mmc_t0[state->ith] = 0;
++            if (state->ith == 0) cpu_prof_mmc_on = last; // read by the other threads only inside this node, after its barrier
++        }
 +
          // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
          // Try fused ops, fall back to normal compute
          const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-@@ -3153,8 +3413,45 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3153,8 +3614,53 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              tp->ec    = GGML_STATUS_ABORTED;
          }
  
@@ -403,7 +694,7 @@ index ab82e3d..5454e66 100644
 +                    elide = cpu_node_t0_only(cgraph->nodes[j]);
 +                }
 +                if (elide) {
-+                    const int nx = cpu_next_compute_node(cgraph, node_n);
++                    const int nx = cpu_next_compute_node(cgraph, node_n, skip_empty);
 +                    elide = nx < cgraph->n_nodes && cpu_node_t0_only(cgraph->nodes[nx]);
 +                }
 +            }
@@ -429,12 +720,97 @@ index ab82e3d..5454e66 100644
 +    }
 +
 +    if (cpu_prof_every > 0 && state->ith == 0) {
++        const int64_t t1 = ggml_time_us();
++        cpu_prof_graph_us  += t1 + cpu_prof_t_end_prev; // cpu_prof_t_end_prev holds -start here
++        cpu_prof_last_wall  = t1 + cpu_prof_t_end_prev;
++        if (tp->ab_dec) {
++            cpu_prof_ab_us[params.ab_off ? 1 : 0] += t1 + cpu_prof_t_end_prev;
++            cpu_prof_ab_n[params.ab_off ? 1 : 0]++;
++        }
++        cpu_prof_t_end_prev = t1;
 +        if (++cpu_prof_graphs % cpu_prof_every == 0) {
 +            cpu_prof_dump();
          }
      }
  
-@@ -3933,6 +4230,19 @@ void ggml_cpu_init(void) {
+@@ -3164,8 +3670,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+ #endif
+ 
++    if (cpu_prof_every > 0 && state->ith < 64) {
++        cpu_prof_t_arrive[state->ith] = ggml_time_us();
++    }
++
+     ggml_barrier(state->threadpool);
+ 
++    if (cpu_prof_every > 0 && state->ith == 0 && params.nth <= 64 && cgraph->n_nodes >= 64) {
++        int64_t fin = 0, wake = 0; int last = 0;
++        for (int i = 1; i < params.nth; i++) {
++            if (cpu_prof_t_arrive[i] - cpu_prof_t_arrive[0] > fin) { fin = cpu_prof_t_arrive[i] - cpu_prof_t_arrive[0]; last = i; }
++            if (cpu_prof_t_entry[i] - cpu_prof_t_entry[0] > wake) { wake = cpu_prof_t_entry[i] - cpu_prof_t_entry[0]; }
++        }
++        cpu_prof_fin_hist[cpu_prof_fin_n % CPU_PROF_HIST]  = (int32_t) fin;
++        cpu_prof_wake_hist[cpu_prof_fin_n % CPU_PROF_HIST] = (int32_t) wake;
++        cpu_prof_fin_n++;
++        cpu_prof_last_ith[last]++;
++        {
++            int32_t nmin = 1 << 30, nmax = 0, ckmax = 0; int64_t tmin = INT64_MAX, tmax = 0;
++            for (int i = 0; i < params.nth; i++) {
++                nmin = MIN(nmin, cpu_prof_mmc_n[i]); nmax = MAX(nmax, cpu_prof_mmc_n[i]); ckmax = MAX(ckmax, cpu_prof_mmc_max[i]);
++                if (cpu_prof_mmc_t0[i] > 0) { tmin = MIN(tmin, cpu_prof_mmc_t0[i]); tmax = MAX(tmax, cpu_prof_mmc_t0[i]); }
++            }
++            cpu_prof_mmc_nlast += cpu_prof_mmc_n[last]; cpu_prof_mmc_nmin += nmin; cpu_prof_mmc_nmax += nmax;
++            cpu_prof_mmc_ckmax_hist[(cpu_prof_fin_n - 1) % CPU_PROF_HIST] = ckmax;
++            cpu_prof_mmc_lastck_hist[(cpu_prof_fin_n - 1) % CPU_PROF_HIST] = cpu_prof_mmc_max[last];
++            cpu_prof_mmc_start_hist[(cpu_prof_fin_n - 1) % CPU_PROF_HIST] = tmax > 0 ? (int32_t) (tmax - tmin) : 0;
++        }
++    }
++
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
+ #endif
+@@ -3324,6 +3857,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+         threadpool->n_graph          = 0;
+         threadpool->n_barrier        = 0;
+         threadpool->n_barrier_passed = 0;
++        for (int g = 0; g < GGML_MAX_N_THREADS / 4; g++) {
++            atomic_store_explicit(&threadpool->bar_grp[g].n, 0, memory_order_relaxed);
++        }
+         threadpool->current_chunk    = 0;
+         threadpool->stop             = false;
+         threadpool->pause            = tpp->paused;
+@@ -3389,6 +3925,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
+ }
+ 
+ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
++    const int64_t t_c0 = cpu_prof_on ? ggml_time_us() : 0;
+     ggml_cpu_init();
+ 
+     GGML_ASSERT(cplan);
+@@ -3415,6 +3952,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+         threadpool->abort            = -1;
+         threadpool->ec               = GGML_STATUS_SUCCESS;
+     }
++    threadpool->ab_off = (cpu_ab && cgraph->n_nodes >= 64 && (cpu_ab_graph++ & 1)) ? cpu_ab : 0;
++    threadpool->ab_dec = cgraph->n_nodes >= 64 && cgraph->nodes[0]->ne[1] == 1;
+ 
+ #ifdef GGML_USE_OPENMP
+     if (n_threads > 1) {
+@@ -3462,6 +4001,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+         ggml_threadpool_free(threadpool);
+     }
+ 
++    if (cpu_prof_on) {
++        const int64_t dt = ggml_time_us() - t_c0;
++        cpu_prof_compute_us += dt;
++        cpu_prof_compute_n++;
++        cpu_prof_ovh_hist[cpu_prof_ovh_n++ % CPU_PROF_HIST] = (int32_t) (dt - cpu_prof_last_wall);
++    }
++
+     return ret;
+ }
+ 
+@@ -3933,6 +4479,30 @@ void ggml_cpu_init(void) {
          {
              const char * env = getenv("GGML_CPU_DISABLE_FUSION");
              ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
@@ -445,12 +821,23 @@ index ab82e3d..5454e66 100644
 +        {
 +            const char * env = getenv("GGML_CPU_PROF");
 +            cpu_prof_every = env ? atoi(env) : 0;
++            cpu_prof_on = cpu_prof_every > 0;
 +            env = getenv("GGML_PF_NEXT_KB");
 +            cpu_pf_next_kb = env ? atoi(env) : 0;
 +            env = getenv("GGML_REPACK_CHUNKS");
 +            cpu_pf_chunks = env ? MAX(1, atoi(env)) : 4;
 +            env = getenv("GGML_CPU_BAR_ELIDE");
 +            cpu_bar_elide = env ? atoi(env) : 1;
++            env = getenv("GGML_CPU_SKIP_EMPTY");
++            cpu_skip_empty = env ? atoi(env) : 0;
++            env = getenv("GGML_CPU_DUMP_GRAPH");
++            cpu_dump_graph = env ? atoi(env) : 0;
++            env = getenv("GGML_CPU_AB");
++            cpu_ab = env ? atoi(env) : 0;
++            env = getenv("GGML_CPU_BARRIER_BENCH");
++            cpu_barrier_bench = env ? atoi(env) : 0;
++            env = getenv("GGML_CPU_BARRIER");
++            cpu_barrier_mode = env ? atoi(env) : 0;
          }
  
          is_first_call = false;
@@ -1254,10 +1641,10 @@ index 0000000..ef8543c
 +}
 +#endif
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 7a73e13..9df2825 100644
+index 7a73e13..59a6105 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -2055,25 +2055,41 @@ static void ggml_compute_forward_concat_f32(
+@@ -2055,25 +2055,62 @@ static void ggml_compute_forward_concat_f32(
      int64_t o[4] = {0, 0, 0, 0};
      o[dim] = src0->ne[dim];
  
@@ -1272,11 +1659,28 @@ index 7a73e13..9df2825 100644
 -                        x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
 -                    } else {
 -                        x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
--                    }
--
++    if (params->ab_off & GGML_CPU_AB_CONCAT) {
++        // reference (pre-trilane) loop, for the paired A/B only
++        for (int i3 = 0; i3 < ne3; i3++) {
++            for (int i2 = ith; i2 < ne2; i2 += nth) {
++                for (int i1 = 0; i1 < ne1; i1++) {
++                    for (int i0 = 0; i0 < ne0; i0++) {
++                        const float * x;
++                        if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
++                            x = (const float *) ((const char *)src0->data + (i0       )*nb00 + (i1       )*nb01 + (i2       )*nb02 + (i3       )*nb03);
++                        } else {
++                            x = (const float *) ((const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13);
++                        }
++                        float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
++                        *y = *x;
+                     }
++                }
++            }
++        }
++        return;
++    }
+ 
 -                    float * y = (float *)((char *)dst->data + i0*nb0 + i1*nb1 + i2*nb2 + i3*nb3);
--
--                    *y = *x;
 +    // trilane: split all dst rows (i1,i2,i3) across threads (the old i2-only split ran the whole
 +    // single-sequence decode conv-state concat [3+1, 6144, 1] on thread 0), and copy each row as a
 +    // src0 range plus a src1 range without a per-element branch. Pure copies: bit-identical.
@@ -1284,7 +1688,8 @@ index 7a73e13..9df2825 100644
 +    const int64_t dr  = (nr + nth - 1)/nth;
 +    const int64_t ir0 = MIN(nr, dr*ith);
 +    const int64_t ir1 = MIN(nr, ir0 + dr);
-+
+ 
+-                    *y = *x;
 +    for (int64_t ir = ir0; ir < ir1; ir++) {
 +        const int64_t i3 = ir/(ne1*ne2);
 +        const int64_t i2 = (ir - i3*ne1*ne2)/ne1;
@@ -1315,7 +1720,7 @@ index 7a73e13..9df2825 100644
      }
  }
  
-@@ -11202,7 +11218,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11202,7 +11239,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
      const ggml_compute_params * params,
      ggml_tensor * dst,
      int64_t ir0,
@@ -1325,7 +1730,7 @@ index 7a73e13..9df2825 100644
  
      ggml_tensor * src_q     = dst->src[0];
      ggml_tensor * src_k     = dst->src[1];
-@@ -11282,18 +11299,64 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11282,18 +11320,64 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
  
          // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
          // For K>1, work in scratch and copy out per-token when the slot is in range.
@@ -1392,7 +1797,7 @@ index 7a73e13..9df2825 100644
          for (int64_t t = 0; t < n_tokens; t++) {
              const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
              const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
-@@ -11354,7 +11417,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11354,7 +11438,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
  
  static void ggml_compute_forward_gated_delta_net_f32(
          const ggml_compute_params * params,
@@ -1402,7 +1807,7 @@ index 7a73e13..9df2825 100644
  
      ggml_tensor * V = dst->src[2];
      int64_t nr = V->ne[1] * V->ne[3];
-@@ -11388,7 +11452,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -11388,7 +11473,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
          const int64_t ir0 = dr * current_chunk;
          const int64_t ir1 = MIN(ir0 + dr, nr);
  
@@ -1411,7 +1816,7 @@ index 7a73e13..9df2825 100644
          current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
      }
  }
-@@ -11410,6 +11474,17 @@ void ggml_compute_forward_gated_delta_net(
+@@ -11410,6 +11495,17 @@ void ggml_compute_forward_gated_delta_net(
      }
  }
  
@@ -1442,10 +1847,10 @@ index 2728b08..b452acd 100644
  void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
-index 2632ae3..662e7f1 100644
+index 2632ae3..e519f43 100644
 --- a/ggml/src/ggml-cpu/repack.cpp
 +++ b/ggml/src/ggml-cpu/repack.cpp
-@@ -18,6 +18,13 @@
+@@ -18,6 +18,17 @@
  
  #include "repack.h"
  
@@ -1455,11 +1860,15 @@ index 2632ae3..662e7f1 100644
 +// GGML_REPACK_CHUNKS sets work chunks per thread (default 4)
 +static const int g_gemv_nobar    = getenv("GGML_GEMV_NOBAR") ? atoi(getenv("GGML_GEMV_NOBAR")) : 0;
 +static const int g_repack_chunks = getenv("GGML_REPACK_CHUNKS") ? atoi(getenv("GGML_REPACK_CHUNKS")) : 4;
++static const int g_split_rowq    = getenv("GGML_REPACK_SPLIT_ROWQ") ? atoi(getenv("GGML_REPACK_SPLIT_ROWQ")) : 0; // trilane (paired A/B: 0.5-1% slower, off)
++// trilane: cap a work chunk at this many KiB of weights (0 = off). With only nth*4 chunks, the 417 MB tied head of
++// Qwen3.5-2B came in 13 MB chunks (~1.3 ms each per thread), so threads finished the last node up to a chunk apart
++static const int g_repack_chunk_kb = getenv("GGML_REPACK_CHUNK_KB") ? atoi(getenv("GGML_REPACK_CHUNK_KB")) : 1024;
 +
  #if defined(__GNUC__)
  #pragma GCC diagnostic ignored "-Woverlength-strings"
  #endif
-@@ -4554,12 +4561,16 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
+@@ -4554,12 +4565,16 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
  
  template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
  
@@ -1477,7 +1886,7 @@ index 2632ae3..662e7f1 100644
                      return true;
                  }
              case GGML_OP_MUL_MAT_ID:
-@@ -4687,6 +4698,33 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+@@ -4687,6 +4702,33 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
  
          const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
  
@@ -1511,12 +1920,43 @@ index 2632ae3..662e7f1 100644
          // INFO: Quantization is done in planes to avoid extra complexity in chunking.
          // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
          // the planes are broadcast.
-@@ -4711,7 +4749,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+@@ -4700,8 +4742,24 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+             }
+ 
+             const int64_t i11_processed = ne11 - ne11 % 4;
+-            for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
+-                from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
++            if (g_split_rowq && !(params->ab_off & GGML_CPU_AB_ROWQ) && i11_processed == 0 && ne10 % ggml_blck_size(PARAM_TYPE) == 0) {
++                // trilane: fewer than 4 rows (single-token decode): split each row's quantization blocks across
++                // threads instead of leaving the whole row to thread 0 while the others wait at the barrier.
++                // Quantization blocks are independent, so the bytes are identical.
++                const int64_t bs  = ggml_blck_size(PARAM_TYPE);
++                const int64_t nbk = ne10 / bs;
++                const int64_t b0  = (ith * nbk) / nth;
++                const int64_t b1  = ((ith + 1) * nbk) / nth;
++                for (int64_t i11 = 0; i11 < ne11; i11++) {
++                    if (b1 > b0) {
++                        from_float((float *) (data_ptr + i11 * nb11) + b0 * bs,
++                                   (void *) (wdata_ptr + i11 * nbw1 + b0 * ggml_type_size(PARAM_TYPE)), (b1 - b0) * bs);
++                    }
++                }
++            } else {
++                for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
++                    from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
++                }
+             }
+         }
+ 
+@@ -4711,7 +4769,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
          // 4x chunks per thread
          const int64_t nr0 = ggml_nrows(op->src[0]);
  
 -        int     nth_scaled  = nth * 4;
-+        int     nth_scaled  = nth * g_repack_chunks;
++        int64_t nth_scaled  = nth * ((params->ab_off & GGML_CPU_AB_CHUNKS) ? 4 : g_repack_chunks);
++        if (g_repack_chunk_kb > 0 && !(params->ab_off & GGML_CPU_AB_BIGCHUNK)) {
++            const int64_t wbytes = (int64_t) ggml_row_size(src0->type, ne00) * nr0;
++            nth_scaled = std::max<int64_t>(nth_scaled, wbytes / ((int64_t) g_repack_chunk_kb * 1024));
++        }
          int64_t chunk_size0 = (nr0 + nth_scaled - 1) / nth_scaled;
          int64_t nchunk0     = (nr0 + chunk_size0 - 1) / chunk_size0;
  
@@ -6139,6 +6579,159 @@ index 3af6e22..1cb18ae 100644
      // Get the default chat template. Returns nullptr if not available
      // If name is NULL, returns the default chat template
      LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..f0c71bd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1504,6 +1504,58 @@ bool llama_context::set_adapter_cvec(
+     return res;
+ }
+ 
++// trilane: LLAMA_DECODE_PROF=N prints the average host-side time split of single-token llama_decode calls every N calls
++static int     g_dprof_every = -1;
++static bool    g_dprof_on    = false;
++static int64_t g_dprof_prev  = 0;
++static int64_t g_dprof_end   = 0;
++static int64_t g_dprof_n     = 0;
++static int64_t g_dprof_us[12];
++static const char * g_dprof_name[12] = {
++    "outside llama_decode", "batch init", "sched_reserve+memory_update", "memory init_batch", "output_reserve+samplers",
++    "mctx apply+graph reuse/build+alloc", "set_inputs", "graph_compute (sched+cpu graph)", "logits/outputs extract", "output mapping", "", "" };
++static void dprof_mark(int k) {
++    if (!g_dprof_on) {
++        return;
++    }
++    const int64_t t = ggml_time_us();
++    g_dprof_us[k] += t - g_dprof_prev;
++    g_dprof_prev = t;
++}
++static void dprof_begin(bool single_token) {
++    if (g_dprof_every < 0) {
++        const char * e = getenv("LLAMA_DECODE_PROF");
++        g_dprof_every = e ? atoi(e) : 0;
++    }
++    g_dprof_on = g_dprof_every > 0 && single_token;
++    if (!g_dprof_on) {
++        g_dprof_end = 0;
++        return;
++    }
++    const int64_t t = ggml_time_us();
++    if (g_dprof_end > 0) {
++        g_dprof_us[0] += t - g_dprof_end;
++    }
++    g_dprof_prev = t;
++}
++static void dprof_end() {
++    if (!g_dprof_on) {
++        return;
++    }
++    dprof_mark(9);
++    g_dprof_end = g_dprof_prev;
++    if (++g_dprof_n % g_dprof_every == 0) {
++        double tot = 0;
++        for (int k = 1; k < 10; k++) {
++            tot += g_dprof_us[k];
++        }
++        fprintf(stderr, "[decode-prof] %lld single-token decodes: inside llama_decode %.4f ms/token\n", (long long) g_dprof_n, tot / 1000.0 / g_dprof_n);
++        for (int k = 0; k < 10; k++) {
++            fprintf(stderr, "[decode-prof]   %-36s %.4f ms\n", g_dprof_name[k], g_dprof_us[k] / 1000.0 / (k == 0 ? std::max<int64_t>(1, g_dprof_n - 1) : g_dprof_n));
++        }
++    }
++}
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+@@ -1557,6 +1609,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         gf_res_prev_active = res;
+     }
+ 
++    dprof_mark(5);
++
+     // set the input data for the input tensors
+     {
+         //const auto t_start_us = ggml_time_us();
+@@ -1567,6 +1621,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
++    dprof_mark(6);
++
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+@@ -1574,6 +1630,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
++    dprof_mark(7);
++
+     ret = GGML_STATUS_SUCCESS;
+ 
+     return res;
+@@ -1876,6 +1934,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         }
+     }
+ 
++    dprof_begin(batch_inp.tokens.size() == 1);
++
+     if (!balloc->init(batch_inp, vocab, output_all)) {
+         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+         return -1;
+@@ -1884,6 +1944,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+     const uint32_t n_outputs_all = balloc->get_n_outputs();
+ 
++    dprof_mark(1);
++
+     if (output_all) {
+         // require that all tokens are output
+         if (n_outputs_all != n_tokens_all) {
+@@ -1919,6 +1981,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     // handle any pending shifts/copies
+     memory_update(false);
+ 
++    dprof_mark(2);
++
+     llama_memory_context_ptr mctx;
+ 
+     while (true) {
+@@ -1964,6 +2028,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         break;
+     }
+ 
++    dprof_mark(3);
++
+     // reserve output buffer
+     if (output_reserve(n_outputs_all) < n_outputs_all) {
+         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+@@ -1978,6 +2044,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
++    dprof_mark(4);
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
+@@ -2162,6 +2230,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+         n_outputs_prev += n_outputs;
+         n_tokens_prev  += ubatch.n_tokens;
++
++        dprof_mark(8);
+     } while (mctx->next());
+ 
+     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+@@ -2214,6 +2284,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         }
+     }
+ 
++    dprof_end();
++
+     // wait for the computation to finish (automatically done when obtaining the model output)
+     //synchronize();
+ 
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 2bc3a29..d12543c 100644
 --- a/src/llama-graph.cpp

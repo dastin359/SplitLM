@@ -39,7 +39,7 @@ Each row is a same-session A/B against the build before the change, with greedy 
 | All NPU fixes merged, vs stock NPU kernels at the same 2048-token batches | LFM2.5-24B-A2B | 537 → 651 t/s (**+21%**); 672 t/s with 4096-token batches | see Limitations |
 | Short-conv time tiles and matrix-unit queue polling during the recurrent-state scan | Qwen3.5-2B | NPU prefill at 4096 tokens 1,643 → 1,721 t/s (**+4.8%**); conv block 127 → 80 ms per 2048-token batch | identical text and perplexity |
 | In-place recurrent state (no per-token state copy) | Qwen3.5-2B | CPU decode 60.3 → 63.4 t/s (**+5%**) | identical text |
-| Single-token decode overhead: recurrent-state update fused with its copy, row-split CONCAT, 108 barriers per token elided between single-thread nodes | Qwen3.5-2B | CPU decode median 56.3 → 57.4 t/s (**+1.8%**), best 60.0 → 61.4 (+2.3%); state update 1.06 → 0.47 ms per token (interleaved runs on a throttling machine) | identical text and perplexity |
+| Single-token decode overhead: recurrent-state update fused with its copy, row-split CONCAT, barrier elision, repacked GEMV chunks capped at 1 MiB (the Q6_K head no longer finishes up to 13 MB apart across threads) | Qwen3.5-2B | CPU decode 59.2 → 65.6 t/s (**+10.8%**); after a 4096-token context 50.0 → 53.8 t/s (**+7.6%**) | identical text and perplexity |
 | Speculative decoding with the model's MTP head, 3 drafted tokens | Qwen3.8-27B | decode 5.0-5.3 → 8.7-8.9 t/s (**1.7×**), 67% accepted | identical text |
 
 
