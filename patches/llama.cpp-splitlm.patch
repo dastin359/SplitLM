@@ -2593,10 +2593,10 @@ index 59a0575..cef2ccc 100644
          case HTP_TYPE_F16:
              return execute_op_activations_f16(octx);
 diff --git a/ggml/src/ggml-hexagon/htp/flash-attn-ops.c b/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
-index a0473c1..a97ff5d 100644
+index a0473c1..5bd2ed3 100644
 --- a/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
-@@ -1058,10 +1058,102 @@ typedef struct {
+@@ -1058,10 +1058,146 @@ typedef struct {
      const struct htp_tensor * mask;
      const __fp16 *            mask_vtcm;             // VTCM mask buffer base (NULL = DDR fallback)
      size_t                    mask_vtcm_row_stride;  // elements (__fp16) per row in VTCM mask buffer
@@ -2696,11 +2696,55 @@ index a0473c1..a97ff5d 100644
 +    *rowmax1_out = v_s_rowmax1;
 +}
 +
++// exp2 of the HMX softmax P values: hvx_vec_exp2_f16 with a degree-4 polynomial for 2^f instead of the
++// degree-6 Taylor one (8 instead of 12 qf16 ops per vector). Coefficients are a relative-error minimax fit
++// over f in [-0.5, 1] (covers the range reduction below for either rounding of the hf->h conversion),
++// quantized to fp16 one at a time: max relative error 5.4e-5 vs 1.5e-4 for the fp16 Taylor coefficients.
++static inline __attribute__((always_inline)) HVX_Vector fa_exp2_f16(HVX_Vector x_v) {
++    const HVX_Vector zero_v    = Q6_V_vzero();
++    const HVX_Vector half_hf_v = Q6_Vh_vsplat_R(0x3800);  // fp16 0.5
++
++    x_v = Q6_Vhf_vmax_VhfVhf(hvx_vec_splat_f16(-24.0f), x_v);
++
++    HVX_Vector x_minus_half = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(x_v, half_hf_v));
++    HVX_Vector k_v          = Q6_Vh_equals_Vhf(x_minus_half);
++    HVX_Vector f_v          = Q6_Vhf_equals_Vh(k_v);
++    HVX_Vector x_qf16       = Q6_Vqf16_vsub_VhfVhf(x_v, f_v);
++
++    HVX_Vector y = Q6_Vqf16_vmpy_Vqf16Vhf(x_qf16, Q6_Vh_vsplat_R(0x212a));  // c4 * x
++    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x2b46));        // + c3
++    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
++    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x33af));        // + c2
++    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
++    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x398b));        // + c1
++    y            = Q6_Vqf16_vmpy_Vqf16Vqf16(y, x_qf16);
++    y            = Q6_Vqf16_vadd_Vqf16Vhf(y, Q6_Vh_vsplat_R(0x3c00));        // + 1.0
++
++    y                          = Q6_Vhf_equals_Vqf16(y);
++    HVX_Vector y_exp           = Q6_Vuh_vlsr_VuhR(Q6_Vh_vasl_VhR(y, 1), 11);
++    y_exp                      = Q6_Vh_vadd_VhVh(k_v, y_exp);
++    HVX_VectorPred q_underflow = Q6_Q_vcmp_gt_VhVh(zero_v, y_exp);
++    y                          = Q6_Vh_vaslacc_VhVhR(y, k_v, 10);
++    return Q6_V_vmux_QVV(q_underflow, zero_v, y);
++}
++
++// acc (qf32) += sum of the 64 fp16 values of p_hf over both fp32 halves. Before v79 the widening multiply
++// gives qf32 halves: add them as qf32 instead of converting each half to sf first (2 fewer ops per vector).
++static inline __attribute__((always_inline)) HVX_Vector fa_rowsum_acc(HVX_Vector acc, HVX_Vector p_hf) {
++#if __HVX_ARCH__ >= 79
++    const HVX_VectorPair vp = hvx_vec_f16_to_f32_shuff(p_hf);
++    return Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp), Q6_V_hi_W(vp)));
++#else
++    const HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(p_hf, hvx_vec_splat_f16(1.0));
++    return Q6_Vqf32_vadd_Vqf32Vqf32(acc, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp), Q6_V_hi_W(vp)));
++#endif
++}
++
 +static inline __attribute__((always_inline)) void fa_softmax_impl(
      unsigned int n, unsigned int i, void * data,
      const bool has_mask,
      const bool mask_broadcast,
-@@ -1125,6 +1217,9 @@ static inline void fa_softmax_impl(
+@@ -1125,6 +1261,9 @@ static inline void fa_softmax_impl(
              const __fp16 * s_ld_base = factx->vtcm_s_tiles[args->buf_idx] + r0 * HMX_FP16_TILE_N_ROWS * Bc;
              __fp16 *       p_st_base = factx->vtcm_p_tiles[args->buf_idx] + r0 * HMX_FP16_TILE_N_ROWS * Bc;
  
@@ -2710,7 +2754,7 @@ index a0473c1..a97ff5d 100644
              // Decode 2 rows from S tiles into per-thread row buffers
              if (has_softcap) {
                  const HVX_Vector v_cap = hvx_vec_splat_f16(factx->logit_softcap);
-@@ -1144,7 +1239,7 @@ static inline void fa_softmax_impl(
+@@ -1144,7 +1283,7 @@ static inline void fa_softmax_impl(
                      HVX_Vector t1   = hvx_vec_tanh_f16(v_s_row1);
                      my_row_buf1[ci] = hvx_vec_mul_f16_f16(t1, v_cap);
                  }
@@ -2719,7 +2763,7 @@ index a0473c1..a97ff5d 100644
                  size_t c = 0;
                  for (; c + 64 < kv_rows; c += 128) {
                      size_t             ci0       = c / 64;
-@@ -1188,7 +1283,50 @@ static inline void fa_softmax_impl(
+@@ -1188,7 +1327,50 @@ static inline void fa_softmax_impl(
  
              HVX_Vector v_s_rowmax0 = v_neg_inf;
              HVX_Vector v_s_rowmax1 = v_neg_inf;
@@ -2771,7 +2815,66 @@ index a0473c1..a97ff5d 100644
                  for (size_t c = 0; c < kv_rows; c += 64) {
                      size_t         ci          = c / 64;
                      const size_t   ne          = hex_smin(kv_rows - c, 64);
-@@ -1820,6 +1958,179 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor
+@@ -1328,10 +1510,10 @@ static inline void fa_softmax_impl(
+                 HVX_Vector v_s_minus_m0_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci1], v_dup_m0);
+                 HVX_Vector v_s_minus_m1_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci1], v_dup_m1);
+ 
+-                HVX_Vector v_p_row0_hf_0  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_0));
+-                HVX_Vector v_p_row1_hf_0  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_0));
+-                HVX_Vector v_p_row0_hf_1  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_1));
+-                HVX_Vector v_p_row1_hf_1  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_1));
++                HVX_Vector v_p_row0_hf_0  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_0));
++                HVX_Vector v_p_row1_hf_0  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_0));
++                HVX_Vector v_p_row0_hf_1  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_1));
++                HVX_Vector v_p_row1_hf_1  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_1));
+ 
+                 __fp16 *     out_dtile0  = p_st_base + ci0 * HMX_FP16_TILE_N_ELMS * 2;
+                 __fp16 *     out_dtile1  = p_st_base + ci1 * HMX_FP16_TILE_N_ELMS * 2;
+@@ -1348,23 +1530,18 @@ static inline void fa_softmax_impl(
+                 *pv_p_out0_1               = Q6_V_lo_W(vp_p_dual1);
+                 *pv_p_out1_1               = Q6_V_hi_W(vp_p_dual1);
+ 
+-                HVX_VectorPair vp_p0_0 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf_0);
+-                HVX_VectorPair vp_p1_0 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf_0);
+-                HVX_VectorPair vp_p0_1 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf_1);
+-                HVX_VectorPair vp_p1_1 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf_1);
+-
+-                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0_0), Q6_V_hi_W(vp_p0_0)));
+-                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0_1), Q6_V_hi_W(vp_p0_1)));
+-                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1_0), Q6_V_hi_W(vp_p1_0)));
+-                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1_1), Q6_V_hi_W(vp_p1_1)));
++                v_p_rowsum0 = fa_rowsum_acc(v_p_rowsum0, v_p_row0_hf_0);
++                v_p_rowsum0 = fa_rowsum_acc(v_p_rowsum0, v_p_row0_hf_1);
++                v_p_rowsum1 = fa_rowsum_acc(v_p_rowsum1, v_p_row1_hf_0);
++                v_p_rowsum1 = fa_rowsum_acc(v_p_rowsum1, v_p_row1_hf_1);
+             }
+             for (size_t c_rem = c; c_rem < kv_rows; c_rem += 64) {
+                 size_t     ci           = c_rem / 64;
+                 HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci], v_dup_m0);
+                 HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci], v_dup_m1);
+ 
+-                HVX_Vector v_p_row0_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0));
+-                HVX_Vector v_p_row1_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1));
++                HVX_Vector v_p_row0_hf  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0));
++                HVX_Vector v_p_row1_hf  = fa_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1));
+                 __fp16 *     out_dtile  = p_st_base + ci * HMX_FP16_TILE_N_ELMS * 2;
+                 HVX_Vector * pv_p_out0  = ((HVX_Vector *) out_dtile) + r1 / 2;
+                 HVX_Vector * pv_p_out1  = pv_p_out0 + 16;
+@@ -1373,11 +1550,8 @@ static inline void fa_softmax_impl(
+                 *pv_p_out0               = Q6_V_lo_W(vp_p_dual);
+                 *pv_p_out1               = Q6_V_hi_W(vp_p_dual);
+ 
+-                HVX_VectorPair vp_p0 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf);
+-                HVX_VectorPair vp_p1 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf);
+-
+-                v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0), Q6_V_hi_W(vp_p0)));
+-                v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1), Q6_V_hi_W(vp_p1)));
++                v_p_rowsum0 = fa_rowsum_acc(v_p_rowsum0, v_p_row0_hf);
++                v_p_rowsum1 = fa_rowsum_acc(v_p_rowsum1, v_p_row1_hf);
+             }
+ 
+             HVX_Vector rowsum0_sf = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(v_p_rowsum0));
+@@ -1820,6 +1994,179 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor
      }
  }
  
@@ -2951,7 +3054,7 @@ index a0473c1..a97ff5d 100644
  // ============================================================================
  // Core HMX flash attention algorithm (GQA-merged)
  // ============================================================================
-@@ -1913,6 +2224,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -1913,6 +2260,13 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
      const bool pipeline = factx.pipeline;
      const uint32_t n_threads = factx.n_threads;
      const uint32_t G = factx.G;
@@ -2965,7 +3068,7 @@ index a0473c1..a97ff5d 100644
  
      // Multi-device: prefer head-parallel partitioning (each core owns a disjoint head
      // shard), falling back to Q-block (token) split when heads don't divide evenly.
-@@ -2065,6 +2383,24 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2065,6 +2419,24 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
              const size_t   g_br_actual = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS);
              const size_t   n_row_tiles = g_br_actual / HMX_FP16_TILE_N_ROWS;
  
@@ -2990,7 +3093,7 @@ index a0473c1..a97ff5d 100644
              for (uint32_t kv_head = kv_head_min; kv_head < kv_head_max; ++kv_head) {
                  const uint32_t ik2 = kv_head;
                  const uint32_t ik3 = fastdiv(ib3, &kparams->broadcast_rk3);
-@@ -2125,28 +2461,29 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2125,28 +2497,29 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                      hmx_fa_o_update_job_t ou_job[2];
  
                      // Prefetch block 1 early if there are multiple blocks
@@ -3025,7 +3128,7 @@ index a0473c1..a97ff5d 100644
                          const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
  
                          // ---- 1. Pop and run V-prep for current block ----
-@@ -2179,8 +2516,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2179,8 +2552,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                              ou_job[prev_buf].d_tiles     = factx.vtcm_d_tiles[prev_buf];
                              ou_job[prev_buf].hmx_scales  = factx.vtcm_hmx_scales_id;
                              ou_job[prev_buf].n_row_tiles = n_row_tiles;
@@ -3035,7 +3138,7 @@ index a0473c1..a97ff5d 100644
                              ou_job[prev_buf].n_row_tiles_g_br = n_row_tiles_g_br;
                              ou_job[prev_buf].n_tiles_per_bc   = n_tiles_per_bc;
                              ou_job[prev_buf].DV               = DV_pad;
-@@ -2188,9 +2524,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2188,9 +2560,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                          }
  
                          // ---- 4. Pop and run K-prep for next block & push next QK-dot ----
@@ -3047,7 +3150,7 @@ index a0473c1..a97ff5d 100644
                              const size_t   next_buf   = 1 - buf_idx;
  
                              void * next_k = (void *) dma_queue_pop(dma_q).dst;
-@@ -2232,6 +2568,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2232,6 +2604,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                          sargs.mask_vtcm            = current_mask_vtcm;
                          sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                          sargs.slopes               = factx.vtcm_slopes;
@@ -3055,7 +3158,7 @@ index a0473c1..a97ff5d 100644
  
                          // Run Softmax on HVX (blocking call)
                          fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
-@@ -2243,7 +2580,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2243,7 +2616,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                          }
  
                          // Prefetch block kv_blk + 2
@@ -3064,7 +3167,7 @@ index a0473c1..a97ff5d 100644
                              fa_prefetch_block(dma_q, k, v, mask, kv_blk + 2, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                                ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, buf_idx, &factx);
                          }
-@@ -2252,9 +2589,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2252,9 +2625,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                      }
  
                      // Epilogue
@@ -3077,7 +3180,7 @@ index a0473c1..a97ff5d 100644
                          ou_job[0].o_curr           = o_tile_curr;
                          ou_job[0].o_prev           = o_tile_prev;
                          ou_job[0].p_tiles          = factx.vtcm_p_tiles[1 - buf_idx];
-@@ -2279,21 +2616,21 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2279,21 +2652,21 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
  
                  } else {
                      // Fallback path
@@ -3104,7 +3207,7 @@ index a0473c1..a97ff5d 100644
                              const uint32_t  prefetch_start = (kv_blk + 1) * Bc;
                              const uint32_t  prefetch_rows  = hex_smin(Bc, nek1 - prefetch_start);
                              const size_t    prefetch_buf   = 1 - buf_idx;
-@@ -2356,6 +2693,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2356,6 +2729,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                          sargs.mask_vtcm            = current_mask_vtcm;
                          sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                          sargs.slopes               = factx.vtcm_slopes;
@@ -3112,7 +3215,7 @@ index a0473c1..a97ff5d 100644
                          fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
  
                          {
-@@ -2372,7 +2710,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2372,7 +2746,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                              ou_job.DV               = DV_pad;
  
                              hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_fa_o_update_worker, &ou_job));
@@ -3121,7 +3224,7 @@ index a0473c1..a97ff5d 100644
                                  // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                                  htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
                                  fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br, kv_head, n_rows_g);
-@@ -2455,6 +2793,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2455,6 +2829,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                  // ---- Store O block ----
                  fa_phase_o_store(&factx, dst, o_tile_curr, q_start, kv_head, ib3, n_rows_g);
              }
