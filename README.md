@@ -43,6 +43,8 @@ Each row is a same-session A/B against the build before the change, with greedy 
 | Speculative decoding with the model's MTP head, 3 drafted tokens | Qwen3.8-27B | decode 5.0-5.3 → 8.7-8.9 t/s (**1.7×**), 67% accepted | identical text |
 
 
+**All kernel work combined** (final build vs the morning snapshot, same session): Qwen3.5-2B NPU prefill at 4096 tokens 1,638 → 1,835 t/s (**+12%**), LFM2.5-24B-A2B 665 → 874 t/s (**+32%**), Qwen3.5-2B CPU decode 62.4 → 68.1 t/s (**+9%**) and, after a 4096-token context, 54.0 → 64.2 t/s (**+19%**); greedy text identical on the 2B.
+
 ### Bigger models
 
 | Model | Result |
@@ -58,10 +60,10 @@ Qualcomm AI Hub's "optimized" Qwen3.5-2B is byte-identical to the GGUF used here
 
 | Phase | Model | Now | % of ceiling |
 |---|---|---|---|
-| NPU prefill, 4096 tokens | Qwen3.5-2B | 1,721 t/s = 4.7 TFLOPS (2048-token batches) | 41% of 11.48 TFLOPS |
-| NPU prefill, 4096 tokens | LFM2.5-24B-A2B | 831 t/s = 3.6 TFLOPS | 32% (26% before the pipelined expert kernel) |
+| NPU prefill, 4096 tokens | Qwen3.5-2B | 1,835 t/s = 5.0 TFLOPS (2048-token batches) | 44% of 11.48 TFLOPS |
+| NPU prefill, 4096 tokens | LFM2.5-24B-A2B | 874 t/s = 3.8 TFLOPS | 33% (23% with stock kernels) |
 | NPU prefill, 4096 tokens | Qwen3.8-27B | 105 t/s = 5.2 TFLOPS (stock NPU kernels, 512-token batches; not re-measured) | 45% |
-| CPU decode after 4096 tokens (llama-bench, CPU only) | Qwen3.5-2B | 55.4 t/s = 67 GB/s of weights | 61% of ~110 GB/s |
+| CPU decode after 4096 tokens (llama-bench, CPU only) | Qwen3.5-2B | 64.2 t/s = 77 GB/s of weights | 70% of ~110 GB/s (74% from an empty context, 68.1 t/s) |
 
 TFLOPS = t/s × 2 × active matmul weights per token (2.75 / 4.38 / 49.45 GFLOP; attention and output head excluded). The ceilings come from measurement, not datasheets: inside a matrix job the NPU sustains 3,809-3,982 FP16 MACs per cycle at 1.40 GHz, which we round up to a 4,096-MAC peak (11.48 TFLOPS); the best DRAM read loop reaches ~110 GB/s (135 GB/s theoretical).
 
@@ -136,7 +138,7 @@ $env:ADSP_LIBRARY_PATH = "$PWD\..\lib"
 
 ## Limitations
 
-- In the current build, Qwen3.5-2B decode after an NPU handoff measured 43.1 t/s vs 49.5 t/s for a CPU-prefilled sequence at 3,328 tokens (an earlier build: 51.2 vs 51.2). Not yet explained.
+- Qwen3.5-2B decode after an NPU handoff still runs slower than decode of a CPU-prefilled sequence: 54.7 vs 63.7 t/s after a 4,092-token prompt in the final build (an earlier build measured 51.2 on both). Not yet explained.
 - Single-copy aliasing covers Q4_0 weights only, because the CPU tile kernel reads Q4_0 tiles. Other formats the NPU tiles (Q4_1, Q8_0, K-quants, IQ4_NL, MXFP4) keep a separate CPU copy, and formats the NPU cannot run (e.g. IQ3_S) stay on the CPU.
 - Speculative decoding runs in `trilane-spec` (one stream); the multi-slot server does not draft yet.
 - The fork's NPU kernels shift LFM2.5's logits slightly against stock (KLD 0.006; perplexity +0.66% ± 0.3% on 8 wikitext chunks, +0.35% on 16). Disabling the new fusions one at a time does not remove the shift, so the cause is unresolved. Qwen3.5-2B is unchanged (perplexity ratio 1.0008). The causal key-block skip changes LFM2.5's greedy text after a few tokens (a no-op update that rounds fp16 differently; perplexity identical; `GGML_HEXAGON_FA_KV_SKIP=0` restores it).
