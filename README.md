@@ -132,6 +132,8 @@ $env:ADSP_LIBRARY_PATH = "$PWD\..\lib"
 
 `--bench N` runs a ~1.3N-token prompt through the split, NPU-only and CPU-only routes plus a cached follow-up, without HTTP (`-ub 1024` matches the Qwen3.5-2B runs; models over 3 GiB default to 4096-token batches). API: `POST /v1/chat/completions` (OpenAI format, `stream: true` for SSE); an optional `"trilane": {"route": "auto" | "split" | "npu" | "cpu"}` forces a route. `GET /stats` returns routing, cache, slots and per-request timings. The binaries keep the project's working name, `trilane`.
 
+`--prefill-model <file.gguf>` loads a separate GGUF of the same model for the NPU lane (the CPU lane keeps `-m`). `scripts/make-prefill-gguf.py` writes one with the FFN gate/up weights stored as the exact fp16 dequantization of the Q4_0 weights, which skips the HVX dequantization of those matmuls and lets the SWIGLU run in their epilogue. On Qwen3.5-2B (1.93 GiB file instead of 1.12): NPU prefill pp4096 +2.6-3.4% at ub512-2048, split-route TTFT at 4,092 tokens 2.55-2.60 s -> 2.48 s, PPL 13.8503 -> 13.8514, same short greedy text. It needs the llama.cpp change that fuses the SWIGLU only for unquantized gate/up weights. Weight aliasing is off with a separate prefill file, and NPU decode slots get slower with it (21 vs 29 t/s), since they read the larger fp16 weights.
+
 ## Limitations
 
 - In the current build, Qwen3.5-2B decode after an NPU handoff measured 43.1 t/s vs 49.5 t/s for a CPU-prefilled sequence at 3,328 tokens (an earlier build: 51.2 vs 51.2). Not yet explained.

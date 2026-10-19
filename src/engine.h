@@ -22,6 +22,8 @@ namespace trilane {
 
 struct engine_params {
     std::string model;
+    std::string prefill_model;          // optional separate GGUF for the NPU prefill lane (same architecture, e.g.
+                                        // the model with fp16 FFN weights); "" = prefill from `model`
     std::string prefill_dev = "HTP0";  // NPU device(s) for prefill; "CPU" disables the NPU lane
     int    threads_decode   = 8;
     int    threads_prefill  = 4;       // host threads of the prefill context
