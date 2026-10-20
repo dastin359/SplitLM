@@ -336,8 +336,8 @@ static int run_draft_model(const args & a, llama_context * cp, llama_context * c
     printf("\ndraft length histogram:");
     for (int i = 0; i < (int) k_hist.size(); i++) if (k_hist[i]) printf("  %d:%d", i, k_hist[i]);
     if (a.adaptive) printf(" | alpha estimate %.3f", tuner.alpha());
-    if (a.spec_async) printf("\ndraft-ahead: %d launches, %d full hits (%.1f%%), %d ahead tokens used", da.n_launch, da.n_hit,
-                             da.n_launch ? 100.0 * da.n_hit / da.n_launch : 0.0, da.n_tokens_used);
+    if (a.spec_async) printf("\ndraft-ahead: %d launches, %d full hits (%.1f%%, %d steps drafted for free), %d ahead tokens used", da.n_launch, da.n_hit,
+                             da.n_launch ? 100.0 * da.n_hit / da.n_launch : 0.0, n_hit_steps, da.n_tokens_used);
     printf("\n");
     if (a.check) printf("--- text ---\n%s\n--- end ---\n", out.c_str());
     fflush(stdout);
