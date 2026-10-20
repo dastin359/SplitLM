@@ -38,7 +38,7 @@ struct engine_params {
     bool   alias_experts    = true;    // CPU decode reads the NPU's copy of the weights in place when memory requires it
     bool   calibrate        = true;    // measure both lanes at startup and derive the routing threshold
     bool   threadpool       = true;    // persistent decode threads (else ggml spawns a thread pool for every decode step)
-    int    prio             = 0;       // decode thread priority: 0 normal, 1 medium, 2 high, 3 realtime
+    int    prio             = 2;       // decode thread priority: 0 normal, 1 medium, 2 high (default), 3 realtime
 };
 
 // prefill cost model per lane: t(n) = fixed_ms + n / tps * 1000
