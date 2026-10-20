@@ -7,7 +7,8 @@
 //   --draft-model F --spec-type draft-model   greedy drafting on a separate draft model (own loop, no re-evaluation),
 //                                             draft context on --draft-dev CPU|HTP0|GPUOpenCL
 //   --draft-model F --spec-type draft-simple|draft-dflash|draft-eagle3|draft-mtp   llama.cpp common drafters
-//   --draft-head N[:T]   draft LM head over the first N token ids + last T ids (llama_set_draft_head)
+//   --draft-head N[:T]   draft LM head over the first N token ids + last T ids (llama_set_draft_head); default for
+//                        draft-mtp / draft-model with a vocabulary >= 128K: 65536:256 (--draft-head 0 = full head)
 //   --spec-async         draft-model mode: keep drafting on the draft context while the target verifies
 //   --adaptive           pick the draft length online (acceptance estimate x measured draft/verify times)
 
@@ -51,7 +52,7 @@ struct args {
     std::string draft_model;        // --draft-model: separate draft GGUF (small model, mtp-*.gguf, dflash-*.gguf)
     std::string draft_dev = "CPU";  // --draft-dev: device of the draft context
     int draft_threads = 0;          // --draft-threads: CPU threads of the draft context (0 = -t)
-    int draft_head_n = 0, draft_head_tail = 256; // --draft-head N[:T]
+    int draft_head_n = -1, draft_head_tail = 256; // --draft-head N[:T]; -1 = auto (see apply_draft_head)
     bool spec_async = false;        // --spec-async
     bool adaptive = false;          // --adaptive
     bool draft_prefill_overlap = true; // --no-draft-overlap: draft prompt after (not during) the NPU prefill
@@ -165,12 +166,24 @@ static std::vector<std::string> exact_name_patterns(const std::vector<std::strin
 }
 
 // ---- spec2: draft-model speculation with our own loop (draft context on any device, optional draft-ahead) ----
+// Pruned draft head (measured, identical text): 27B MTP k3 10.7 -> 12.2 t/s, 2B MTP k3 66.9 -> 83.0 t/s. Auto: large
+// vocabularies (Qwen 248K) on the MTP / draft-model drafters; other drafters and small vocabularies keep the full head.
+static void apply_draft_head(const args & a, llama_context * c) {
+    int n = a.draft_head_n;
+    if (n < 0) {
+        const int nv = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(c)));
+        n = (nv >= 131072 && (a.spec_type == "draft-mtp" || a.spec_type == "draft-model")) ? 65536 : 0;
+    }
+    if (n > 0) llama_set_draft_head(c, n, a.draft_head_tail);
+    fprintf(stderr, "[spec2] draft head: %s\n", n > 0 ? (std::to_string(n) + ":" + std::to_string(a.draft_head_tail)).c_str() : "full");
+}
+
 // Invariants: the target context cd holds committed[0..n_tgt-1]; committed.back() is id_last (not yet in cd).
 // The draft context holds dr.dtoks (reconciled with committed before each fresh draft, see spec_draft.h).
 static int run_draft_model(const args & a, llama_context * cp, llama_context * cd, llama_context * cdr,
                            const llama_model * md, const std::vector<llama_token> & inp, int n_alias) {
     const llama_vocab * vocab = llama_model_get_vocab(md);
-    if (a.draft_head_n > 0) llama_set_draft_head(cdr, a.draft_head_n, a.draft_head_tail);
+    apply_draft_head(a, cdr);
 
     // rollback support of the target: bounded snapshots (n_rs_seq) or full checkpoints; probing clears the memory
     const bool use_ckpt_tgt = common_context_can_seq_rm(cd) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -600,7 +613,7 @@ int main(int argc, char ** argv) {
             if (!cm) { fprintf(stderr, "failed to create MTP context\n"); return 1; }
             sp.draft.ctx_dft = cm;
         }
-        if (cm && a.draft_head_n > 0) llama_set_draft_head(cm, a.draft_head_n, a.draft_head_tail);
+        if (cm) apply_draft_head(a, cm);
         spec = common_speculative_init(sp, 1);
         if (!spec) { fprintf(stderr, "failed to init speculative decoding\n"); return 1; }
     }
