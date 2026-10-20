@@ -12,7 +12,45 @@
 #include <cstring>
 #include <sstream>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace trilane {
+
+// The decode thread pool runs graph worker 0 on the thread that calls llama_decode (cpu_worker), but ggml sets
+// priority and turns off Windows power throttling (EcoQoS) only for its own workers and for the thread that created
+// the pool. Without this, worker 0 runs throttled at normal priority and the other workers wait for it at every
+// barrier (and run all single-thread nodes slower). TRILANE_WORKER0_PRIO=0 restores the old behaviour (together with
+// --prio 0, the old engine exactly).
+static bool worker0_fix_on() {
+    const char * e = getenv("TRILANE_WORKER0_PRIO");
+    return !(e && atoi(e) == 0);
+}
+
+static void decode_thread_like_pool(int prio) {
+#ifdef _WIN32
+    if (!worker0_fix_on()) return;
+    THREAD_POWER_THROTTLING_STATE t;
+    ZeroMemory(&t, sizeof(t));
+    t.Version     = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+    t.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+    t.StateMask   = 0;
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &t, sizeof(t));
+    int p = THREAD_PRIORITY_NORMAL;
+    switch (prio) {
+        case 1: p = THREAD_PRIORITY_ABOVE_NORMAL;  break;
+        case 2: p = THREAD_PRIORITY_HIGHEST;       break;
+        case 3: p = THREAD_PRIORITY_TIME_CRITICAL; break;
+        default: break;
+    }
+    if (p != THREAD_PRIORITY_NORMAL) SetThreadPriority(GetCurrentThread(), p);
+#else
+    (void) prio;
+#endif
+}
 
 // CPU_HTPTILE hooks exported by our ggml-cpu fork (see ggml/src/ggml-cpu/htp-tile.cpp)
 typedef void * (*htptile_resolver_t)(const char * name, const ggml_tensor * t, void * user);
@@ -244,7 +282,15 @@ bool engine::load(const engine_params & p) {
         if (tp_new) {
             ggml_threadpool_params tpp = ggml_threadpool_params_default(params_.threads_decode);
             tpp.prio = (enum ggml_sched_priority) params_.prio;
+#ifdef _WIN32
+            // ggml_threadpool_new also applies the pool priority to the calling thread (this one, which later runs
+            // the calibration, the HTTP server and the bench drivers). Only the decode threads should be raised.
+            const int main_prio = GetThreadPriority(GetCurrentThread());
+#endif
             tp_decode_ = tp_new(&tpp);
+#ifdef _WIN32
+            if (worker0_fix_on() && main_prio != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(GetCurrentThread(), main_prio);
+#endif
         }
         if (tp_decode_) llama_attach_threadpool(cd_, tp_decode_, nullptr);
         fprintf(stderr, "[trilane] decode thread pool: %s (%d threads, prio %d)\n", tp_decode_ ? "persistent" : "FAILED, per-step", params_.threads_decode, params_.prio);
@@ -671,6 +717,7 @@ void engine::npu_worker() {
 // CPU lane: continuous batching. Admit prefilled requests into free slots between steps, then decode
 // one token for every active slot in a single batch.
 void engine::cpu_worker() {
+    if (tp_decode_) decode_thread_like_pool(params_.prio); // per-step pools (--no-threadpool): unchanged
     const int S = params_.max_seqs;
     std::vector<request_ptr> slots(S);
     llama_batch b = llama_batch_init(S, 0, 1);
