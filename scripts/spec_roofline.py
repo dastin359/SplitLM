@@ -8,7 +8,9 @@ Model (greedy decoding, one stream):
   step time (async) = max(t_verify(k + 1) * (1 + contention), k * t_draft_tok_npu) on a hit,
                       plus k * t_draft_tok on a miss (hit = all k accepted and the draft guessed the bonus token)
   t_verify(n)       = dense_bytes / BW * f_dense(n) + expert_bytes(n) / BW
-  expert_bytes(n)   = per_expert_all_layers * E * (1 - (1 - p)^n)    (p fitted to measured LFM2.5 verify cost)
+  expert_bytes(n)   = per_expert_all_layers * min(E, top_k * (1 + r * (n - 1)))
+                      (each extra token brings r * top_k experts not yet loaded; r = 0.45 fits the measured LFM2.5
+                      verify costs 4 tokens 1.85x and 8 tokens 3.4x; uniform routing would give r ~ 0.94)
 All byte counts come from the GGUF tensor tables (bytes read per decoded token, embeddings excluded).
 
 Usage: python spec_roofline.py [--bw 82] [--csv]
@@ -31,13 +33,13 @@ def interp(table, n):
 
 
 TARGETS = {
-    # name: dense GB (incl. head, excl. embeddings), per-expert GB summed over MoE layers, n_expert, top_k, p_eff, small
-    "Qwen3.5-2B":      dict(dense=1.204, exp=0.0, E=0, K=0, p=0.0, small=True),
-    "Qwen3.8-27B":     dict(dense=15.065, exp=0.0, E=0, K=0, p=0.0, small=False),
-    # 40 MoE layers x 1.511 MB per expert; p = top_k/E x 0.61 (routing correlation fitted on LFM2.5)
-    "Qwen3.6-35B-A3B": dict(dense=2.015, exp=40 * 0.001511, E=256, K=8, p=8 / 256 * 0.61, small=False),
-    # 38 MoE layers x 5.308 MB; p fitted so that 4 tokens cost 1.85x and 8 tokens 3.4x (measured)
-    "LFM2.5-24B-A2B":  dict(dense=0.660, exp=38 * 0.005308, E=64, K=4, p=0.0381, small=False),
+    # name: dense GB (incl. head, excl. embeddings), per-expert GB summed over MoE layers, n_expert, top_k, r, small
+    "Qwen3.5-2B":      dict(dense=1.204, exp=0.0, E=0, K=0, r=0.0, small=True),
+    "Qwen3.8-27B":     dict(dense=15.065, exp=0.0, E=0, K=0, r=0.0, small=False),
+    # 40 MoE layers x 1.511 MB per expert; r assumed equal to LFM2.5's
+    "Qwen3.6-35B-A3B": dict(dense=2.015, exp=40 * 0.001511, E=256, K=8, r=0.45, small=False),
+    # 38 MoE layers x 5.308 MB; r fitted so that 4 tokens cost 1.85x and 8 tokens 3.4x (measured)
+    "LFM2.5-24B-A2B":  dict(dense=0.660, exp=38 * 0.005308, E=64, K=4, r=0.45, small=False),
 }
 
 # draft: GB per drafted token (sequential), fixed per-token overhead ms, alpha assumption (range)
@@ -65,7 +67,7 @@ def t_verify(tgt, n, bw):
     f = interp(F_SMALL if tgt["small"] else F_DENSE, n)
     t = tgt["dense"] / bw * f
     if tgt["E"]:
-        t += tgt["exp"] * tgt["E"] * (1 - (1 - tgt["p"]) ** n) / bw
+        t += tgt["exp"] * min(tgt["E"], tgt["K"] * (1 + tgt["r"] * (n - 1))) / bw
     return t * 1000.0  # ms
 
 
