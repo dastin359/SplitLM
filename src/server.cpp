@@ -59,7 +59,9 @@ static void usage() {
         "usage: trilane-server -m model.gguf [--prefill-model prefill.gguf] [--prefill-dev HTP0|CPU] [--host 127.0.0.1] [--port 8080]\n"
         "       [-t decode_threads] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [--keepwarm-ms 20] [--cpu-prefill-max 24] [--no-alias]\n"
         "       [--cache-mb 2048] [--slots 4] [--npu-decode-slots 0|1] [--ui path/to/index.html] [-v]\n"
-        "       [--prio 0-3] [--no-threadpool] [--bench-routes split,cpu,...]\n");
+        "       [--prio 0-3] [--no-threadpool] [--bench-routes split,cpu,...]\n"
+        "  --prio: decode thread priority 0 normal, 1 medium, 2 high (default), 3 realtime; 0 = old default\n"
+        "  env TRILANE_WORKER0_PRIO=0: decode thread (graph worker 0) keeps normal priority and throttling (old behaviour)\n");
     exit(1);
 }
 
