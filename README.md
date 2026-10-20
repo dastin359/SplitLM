@@ -22,7 +22,7 @@ Qwen3.5-2B Q4_0, one request with a 4096-token prompt and 128 generated tokens. 
 | NPU only | 1,614 t/s | 29.0 t/s | 2.54 s | 6.95 s |
 | **SplitLM: NPU prefill, CPU decode** | **1,614 t/s** | **55.4 t/s** | **2.54 s** | **4.85 s** |
 
-Rates are llama-bench at 4096 tokens (NPU with the engine's 1024-token batches); first-token and whole-request times are computed as prompt ÷ prefill + 128 ÷ decode. The split is 2.0× the default device choice, 2.5× CPU only and 1.4× NPU only. The SplitLM row assumes decode after the handoff runs at the CPU-only rate; in the engine's own end-to-end run on the current build (3,328-token prompt) it ran slower than a CPU-prefilled sequence, 43.1 vs 49.5 t/s, an open issue (an earlier build measured 51.2 on both). Measured end to end in that run: first token in 2.10 s vs 8.27 s CPU-only and 2.06 s NPU-only; whole request with 128 tokens about 5.1 s vs 10.9 s CPU-only and 6.4 s NPU-only.
+Rates are llama-bench at 4096 tokens (NPU with the engine's 1024-token batches); first-token and whole-request times are computed as prompt ÷ prefill + 128 ÷ decode. The split is 2.0× the default device choice, 2.5× CPU only and 1.4× NPU only. The SplitLM row assumes decode after the handoff runs at the CPU-only rate; an interleaved study later found no decode deficit after the handoff (see Limitations). Measured end to end in that run: first token in 2.10 s vs 8.27 s CPU-only and 2.06 s NPU-only; whole request with 128 tokens about 5.1 s vs 10.9 s CPU-only and 6.4 s NPU-only.
 
 ### What the kernels buy
 
@@ -41,9 +41,16 @@ Each row is a same-session A/B against the build before the change, with greedy 
 | In-place recurrent state (no per-token state copy) | Qwen3.5-2B | CPU decode 60.3 → 63.4 t/s (**+5%**) | identical text |
 | Single-token decode overhead: recurrent-state update fused with its copy, row-split CONCAT, barrier elision, repacked GEMV chunks capped at 1 MiB (the Q6_K head no longer finishes up to 13 MB apart across threads) | Qwen3.5-2B | CPU decode 59.2 → 65.6 t/s (**+10.8%**); after a 4096-token context 50.0 → 53.8 t/s (**+7.6%**) | identical text and perplexity |
 | Speculative decoding with the model's MTP head, 3 drafted tokens | Qwen3.8-27B | decode 5.0-5.3 → 8.7-8.9 t/s (**1.7×**), 67% accepted | identical text |
+| Flash-attention softmax with an integer row reference: the rounded-up row max puts each score's integer part straight into the exponent bits, a degree-3 polynomial covers the exact [-0.5, 0.5] fraction, softmax done in the matrix unit's tile layout | LFM2.5-24B-A2B | attention op 54.9 → 44.6 ms (**−19%**); prefill +1.7-2.7% | perplexity within noise |
+| Fused MoE expert reduce (router-weight multiply + 4-way expert sum + residual add in one NPU op) and a block-DMA top-k for the router | LFM2.5-24B-A2B | prefill at 2048 tokens 924 → 994 t/s (**+7.5%**) | perplexity within noise |
+| Faster Q4_0 tile expansion and aligned full-vector stores in the MoE output scatter | LFM2.5-24B-A2B | expert ops a few % faster | identical text |
+| fp16 sigmoid in the SILU / SWIGLU epilogues (the matmul-fused SWIGLU went from vector-unit-bound to matrix-unit-bound: matrix unit busy 78% → 94%), row-split stores for matmul + residual add | Qwen3.5-2B | NPU prefill at 4096 tokens 1,908 → 2,006 t/s (**+5%**) | perplexity within noise |
+| Recurrent-state scan v2: state kept transposed in the matrix unit's tile order (no transposes), qf16 forward substitution, fewer vector ops | Qwen3.5-2B | NPU prefill at 4096 tokens to ~2,040 t/s on top of the row above (**+1.5-2%**) | perplexity within noise; `GGML_HEXAGON_GDN_V2=0` restores the old numerics exactly |
 
 
-**All kernel work combined** (final build vs the morning snapshot, same session): Qwen3.5-2B NPU prefill at 4096 tokens 1,638 → 1,835 t/s (**+12%**), LFM2.5-24B-A2B 665 → 874 t/s (**+32%**), Qwen3.5-2B CPU decode 62.4 → 68.1 t/s (**+9%**) and, after a 4096-token context, 54.0 → 64.2 t/s (**+19%**); greedy text identical on the 2B.
+**Second optimization round combined** (all five changes above merged, vs the previous final build, two interleaved same-session rounds): Qwen3.5-2B NPU prefill at 4096 tokens 1,882 → **2,143 t/s (+14%, 51% of the matrix-unit peak)** with the fp16 gate/up prefill file, 1,884 → 2,065 at 2048 tokens (+10%) with the plain Q4_0 file; LFM2.5-24B-A2B 876 → **1,047 t/s at 4096 tokens (+20%)** and 886 → 1,113 at 2048 (+26%). Perplexity unchanged within noise (LFM2.5 13.580 → 13.547, Qwen3.5-2B 11.265 → 11.274); `test-backend-ops` pass counts unchanged; greedy text on a 3K-token prompt identical on the 2B, while short prompts diverge after some tokens on all models (accumulated rounding: with every new switch off the output is bit-identical, and no single switch restores it).
+
+**First round combined** (final build vs the morning snapshot, same session): Qwen3.5-2B NPU prefill at 4096 tokens 1,638 → 1,835 t/s (**+12%**), LFM2.5-24B-A2B 665 → 874 t/s (**+32%**), Qwen3.5-2B CPU decode 62.4 → 68.1 t/s (**+9%**) and, after a 4096-token context, 54.0 → 64.2 t/s (**+19%**); greedy text identical on the 2B.
 
 ### Bigger models
 
@@ -60,8 +67,8 @@ Qualcomm AI Hub's "optimized" Qwen3.5-2B is byte-identical to the GGUF used here
 
 | Phase | Model | Now | % of ceiling |
 |---|---|---|---|
-| NPU prefill, 4096 tokens | Qwen3.5-2B | 1,835 t/s = 5.0 TFLOPS (2048-token batches) | 44% of 11.48 TFLOPS |
-| NPU prefill, 4096 tokens | LFM2.5-24B-A2B | 874 t/s = 3.8 TFLOPS | 33% (23% with stock kernels) |
+| NPU prefill, 4096 tokens | Qwen3.5-2B | 2,143 t/s = 5.9 TFLOPS (2048-token batches, fp16 gate/up prefill file) | 51% of 11.48 TFLOPS |
+| NPU prefill, 4096 tokens | LFM2.5-24B-A2B | 1,047 t/s = 4.6 TFLOPS | 40% (23% with stock kernels) |
 | NPU prefill, 4096 tokens | Qwen3.8-27B | 105 t/s = 5.2 TFLOPS (stock NPU kernels, 512-token batches; not re-measured) | 45% |
 | CPU decode after 4096 tokens (llama-bench, CPU only) | Qwen3.5-2B | 64.2 t/s = 77 GB/s of weights | 70% of ~110 GB/s (74% from an empty context, 68.1 t/s) |
 
@@ -138,7 +145,7 @@ $env:ADSP_LIBRARY_PATH = "$PWD\..\lib"
 
 ## Limitations
 
-- Qwen3.5-2B decode after an NPU handoff still runs slower than decode of a CPU-prefilled sequence: 54.7 vs 63.7 t/s after a 4,092-token prompt in the final build (an earlier build measured 51.2 on both). Not yet explained.
+- CPU decode speed varies run to run by up to 2×. A follow-up study (38-42 interleaved requests per session) found no deficit after the NPU handoff: split-route and CPU-route medians match (60.6 vs 58.3 t/s; 56.9 vs 56.3 in a second session), with identical greedy text. The earlier 54.7 vs 63.7 gap came from a platform-wide slow state in which all CPU clusters run at one capped clock; it hits either route. Decode numbers should be measured interleaved and repeated.
 - Single-copy aliasing covers Q4_0 weights only, because the CPU tile kernel reads Q4_0 tiles. Other formats the NPU tiles (Q4_1, Q8_0, K-quants, IQ4_NL, MXFP4) keep a separate CPU copy, and formats the NPU cannot run (e.g. IQ3_S) stay on the CPU.
 - Speculative decoding runs in `trilane-spec` (one stream); the multi-slot server does not draft yet.
 - The fork's NPU kernels shift LFM2.5's logits slightly against stock (KLD 0.006; perplexity +0.66% ± 0.3% on 8 wikitext chunks, +0.35% on 16). Disabling the new fusions one at a time does not remove the shift, so the cause is unresolved. Qwen3.5-2B is unchanged (perplexity ratio 1.0008). The causal key-block skip changes LFM2.5's greedy text after a few tokens (a no-op update that rounds fp16 differently; perplexity identical; `GGML_HEXAGON_FA_KV_SKIP=0` restores it).
