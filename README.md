@@ -48,6 +48,11 @@ Each row is a same-session A/B against the build before the change, with greedy 
 | Recurrent-state scan v2: state kept transposed in the matrix unit's tile order (no transposes), qf16 forward substitution, fewer vector ops | Qwen3.5-2B | NPU prefill at 4096 tokens to ~2,040 t/s on top of the row above (**+1.5-2%**) | perplexity within noise; `GGML_HEXAGON_GDN_V2=0` restores the old numerics exactly |
 
 
+| MoE SWIGLU folded into the gate/up expert kernel (gate and up columns share one matrix-unit job; silu(gate)·up computed in local memory and only the product written out, in fp16 for the down kernel); same fusion enabled for quantized dense gate/up weights | LFM2.5-24B-A2B, Qwen3.5-2B | LFM2.5 prefill **+6-8%**; Qwen3.5-2B plain Q4_0 **+7%** | perplexity within noise |
+| LFM2.5's short convolution kept on the NPU at 4096-token batches (its standalone layout did not fit local memory, so it silently fell back to the CPU, splitting the graph 62 times), conv gates folded into the conv block, router weights produced by the top-k kernel | LFM2.5-24B-A2B | prefill at 4096 tokens **+12-14%** | perplexity within noise |
+
+**Third optimization round combined** (the two rows above merged, vs the second-round build, two interleaved same-session rounds): LFM2.5-24B-A2B NPU prefill at 4096 tokens 1,035 → **1,268 t/s (+23%, 48% of the matrix-unit peak)**, at 2048 tokens 1,106 → 1,218 (+10%); Qwen3.5-2B plain Q4_0 at 2048 tokens 2,051 → 2,221 (+8%); Qwen3.5-2B with the fp16 gate/up prefill file unchanged (2,143 t/s at 4096 tokens). Perplexity unchanged (LFM2.5 13.547 → 13.553, Qwen3.5-2B identical), all `test-backend-ops` cases pass as before plus new fused-op tests, Qwen3.5-2B greedy text identical.
+
 **Second optimization round combined** (all five changes above merged, vs the previous final build, two interleaved same-session rounds): Qwen3.5-2B NPU prefill at 4096 tokens 1,882 → **2,143 t/s (+14%, 51% of the matrix-unit peak)** with the fp16 gate/up prefill file, 1,884 → 2,065 at 2048 tokens (+10%) with the plain Q4_0 file; LFM2.5-24B-A2B 876 → **1,047 t/s at 4096 tokens (+20%)** and 886 → 1,113 at 2048 (+26%). Perplexity unchanged within noise (LFM2.5 13.580 → 13.547, Qwen3.5-2B 11.265 → 11.274); `test-backend-ops` pass counts unchanged; greedy text on a 3K-token prompt identical on the 2B, while short prompts diverge after some tokens on all models (accumulated rounding: with every new switch off the output is bit-identical, and no single switch restores it).
 
 **First round combined** (final build vs the morning snapshot, same session): Qwen3.5-2B NPU prefill at 4096 tokens 1,638 → 1,835 t/s (**+12%**), LFM2.5-24B-A2B 665 → 874 t/s (**+32%**), Qwen3.5-2B CPU decode 62.4 → 68.1 t/s (**+9%**) and, after a 4096-token context, 54.0 → 64.2 t/s (**+19%**); greedy text identical on the 2B.
@@ -68,7 +73,7 @@ Qualcomm AI Hub's "optimized" Qwen3.5-2B is byte-identical to the GGUF used here
 | Phase | Model | Now | % of ceiling |
 |---|---|---|---|
 | NPU prefill, 4096 tokens | Qwen3.5-2B | 2,143 t/s = 5.9 TFLOPS (2048-token batches, fp16 gate/up prefill file) | 51% of 11.48 TFLOPS |
-| NPU prefill, 4096 tokens | LFM2.5-24B-A2B | 1,047 t/s = 4.6 TFLOPS | 40% (23% with stock kernels) |
+| NPU prefill, 4096 tokens | LFM2.5-24B-A2B | 1,268 t/s = 5.6 TFLOPS | 48% (23% with stock kernels) |
 | NPU prefill, 4096 tokens | Qwen3.8-27B | 105 t/s = 5.2 TFLOPS (stock NPU kernels, 512-token batches; not re-measured) | 45% |
 | CPU decode after 4096 tokens (llama-bench, CPU only) | Qwen3.5-2B | 64.2 t/s = 77 GB/s of weights | 70% of ~110 GB/s (74% from an empty context, 68.1 t/s) |
 
