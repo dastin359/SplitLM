@@ -196,7 +196,7 @@ index 0d48c9a..7e7c303 100644
  }
  #endif
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index ab82e3d..531147c 100644
+index ab82e3d..869d5e7 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -490,6 +490,11 @@ struct ggml_threadpool {
@@ -661,7 +661,7 @@ index ab82e3d..531147c 100644
      if (node->op == GGML_OP_RMS_NORM) {
          // RMS_NORM + MUL fusion
          const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
-@@ -3095,9 +3479,279 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3095,9 +3479,301 @@ static int ggml_cpu_try_fuse_ops(
          }
      }
  
@@ -694,6 +694,13 @@ index ab82e3d..531147c 100644
 +struct cpu_prof_mm { int type, op; int64_t ne0, ne1, n, us_work, us_wait; double bytes; };
 +static struct cpu_prof_mm cpu_prof_mms[64];
 +static int cpu_prof_n_mm = 0;
++// trilane r6: GGML_CPU_PROF_G=1 also prints one line per graph (nodes, wall, per weight shape and token count: us)
++static int cpu_prof_g = -1;
++struct cpu_prof_gmm { int type; int64_t ne0, ne1, nt, us; };
++#define CPU_PROF_GMM_MAX 64
++static struct cpu_prof_gmm cpu_prof_gmms[CPU_PROF_GMM_MAX];
++static int64_t cpu_prof_gmm_dropped = 0; // us of shapes beyond CPU_PROF_GMM_MAX in the current graph (reported separately)
++static int cpu_prof_n_gmm = 0;
 +
 +// trilane: before a thread waits at a barrier, start streaming its first chunk of the next single-token matmul's
 +// weights (GGML_PF_NEXT_KB = KiB per thread, 0 = off; GGML_REPACK_CHUNKS must match repack.cpp's chunking)
@@ -858,6 +865,21 @@ index ab82e3d..531147c 100644
 +    cpu_prof_mms[k].us_work += us_work;
 +    cpu_prof_mms[k].us_wait += us_wait;
 +    cpu_prof_mms[k].bytes   += bytes;
++    if (cpu_prof_g < 0) { const char * e = getenv("GGML_CPU_PROF_G"); cpu_prof_g = e ? atoi(e) : 0; }
++    if (cpu_prof_g > 0) {
++        const int64_t nt = node->op == GGML_OP_MUL_MAT_ID ? node->src[1]->ne[2] : node->src[1]->ne[1];
++        int j = 0;
++        for (; j < cpu_prof_n_gmm; j++) {
++            struct cpu_prof_gmm * g = &cpu_prof_gmms[j];
++            if (g->type == (int) w->type && g->ne0 == w->ne[0] && g->ne1 == w->ne[1] && g->nt == nt) break;
++        }
++        if (j == cpu_prof_n_gmm && j < CPU_PROF_GMM_MAX) {
++            cpu_prof_gmms[j] = (struct cpu_prof_gmm) { (int) w->type, w->ne[0], w->ne[1], nt, 0 };
++            cpu_prof_n_gmm++;
++        }
++        if (j < CPU_PROF_GMM_MAX) cpu_prof_gmms[j].us += us_work + us_wait;
++        else cpu_prof_gmm_dropped += us_work + us_wait;
++    }
 +}
 +
 +static void cpu_prof_dump(void) {
@@ -941,7 +963,7 @@ index ab82e3d..531147c 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3118,6 +3772,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3118,6 +3794,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          /*.wdata      =*/ cplan->work_data,
          /*.threadpool =*/ tp,
          /*.use_ref    =*/ cplan->use_ref,
@@ -949,7 +971,7 @@ index ab82e3d..531147c 100644
      };
  
  #ifdef GGML_USE_OPENMP
-@@ -3126,6 +3781,55 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3126,6 +3803,55 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -1005,7 +1027,7 @@ index ab82e3d..531147c 100644
      for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
          struct ggml_tensor * node = cgraph->nodes[node_n];
  
-@@ -3138,11 +3842,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3138,11 +3864,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
@@ -1037,7 +1059,7 @@ index ab82e3d..531147c 100644
          } else {
              ggml_compute_forward(&params, node);
          }
-@@ -3153,8 +3877,57 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3153,8 +3899,69 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              tp->ec    = GGML_STATUS_ABORTED;
          }
  
@@ -1091,12 +1113,24 @@ index ab82e3d..531147c 100644
 +            cpu_prof_ab_n[params.ab_off ? 1 : 0]++;
 +        }
 +        cpu_prof_t_end_prev = t1;
++        if (cpu_prof_g > 0) {
++            fprintf(stderr, "[cpu-prof-g] nodes %d wall %lld |", cgraph->n_nodes, (long long) cpu_prof_last_wall);
++            for (int j = 0; j < cpu_prof_n_gmm; j++) {
++                const struct cpu_prof_gmm * g = &cpu_prof_gmms[j];
++                fprintf(stderr, " %s:%lldx%lld:%lld=%lld", ggml_type_name((enum ggml_type) g->type), (long long) g->ne0, (long long) g->ne1,
++                    (long long) g->nt, (long long) g->us);
++            }
++            if (cpu_prof_gmm_dropped > 0) fprintf(stderr, " dropped(>%d shapes)=%lld", CPU_PROF_GMM_MAX, (long long) cpu_prof_gmm_dropped);
++            fprintf(stderr, "\n");
++            cpu_prof_n_gmm = 0;
++            cpu_prof_gmm_dropped = 0;
++        }
 +        if (++cpu_prof_graphs % cpu_prof_every == 0) {
 +            cpu_prof_dump();
          }
      }
  
-@@ -3164,8 +3937,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3164,8 +3971,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -1132,7 +1166,7 @@ index ab82e3d..531147c 100644
  #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
      ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
  #endif
-@@ -3324,6 +4124,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3324,6 +4158,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
          threadpool->n_graph          = 0;
          threadpool->n_barrier        = 0;
          threadpool->n_barrier_passed = 0;
@@ -1142,7 +1176,7 @@ index ab82e3d..531147c 100644
          threadpool->current_chunk    = 0;
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
-@@ -3389,6 +4192,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
+@@ -3389,6 +4226,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
  }
  
  enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
@@ -1150,7 +1184,7 @@ index ab82e3d..531147c 100644
      ggml_cpu_init();
  
      GGML_ASSERT(cplan);
-@@ -3415,6 +4219,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3415,6 +4253,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
          threadpool->abort            = -1;
          threadpool->ec               = GGML_STATUS_SUCCESS;
      }
@@ -1160,7 +1194,7 @@ index ab82e3d..531147c 100644
  
  #ifdef GGML_USE_OPENMP
      if (n_threads > 1) {
-@@ -3462,6 +4269,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3462,6 +4303,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
          ggml_threadpool_free(threadpool);
      }
  
@@ -1174,7 +1208,7 @@ index ab82e3d..531147c 100644
      return ret;
  }
  
-@@ -3933,6 +4747,34 @@ void ggml_cpu_init(void) {
+@@ -3933,6 +4781,34 @@ void ggml_cpu_init(void) {
          {
              const char * env = getenv("GGML_CPU_DISABLE_FUSION");
              ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
@@ -1253,10 +1287,10 @@ index 81ff5d7..016fa5d 100644
      if (strcmp(name, "ggml_threadpool_new") == 0) {
 diff --git a/ggml/src/ggml-cpu/htp-tile.cpp b/ggml/src/ggml-cpu/htp-tile.cpp
 new file mode 100644
-index 0000000..d3e2010
+index 0000000..acd19f1
 --- /dev/null
 +++ b/ggml/src/ggml-cpu/htp-tile.cpp
-@@ -0,0 +1,943 @@
+@@ -0,0 +1,1074 @@
 +#define GGML_COMMON_IMPL_CPP
 +#define GGML_COMMON_DECL_CPP
 +#include "ggml-common.h"
@@ -1438,6 +1472,8 @@ index 0000000..d3e2010
 +// Activation blocks for this kernel are pre-permuted per group of 8 k: [k0 k2 k4 k6 k1 k3 k5 k7].
 +// Transposing 4 column-pair bytes per row puts the even k in the low nibbles and the odd k in the high ones,
 +// so USDOT(byte & 0x0F, even x) + USDOT(byte & 0xF0, odd x) / 16 needs no nibble shuffles.
++// X2: activations in the htptile_prep_x2 layout (lanes of odd k move from 1, 3 to 2, 3 and of the second even group to 1)
++template <bool X2 = false>
 +static void htptile_band_i8mm(const uint8_t * band, const block_q8_0 * x, const int32_t * xsum, int n_kt, float * y) {
 +    float32x4_t facc[8];
 +    for (int i = 0; i < 8; i++) facc[i] = vdupq_n_f32(0.0f);
@@ -1468,10 +1504,17 @@ index 0000000..d3e2010
 +                    hi[i] = vusdotq_laneq_s32(hi[i], vandq_u8(w[i], mhi), XV, LHI);                         \
 +                }                                                                                           \
 +            }
-+            HTPTILE_GROUP(0, xa, 0, 1)
-+            HTPTILE_GROUP(1, xa, 2, 3)
-+            HTPTILE_GROUP(2, xb, 0, 1)
-+            HTPTILE_GROUP(3, xb, 2, 3)
++            if (X2) {
++                HTPTILE_GROUP(0, xa, 0, 2)
++                HTPTILE_GROUP(1, xa, 1, 3)
++                HTPTILE_GROUP(2, xb, 0, 2)
++                HTPTILE_GROUP(3, xb, 1, 3)
++            } else {
++                HTPTILE_GROUP(0, xa, 0, 1)
++                HTPTILE_GROUP(1, xa, 2, 3)
++                HTPTILE_GROUP(2, xb, 0, 1)
++                HTPTILE_GROUP(3, xb, 2, 3)
++            }
 +#undef HTPTILE_GROUP
 +
 +            const float       dx  = GGML_CPU_FP16_TO_FP32(x[kt].d);
@@ -1586,6 +1629,107 @@ index 0000000..d3e2010
 +        xsum[kt] = s;
 +    }
 +}
++
++// trilane r6 (GGML_HTPTILE_MMLA2, default 1): htptile_band_mmla with 8 column pairs transposed as whole bytes into 2-row x 8-cp operands, then (byte << 4) and (byte & 0xF0)
++// give 16x the even-k and odd-k nibbles: both go into the same integer accumulator (16x the sum), which starts at
++// -16 * 8 * xsum; the float update uses dx / 16. All of it is exact, so the result equals htptile_band_mmla bit for bit.
++// Activations per 32-k block: [even k of 0..15][odd k of 0..15][even k of 16..31][odd k of 16..31] (htptile_prep_x2).
++static void htptile_prep_x2(block_q8_0 * xb, int32_t * xsum, int n_kt) {
++    for (int kt = 0; kt < n_kt; kt++) {
++        int8_t tmp[32];
++        int32_t s = 0;
++        for (int g = 0; g < 2; g++) for (int i = 0; i < 8; i++) {
++            tmp[16 * g + i]     = xb[kt].qs[16 * g + 2 * i];
++            tmp[16 * g + 8 + i] = xb[kt].qs[16 * g + 2 * i + 1];
++        }
++        for (int k = 0; k < 32; k++) s += xb[kt].qs[k];
++        memcpy(xb[kt].qs, tmp, 32);
++        xsum[kt] = s;
++    }
++}
++template <int NT>
++static void htptile_band_mmla2(const uint8_t * band, const block_q8_0 * const * x, const int32_t * const * xsum, int n_kt, float * const * y, int pf) {
++    constexpr int TP = (NT + 1) / 2;
++    int tok[2 * TP];
++    for (int i = 0; i < 2 * TP; i++) tok[i] = std::min(i, NT - 1);
++    float32x4_t facc[2][8][TP];
++    for (int h = 0; h < 2; h++) for (int rp = 0; rp < 8; rp++) for (int q = 0; q < TP; q++) facc[h][rp][q] = vdupq_n_f32(0.0f);
++    const uint8x16_t mhi = vdupq_n_u8(0xF0);
++    for (int kt = 0; kt < n_kt; kt++) {
++        const uint8_t * tile = band + kt * HT_BYTES;
++        if (pf) { for (int l = 0; l < (int) HT_BYTES; l += 64) __builtin_prefetch(tile + pf + l, 0, 0); }
++        int8x16_t   xe[2][TP], xo[2][TP];   // [group][pair]
++        float32x4_t dxv[TP];
++        int32x4_t   offv[TP];
++        for (int q = 0; q < TP; q++) {
++            const block_q8_0 * x0 = x[tok[2 * q]] + kt;
++            const block_q8_0 * x1 = x[tok[2 * q + 1]] + kt;
++            for (int g = 0; g < 2; g++) {
++                xe[g][q] = vcombine_s8(vld1_s8(x0->qs + 16 * g), vld1_s8(x1->qs + 16 * g));
++                xo[g][q] = vcombine_s8(vld1_s8(x0->qs + 16 * g + 8), vld1_s8(x1->qs + 16 * g + 8));
++            }
++            const float d0 = GGML_CPU_FP16_TO_FP32(x0->d) * 0.0625f, d1 = GGML_CPU_FP16_TO_FP32(x1->d) * 0.0625f;
++            const float    dv[4] = { d0, d1, d0, d1 };
++            const int32_t o0 = -128 * xsum[tok[2 * q]][kt], o1 = -128 * xsum[tok[2 * q + 1]][kt];
++            const int32_t  ov[4] = { o0, o1, o0, o1 };
++            dxv[q]  = vld1q_f32(dv);
++            offv[q] = vld1q_s32(ov);
++        }
++        for (int h = 0; h < 2; h++) {
++            int32x4_t acc[8][TP];
++            for (int rp = 0; rp < 8; rp++) for (int q = 0; q < TP; q++) acc[rp][q] = offv[q];
++            for (int g = 0; g < 2; g++) {
++                const uint8_t * p = tile + (8 * g) * 32 + h * 16;
++                uint8x16_t v[8];
++                for (int c = 0; c < 8; c++) v[c] = vld1q_u8(p + 32 * c);
++                uint16x8_t z[8]; // [pair c/2][lo rows 0-7 | hi rows 8-15]
++                for (int c = 0; c < 4; c++) {
++                    z[2 * c]     = vreinterpretq_u16_u8(vzip1q_u8(v[2 * c], v[2 * c + 1]));
++                    z[2 * c + 1] = vreinterpretq_u16_u8(vzip2q_u8(v[2 * c], v[2 * c + 1]));
++                }
++                // 32-bit units of 4 cps: w[cpq][rq] for cp quad cpq (0: cp0-3, 1: cp4-7), row quad rq
++                uint32x4_t w[2][4];
++                for (int cq = 0; cq < 2; cq++) {
++                    const uint16x8_t a_lo = z[4 * cq + 0], a_hi = z[4 * cq + 1], b_lo = z[4 * cq + 2], b_hi = z[4 * cq + 3];
++                    w[cq][0] = vreinterpretq_u32_u16(vzip1q_u16(a_lo, b_lo)); // rows 0-3
++                    w[cq][1] = vreinterpretq_u32_u16(vzip2q_u16(a_lo, b_lo)); // rows 4-7
++                    w[cq][2] = vreinterpretq_u32_u16(vzip1q_u16(a_hi, b_hi)); // rows 8-11
++                    w[cq][3] = vreinterpretq_u32_u16(vzip2q_u16(a_hi, b_hi)); // rows 12-15
++                }
++                for (int rq = 0; rq < 4; rq++) {
++                    const uint8x16_t o0 = vreinterpretq_u8_u32(vzip1q_u32(w[0][rq], w[1][rq])); // rows 4rq, 4rq+1: 8 cps each
++                    const uint8x16_t o1 = vreinterpretq_u8_u32(vzip2q_u32(w[0][rq], w[1][rq])); // rows 4rq+2, 4rq+3
++                    const uint8x16_t l0 = vshlq_n_u8(o0, 4), h0 = vandq_u8(o0, mhi);
++                    const uint8x16_t l1 = vshlq_n_u8(o1, 4), h1 = vandq_u8(o1, mhi);
++                    for (int q = 0; q < TP; q++) {
++                        acc[2 * rq + 0][q] = vusmmlaq_s32(acc[2 * rq + 0][q], l0, xe[g][q]);
++                        acc[2 * rq + 0][q] = vusmmlaq_s32(acc[2 * rq + 0][q], h0, xo[g][q]);
++                        acc[2 * rq + 1][q] = vusmmlaq_s32(acc[2 * rq + 1][q], l1, xe[g][q]);
++                        acc[2 * rq + 1][q] = vusmmlaq_s32(acc[2 * rq + 1][q], h1, xo[g][q]);
++                    }
++                }
++            }
++            const float16_t * sc = (const float16_t *) (tile + 512) + h * 16;
++            for (int g4 = 0; g4 < 4; g4++) {
++                const float32x4_t s4 = vcvt_f32_f16(vld1_f16(sc + 4 * g4));
++                const float32x4_t sp[2] = { vzip1q_f32(s4, s4), vzip2q_f32(s4, s4) };
++                for (int j = 0; j < 2; j++) for (int q = 0; q < TP; q++) {
++                    float32x4_t & f = facc[h][2 * g4 + j][q];
++                    f = vfmaq_f32(f, vcvtq_f32_s32(acc[2 * g4 + j][q]), vmulq_f32(sp[j], dxv[q]));
++                }
++            }
++        }
++    }
++    for (int h = 0; h < 2; h++) for (int rp = 0; rp < 8; rp++) {
++        const int r = h * 16 + 2 * rp;
++        for (int q = 0; q < TP; q++) {
++            float v[4];
++            vst1q_f32(v, facc[h][rp][q]);
++            y[2 * q][r] = v[0]; y[2 * q][r + 1] = v[2];
++            if (2 * q + 1 < NT) { y[2 * q + 1][r] = v[1]; y[2 * q + 1][r + 1] = v[3]; }
++        }
++    }
++}
 +#endif
 +
 +// MMLA: batches only (activations permuted as for USDOT); groups of 2-4 tokens use USMMLA, single tokens USDOT
@@ -1605,11 +1749,15 @@ index 0000000..d3e2010
 +#endif
 +}
 +
++// GGML_HTPTILE_MMLA2=0 restores the 4-column-pair batch kernel and its activation layout
++static bool htptile_mmla2() { static const bool v = !(getenv("GGML_HTPTILE_MMLA2") && atoi(getenv("GGML_HTPTILE_MMLA2")) == 0); return v; }
++static int  htptile_mpf() { static const int v = getenv("GGML_HTPTILE_MPF") ? atoi(getenv("GGML_HTPTILE_MPF")) : 0; return v; }
++
 +static void htptile_band(htptile_kernel kern, const uint8_t * band, const block_q8_0 * x, const int32_t * xsum, int n_kt, float * y) {
 +    switch (kern) {
 +#if defined(HTPTILE_I8MM)
 +        case HTPTILE_USDOT:
-+        case HTPTILE_MMLA:  htptile_band_i8mm(band, x, xsum, n_kt, y); return;
++        case HTPTILE_MMLA:  if (htptile_mmla2()) htptile_band_i8mm<true>(band, x, xsum, n_kt, y); else htptile_band_i8mm(band, x, xsum, n_kt, y); return;
 +#endif
 +#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 +        case HTPTILE_DOT: htptile_band_neon(band, x, nullptr, n_kt, y); return;
@@ -1627,6 +1775,14 @@ index 0000000..d3e2010
 +    static const bool no_multi = getenv("GGML_HTPTILE_NO_MULTI") != nullptr;
 +#if defined(HTPTILE_I8MM)
 +    if (kern == HTPTILE_MMLA && !no_multi && nt > 1) {
++        if (htptile_mmla2()) {
++            switch (nt) {
++                case 2: htptile_band_mmla2<2>(band, x, xsum, n_kt, y, htptile_mpf()); return;
++                case 3: htptile_band_mmla2<3>(band, x, xsum, n_kt, y, htptile_mpf()); return;
++                case 4: htptile_band_mmla2<4>(band, x, xsum, n_kt, y, htptile_mpf()); return;
++                default: break;
++            }
++        }
 +        switch (nt) {
 +            case 2: htptile_band_mmla<2>(band, x, xsum, n_kt, y); return;
 +            case 3: htptile_band_mmla<3>(band, x, xsum, n_kt, y); return;
@@ -1724,7 +1880,8 @@ index 0000000..d3e2010
 +            quantize_row_q8_0((const float *) ((const char *) src1->data + i11 * nb_slot + i12 * nb_tok), wq + r * rs, K);
 +#if defined(HTPTILE_I8MM)
 +            if (kern == HTPTILE_USDOT || kern == HTPTILE_MMLA) {
-+                htptile_prep_x((block_q8_0 *) (wq + r * rs), sums + r * n_kt, n_kt);
++                if (htptile_mmla2()) htptile_prep_x2((block_q8_0 *) (wq + r * rs), sums + r * n_kt, n_kt);
++                else                 htptile_prep_x((block_q8_0 *) (wq + r * rs), sums + r * n_kt, n_kt);
 +            } else
 +#endif
 +            {
@@ -1740,10 +1897,17 @@ index 0000000..d3e2010
 +        const block_q8_0 * xs[HT_MULTI];
 +        const int32_t *    ss[HT_MULTI];
 +        float *            ys[HT_MULTI];
-+        if (!is_id) {
++        // trilane r6: GGML_HTPTILE_DENSE (default 1): dense single tokens take the decode loop below (dynamic chunks,
++        // precomputed sums) and dense batches hand out dynamic chunks of bands; 0 restores the interleaved band loop
++        static const int dense_mode = getenv("GGML_HTPTILE_DENSE") ? atoi(getenv("GGML_HTPTILE_DENSE")) : 1;
++        if (!is_id && (ne12 > 1 || dense_mode == 0)) {
 +            // band-outer, tokens-inner: each 32-row band (~27 KB) stays in L1 while every token uses it,
 +            // and tokens go through the band HT_MULTI at a time
-+            for (int64_t band = ith; band < n_bands; band += nth) {
++            static const int64_t dch = std::max(1, getenv("GGML_HTPTILE_DENSE_CHUNK") ? atoi(getenv("GGML_HTPTILE_DENSE_CHUNK")) : 2);
++            const bool dyn = dense_mode != 0;
++            const int64_t n_ch = dyn ? (n_bands + dch - 1) / dch : n_bands;
++            for (int64_t c = ith; c < n_ch; c = dyn ? ggml_threadpool_chunk_add(params->threadpool, 1) : c + nth)
++            for (int64_t band = dyn ? c * dch : c; band < (dyn ? std::min(n_bands, (c + 1) * dch) : c + 1); band++) {
 +                const uint8_t * w = (const uint8_t *) src0->data + band * HT_ROWS * src0->nb[1];
 +                for (int64_t t0 = 0; t0 < ne12; t0 += HT_MULTI) {
 +                    const int nt = (int) std::min<int64_t>(HT_MULTI, ne12 - t0);
@@ -1830,10 +1994,11 @@ index 0000000..d3e2010
 +                for (int64_t it = i0; it < i1; it++) item(it);
 +            } else {
 +                // dynamic chunks of dec_ch consecutive bands (the counter was armed before the barrier)
-+                const int64_t n_ch = (n_items + dec_ch - 1) / dec_ch;
++                const int64_t ch = dec_ch;
++                const int64_t n_ch = (n_items + ch - 1) / ch;
 +                for (int64_t c = ith; c < n_ch; c = ggml_threadpool_chunk_add(params->threadpool, 1)) {
-+                    const int64_t i1 = std::min<int64_t>(n_items, (c + 1) * dec_ch);
-+                    for (int64_t it = c * dec_ch; it < i1; it++) item(it);
++                    const int64_t i1 = std::min<int64_t>(n_items, (c + 1) * ch);
++                    for (int64_t it = c * ch; it < i1; it++) item(it);
 +                }
 +            }
 +            return true;
@@ -2232,7 +2397,7 @@ index 0000000..ef8543c
 +}
 +#endif
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 7a73e13..064e99f 100644
+index 7a73e13..c6bfabc 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -2055,25 +2055,62 @@ static void ggml_compute_forward_concat_f32(
@@ -2311,7 +2476,7 @@ index 7a73e13..064e99f 100644
      }
  }
  
-@@ -9515,6 +9552,335 @@ static void ggml_flash_attn_ext_reduce_partials(
+@@ -9515,6 +9552,682 @@ static void ggml_flash_attn_ext_reduce_partials(
      }
  }
  
@@ -2602,6 +2767,347 @@ index 7a73e13..064e99f 100644
 +    }
 +}
 +
++
++// r6-fa: v2 of the decode kernel for GQA groups of 4 query heads (LFM2.5: 32/8 heads, Qwen3.5: 8/2). Same arithmetic
++// as ggml_fa_dec_chunk_t<4>, fewer instructions per KV position, plus a software prefetch of the contiguous K/V cells
++// a few blocks ahead:
++//  - the scores of the 4 heads of a position are reduced with a pairwise-add tree straight into one vector (the same
++//    pairwise order as vaddvq_f32), so they land in position-major [t][4] layout: no transpose, no scalar stores;
++//  - the block softmax runs across the 4 heads in one vector per position (max, exp, sums kept per position mod 4 and
++//    combined in vaddvq_f32 order), replacing the per-head scalar scale/mask/max loop;
++//  - V is accumulated with lane-indexed FMAs on the probability vector of a position (one load instead of four);
++//  - the K and V cells (all KV heads, contiguous in the KV cache) one block ahead are prefetched, spread over the
++//    current block's work (the first block's cells up front), so DRAM reads overlap the compute; the per-head-group
++//    loop reads each cell in 1-KB-strided pieces, which the hardware prefetcher does not run ahead of.
++// Results are bit-identical to the template kernel (checked on random masks incl. finite non-zero values,
++// ALiBi, softcap, sinks, head sizes 64-256, 1/5/8 threads). GGML_CPU_FA_DEC_V2=0 restores the template kernel;
++// GGML_CPU_FA_DEC_PFD=0 disables the prefetch, GGML_CPU_FA_DEC_PFC=<cells> sets its distance.
++static int ggml_fa_dec_env(const char * name, int def) {
++    const char * e = getenv(name);
++    return e ? atoi(e) : def;
++}
++
++static bool ggml_fa_dec_v2_enabled() {
++    static const bool on = ggml_fa_dec_env("GGML_CPU_FA_DEC_V2", 1) != 0;
++    return on;
++}
++
++// prefetch distance in KV cells (GGML_CPU_FA_DEC_PFC, default one block)
++static int ggml_fa_dec_pfd() {
++    static const int pfd = ggml_fa_dec_env("GGML_CPU_FA_DEC_PFD", 1) != 0 ? std::max(0, ggml_fa_dec_env("GGML_CPU_FA_DEC_PFC", FA_DEC_BKV)) : 0;
++    return pfd;
++}
++
++// software prefetch cursor over [p, end)
++struct ggml_fa_dec_pf {
++    const char * p   = nullptr;
++    const char * end = nullptr;
++    inline void step(int nlines) {
++        for (int i = 0; i < nlines && p < end; i++, p += 64) {
++            __builtin_prefetch(p, 0, 2);
++        }
++    }
++};
++
++// lane j = (vj[0] + vj[1]) + (vj[2] + vj[3]): the order in which vaddvq_f32 adds its lanes
++static inline float32x4_t ggml_fa_dec_hsum4(float32x4_t v0, float32x4_t v1, float32x4_t v2, float32x4_t v3) {
++    return vpaddq_f32(vpaddq_f32(v0, v1), vpaddq_f32(v2, v3));
++}
++
++static inline void ggml_fa_dec_dot2_g4(const __fp16 * k0, const __fp16 * k1, const __fp16 * q, int64_t DK, float * w0, float * w1) {
++    float32x4_t a0[4], b0[4], a1[4], b1[4];
++    for (int j = 0; j < 4; j++) {
++        a0[j] = vdupq_n_f32(0.0f); b0[j] = vdupq_n_f32(0.0f);
++        a1[j] = vdupq_n_f32(0.0f); b1[j] = vdupq_n_f32(0.0f);
++    }
++    for (int64_t d = 0; d < DK; d += 8) {
++        const float16x8_t x0 = vld1q_f16(k0 + d);
++        const float16x8_t x1 = vld1q_f16(k1 + d);
++        for (int j = 0; j < 4; j++) {
++            const float16x8_t qv = vld1q_f16(q + j*DK + d);
++            a0[j] = vfmlalq_low_f16 (a0[j], x0, qv);
++            b0[j] = vfmlalq_high_f16(b0[j], x0, qv);
++            a1[j] = vfmlalq_low_f16 (a1[j], x1, qv);
++            b1[j] = vfmlalq_high_f16(b1[j], x1, qv);
++        }
++    }
++    vst1q_f32(w0, ggml_fa_dec_hsum4(vaddq_f32(a0[0], b0[0]), vaddq_f32(a0[1], b0[1]), vaddq_f32(a0[2], b0[2]), vaddq_f32(a0[3], b0[3])));
++    vst1q_f32(w1, ggml_fa_dec_hsum4(vaddq_f32(a1[0], b1[0]), vaddq_f32(a1[1], b1[1]), vaddq_f32(a1[2], b1[2]), vaddq_f32(a1[3], b1[3])));
++}
++
++static inline void ggml_fa_dec_dot1_g4(const __fp16 * k0, const __fp16 * q, int64_t DK, float * w0) {
++    float32x4_t a0[4], b0[4];
++    for (int j = 0; j < 4; j++) { a0[j] = vdupq_n_f32(0.0f); b0[j] = vdupq_n_f32(0.0f); }
++    for (int64_t d = 0; d < DK; d += 8) {
++        const float16x8_t x0 = vld1q_f16(k0 + d);
++        for (int j = 0; j < 4; j++) {
++            const float16x8_t qv = vld1q_f16(q + j*DK + d);
++            a0[j] = vfmlalq_low_f16 (a0[j], x0, qv);
++            b0[j] = vfmlalq_high_f16(b0[j], x0, qv);
++        }
++    }
++    vst1q_f32(w0, ggml_fa_dec_hsum4(vaddq_f32(a0[0], b0[0]), vaddq_f32(a0[1], b0[1]), vaddq_f32(a0[2], b0[2]), vaddq_f32(a0[3], b0[3])));
++}
++
++// acc[j][:] = acc[j][:]*rescale[j] + sum_t w[t][j]*V(idx[t])[:], 16 columns at a time held in registers
++static inline void ggml_fa_dec_accum_v_g4(float * acc, float32x4_t rescale, const char * vbase, size_t nbv1,
++                                          const int32_t * idx, const float * w, int n, int64_t DV, ggml_fa_dec_pf & pf, int pfn) {
++    const float32x4_t s0 = vdupq_laneq_f32(rescale, 0);
++    const float32x4_t s1 = vdupq_laneq_f32(rescale, 1);
++    const float32x4_t s2 = vdupq_laneq_f32(rescale, 2);
++    const float32x4_t s3 = vdupq_laneq_f32(rescale, 3);
++    for (int64_t d = 0; d < DV; d += 16) {
++        float32x4_t r[4][4];
++        for (int c = 0; c < 4; c++) {
++            r[0][c] = vmulq_f32(vld1q_f32(acc + 0*DV + d + 4*c), s0);
++            r[1][c] = vmulq_f32(vld1q_f32(acc + 1*DV + d + 4*c), s1);
++            r[2][c] = vmulq_f32(vld1q_f32(acc + 2*DV + d + 4*c), s2);
++            r[3][c] = vmulq_f32(vld1q_f32(acc + 3*DV + d + 4*c), s3);
++        }
++        for (int t = 0; t < n; t++) {
++            const __fp16 * vp = (const __fp16 *) (vbase + (size_t) idx[t]*nbv1) + d;
++            const float16x8_t v0 = vld1q_f16(vp);
++            const float16x8_t v1 = vld1q_f16(vp + 8);
++            const float32x4_t f0 = vcvt_f32_f16(vget_low_f16(v0));
++            const float32x4_t f1 = vcvt_high_f32_f16(v0);
++            const float32x4_t f2 = vcvt_f32_f16(vget_low_f16(v1));
++            const float32x4_t f3 = vcvt_high_f32_f16(v1);
++            const float32x4_t wt = vld1q_f32(w + 4*t);
++            r[0][0] = vfmaq_laneq_f32(r[0][0], f0, wt, 0); r[0][1] = vfmaq_laneq_f32(r[0][1], f1, wt, 0);
++            r[0][2] = vfmaq_laneq_f32(r[0][2], f2, wt, 0); r[0][3] = vfmaq_laneq_f32(r[0][3], f3, wt, 0);
++            r[1][0] = vfmaq_laneq_f32(r[1][0], f0, wt, 1); r[1][1] = vfmaq_laneq_f32(r[1][1], f1, wt, 1);
++            r[1][2] = vfmaq_laneq_f32(r[1][2], f2, wt, 1); r[1][3] = vfmaq_laneq_f32(r[1][3], f3, wt, 1);
++            r[2][0] = vfmaq_laneq_f32(r[2][0], f0, wt, 2); r[2][1] = vfmaq_laneq_f32(r[2][1], f1, wt, 2);
++            r[2][2] = vfmaq_laneq_f32(r[2][2], f2, wt, 2); r[2][3] = vfmaq_laneq_f32(r[2][3], f3, wt, 2);
++            r[3][0] = vfmaq_laneq_f32(r[3][0], f0, wt, 3); r[3][1] = vfmaq_laneq_f32(r[3][1], f1, wt, 3);
++            r[3][2] = vfmaq_laneq_f32(r[3][2], f2, wt, 3); r[3][3] = vfmaq_laneq_f32(r[3][3], f3, wt, 3);
++            if ((t & 3) == 3) {
++                pf.step(pfn);
++            }
++        }
++        for (int j = 0; j < 4; j++) {
++            for (int c = 0; c < 4; c++) {
++                vst1q_f32(acc + j*DV + d + 4*c, r[j][c]);
++            }
++        }
++    }
++}
++
++static void ggml_fa_dec_chunk_g4(
++        const ggml_tensor * dst, int64_t ic_start, int64_t ic_end, float * scratch, float * partials, int64_t partial_stride) {
++    const ggml_tensor * q     = dst->src[0];
++    const ggml_tensor * k     = dst->src[1];
++    const ggml_tensor * v     = dst->src[2];
++    const ggml_tensor * mask  = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
++
++    const int64_t DK     = k->ne[0];
++    const int64_t DV     = v->ne[0];
++    const int64_t n_head = q->ne[2];
++    const int64_t rk2    = q->ne[2]/k->ne[2];
++    const int64_t rv2    = q->ne[2]/v->ne[2];
++    const size_t  nbk1   = k->nb[1];
++    const size_t  nbv1   = v->nb[1];
++
++    float scale         = 1.0f;
++    float max_bias      = 0.0f;
++    float logit_softcap = 0.0f;
++    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
++    if (logit_softcap != 0) {
++        scale /= logit_softcap;
++    }
++    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2((double) n_head));
++    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
++    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
++
++    // scratch layout as in the template kernel (its [GB][BKV] score area is unused here)
++    __fp16  * Q16 = (__fp16 *) scratch;               // [n_head][DK]
++    float   * acc = scratch + n_head*DK/2;            // [n_head][DV]
++    float   * M   = acc + n_head*DV;                  // [n_head]
++    float   * S   = M + n_head;                       // [n_head]
++    float   * w   = S + n_head + FA_DEC_GBMAX*FA_DEC_BKV; // [BKV][4] scores, then probabilities, by position
++    int32_t * idx = (int32_t *) (w + 4*FA_DEC_BKV);   // [BKV] unmasked positions of the block
++    float   * mvl = (float *) (idx + FA_DEC_BKV);     // [BKV] their mask values
++
++    for (int64_t h = 0; h < n_head; h++) {
++        const float * pq = (const float *) ((const char *) q->data + h*q->nb[2]);
++        for (int64_t d = 0; d < DK; d++) {
++            Q16[h*DK + d] = (__fp16) pq[d];
++        }
++        M[h] = -INFINITY;
++        S[h] = 0.0f;
++    }
++    memset(acc, 0, n_head*DV*sizeof(float));
++
++    // ALiBi slopes / soft-capping take the per-lane path
++    const bool plain = max_bias == 0.0f && logit_softcap == 0.0f;
++
++    const ggml_fp16_t * mp = mask ? (const ggml_fp16_t *) mask->data : NULL;
++
++    // prefetch: the KV heads of a cell are contiguous in the KV cache rows
++    const int     pfd   = ggml_fa_dec_pfd();
++    const size_t  kspan = (size_t) (k->ne[2] - 1)*k->nb[2] + DK*sizeof(ggml_fp16_t);
++    const size_t  vspan = (size_t) (v->ne[2] - 1)*v->nb[2] + DV*sizeof(ggml_fp16_t);
++    const bool    pfok  = pfd > 0 && kspan <= nbk1 && vspan <= nbv1;
++    const int64_t n_grp = n_head/4;
++
++    for (int64_t b0 = ic_start; b0 < ic_end; b0 += FA_DEC_BKV) {
++        const int64_t b1 = std::min(b0 + FA_DEC_BKV, ic_end);
++
++        // unmasked positions of this block (the mask is shared by all heads)
++        int n = 0;
++        for (int64_t ic = b0; ic < b1; ic++) {
++            const float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
++            if (mv == -INFINITY) {
++                continue;
++            }
++            idx[n] = (int32_t) ic;
++            mvl[n] = mv;
++            n++;
++        }
++
++        // cells of the block pfd blocks ahead: K lines spread over the score passes, V lines over the V passes
++        ggml_fa_dec_pf kpf, vpf;
++        int kpfn = 0, vpfn = 0;
++        if (pfok && b0 == ic_start) {
++            // prologue: the cells before the first prefetched block, all at once (each thread's first block is ~1/8
++            // of its chunk at 4K context)
++            ggml_fa_dec_pf pk, pv;
++            const int64_t e = std::min<int64_t>(ic_start + pfd, ic_end);
++            pk.p = (const char *) k->data + ic_start*nbk1; pk.end = (const char *) k->data + e*nbk1;
++            pv.p = (const char *) v->data + ic_start*nbv1; pv.end = (const char *) v->data + e*nbv1;
++            pk.step(1 << 20);
++            pv.step(1 << 20);
++        }
++        if (pfok) {
++            const int64_t p0 = b0 + pfd;
++            const int64_t p1 = std::min(p0 + FA_DEC_BKV, ic_end);
++            if (p0 < p1) {
++                kpf.p = (const char *) k->data + p0*nbk1; kpf.end = (const char *) k->data + (p1 - 1)*nbk1 + kspan;
++                vpf.p = (const char *) v->data + p0*nbv1; vpf.end = (const char *) v->data + (p1 - 1)*nbv1 + vspan;
++                const int64_t klines = (kpf.end - kpf.p + 63)/64;
++                const int64_t vlines = (vpf.end - vpf.p + 63)/64;
++                const int64_t ksteps = std::max<int64_t>(1, n_grp*(n/2));
++                const int64_t vsteps = std::max<int64_t>(1, n_grp*(DV/16)*(n/4));
++                kpfn = (int) ((klines + ksteps - 1)/ksteps);
++                vpfn = (int) ((vlines + vsteps - 1)/vsteps);
++            }
++        }
++
++        for (int64_t h0 = 0; n > 0 && h0 < n_head; h0 += 4) {
++            const char * kbase = (const char *) k->data + (h0/rk2)*k->nb[2];
++            const char * vbase = (const char *) v->data + (h0/rv2)*v->nb[2];
++            const __fp16 * Qg  = Q16 + h0*DK;
++
++            // scores, position-major
++            int t = 0;
++            for (; t + 1 < n; t += 2) {
++                ggml_fa_dec_dot2_g4((const __fp16 *) (kbase + (size_t) idx[t]*nbk1), (const __fp16 *) (kbase + (size_t) idx[t + 1]*nbk1), Qg, DK, w + 4*t, w + 4*(t + 1));
++                kpf.step(kpfn);
++            }
++            if (t < n) {
++                ggml_fa_dec_dot1_g4((const __fp16 *) (kbase + (size_t) idx[t]*nbk1), Qg, DK, w + 4*t);
++            }
++
++            // block softmax across the 4 heads, merged into the running (M, S)
++            float32x4_t vmb = vdupq_n_f32(-INFINITY);
++            if (plain) {
++                const float32x4_t vscale = vdupq_n_f32(scale);
++                for (int i = 0; i < n; i++) {
++                    // round s*scale before adding the mask, as the template kernel's scalar loop does; with
++                    // -ffp-model=fast the compiler would otherwise fuse this into one FMA (differs for finite
++                    // non-zero mask values when scale is not a power of 2)
++                    float32x4_t xs = vmulq_f32(vld1q_f32(w + 4*i), vscale);
++                    __asm__("" : "+w"(xs));
++                    const float32x4_t x = vaddq_f32(xs, vdupq_n_f32(mvl[i]));
++                    vst1q_f32(w + 4*i, x);
++                    vmb = vmaxq_f32(vmb, x);
++                }
++            } else {
++                float slope[4];
++                float mb[4] = { -INFINITY, -INFINITY, -INFINITY, -INFINITY };
++                for (int j = 0; j < 4; j++) {
++                    const int64_t h = h0 + j;
++                    slope[j] = (max_bias > 0.0f) ? (h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1)) : 1.0f;
++                }
++                for (int i = 0; i < n; i++) {
++                    for (int j = 0; j < 4; j++) {
++                        float x = w[4*i + j]*scale;
++                        if (logit_softcap != 0.0f) {
++                            x = logit_softcap*tanhf(x);
++                        }
++                        x += slope[j]*mvl[i];
++                        w[4*i + j] = x;
++                        mb[j] = std::max(mb[j], x);
++                    }
++                }
++                vmb = vld1q_f32(mb);
++            }
++            float mo[4], mn[4], rs[4];
++            vst1q_f32(mo, vld1q_f32(M + h0));
++            const float32x4_t Mnew = vmaxq_f32(vld1q_f32(mo), vmb);
++            vst1q_f32(mn, Mnew);
++            for (int j = 0; j < 4; j++) {
++                rs[j] = mo[j] == -INFINITY ? 0.0f : expf(mo[j] - mn[j]);
++            }
++            vst1q_f32(M + h0, Mnew);
++            const float32x4_t rescale = vld1q_f32(rs);
++
++            // sums kept per position mod 4 and combined as vaddvq_f32 combines its lanes
++            float32x4_t s4[4] = { vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) };
++            int i = 0;
++            for (; i + 3 < n; i += 4) {
++                const float32x4_t p0 = ggml_v_expf(vsubq_f32(vld1q_f32(w + 4*i + 0),  Mnew));
++                const float32x4_t p1 = ggml_v_expf(vsubq_f32(vld1q_f32(w + 4*i + 4),  Mnew));
++                const float32x4_t p2 = ggml_v_expf(vsubq_f32(vld1q_f32(w + 4*i + 8),  Mnew));
++                const float32x4_t p3 = ggml_v_expf(vsubq_f32(vld1q_f32(w + 4*i + 12), Mnew));
++                vst1q_f32(w + 4*i + 0, p0); s4[0] = vaddq_f32(s4[0], p0);
++                vst1q_f32(w + 4*i + 4, p1); s4[1] = vaddq_f32(s4[1], p1);
++                vst1q_f32(w + 4*i + 8, p2); s4[2] = vaddq_f32(s4[2], p2);
++                vst1q_f32(w + 4*i + 12, p3); s4[3] = vaddq_f32(s4[3], p3);
++            }
++            for (; i < n; i++) {
++                const float32x4_t p = ggml_v_expf(vsubq_f32(vld1q_f32(w + 4*i), Mnew));
++                vst1q_f32(w + 4*i, p);
++                s4[i & 3] = vaddq_f32(s4[i & 3], p);
++            }
++            const float32x4_t tot = vaddq_f32(vaddq_f32(s4[0], s4[1]), vaddq_f32(s4[2], s4[3]));
++            vst1q_f32(S + h0, vfmaq_f32(tot, vld1q_f32(S + h0), rescale));
++
++            ggml_fa_dec_accum_v_g4(acc + h0*DV, rescale, vbase, nbv1, idx, w, n, DV, vpf, vpfn);
++        }
++        // whatever the passes did not cover
++        kpf.step(1 << 20);
++        vpf.step(1 << 20);
++    }
++
++    for (int64_t h = 0; h < n_head; h++) {
++        float * VKQ = acc + h*DV;
++
++        // sinks - apply only on the first kv-chunk
++        if (sinks && ic_start == 0) {
++            const float s = ((const float *) sinks->data)[h];
++            float ms = 1.0f;
++            float vs = 1.0f;
++            if (s > M[h]) {
++                ms = expf(M[h] - s);
++                M[h] = s;
++                ggml_vec_scale_f32(DV, VKQ, ms);
++            } else {
++                vs = expf(s - M[h]);
++            }
++            S[h] = S[h]*ms + vs;
++        }
++
++        float * partial = partials + h*partial_stride;
++        partial[0] = M[h];
++        partial[1] = S[h];
++        memcpy(partial + 2, VKQ, DV*sizeof(float));
++    }
++}
++
 +// can the decode kernel take this FLASH_ATTN_EXT node (given the split-KV path is taken)?
 +static bool ggml_fa_dec_supported(const ggml_tensor * dst) {
 +    const ggml_tensor * q    = dst->src[0];
@@ -2636,7 +3142,13 @@ index 7a73e13..064e99f 100644
 +static void ggml_fa_dec_chunk(
 +        const ggml_tensor * dst, int64_t ic_start, int64_t ic_end, float * scratch, float * partials, int64_t partial_stride) {
 +    switch (ggml_fa_dec_gb(dst->src[0]->ne[2] / dst->src[1]->ne[2])) {
-+        case 4:  ggml_fa_dec_chunk_t<4>(dst, ic_start, ic_end, scratch, partials, partial_stride); break;
++        case 4:
++            if (ggml_fa_dec_v2_enabled()) {
++                ggml_fa_dec_chunk_g4(dst, ic_start, ic_end, scratch, partials, partial_stride);
++            } else {
++                ggml_fa_dec_chunk_t<4>(dst, ic_start, ic_end, scratch, partials, partial_stride);
++            }
++            break;
 +        case 3:  ggml_fa_dec_chunk_t<3>(dst, ic_start, ic_end, scratch, partials, partial_stride); break;
 +        case 2:  ggml_fa_dec_chunk_t<2>(dst, ic_start, ic_end, scratch, partials, partial_stride); break;
 +        default: ggml_fa_dec_chunk_t<1>(dst, ic_start, ic_end, scratch, partials, partial_stride); break;
@@ -2647,7 +3159,7 @@ index 7a73e13..064e99f 100644
  static void ggml_compute_forward_flash_attn_ext_f16(
          const ggml_compute_params * params,
          ggml_tensor * dst) {
-@@ -9579,7 +9945,20 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9579,7 +10292,20 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t partial_stride = nth * partial_size;
          float *       chunk_partials = partials_base + ith * partial_size;
  
@@ -2669,7 +3181,7 @@ index 7a73e13..064e99f 100644
              for (int64_t q_head = 0; q_head < neq2; q_head++) {
                  ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                      params, dst, q_head, q_head + 1, ic_start, ic_end,
-@@ -11202,7 +11581,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11202,7 +11928,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
      const ggml_compute_params * params,
      ggml_tensor * dst,
      int64_t ir0,
@@ -2679,7 +3191,7 @@ index 7a73e13..064e99f 100644
  
      ggml_tensor * src_q     = dst->src[0];
      ggml_tensor * src_k     = dst->src[1];
-@@ -11282,18 +11662,64 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11282,18 +12009,64 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
  
          // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
          // For K>1, work in scratch and copy out per-token when the slot is in range.
@@ -2746,7 +3258,7 @@ index 7a73e13..064e99f 100644
          for (int64_t t = 0; t < n_tokens; t++) {
              const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
              const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
-@@ -11354,7 +11780,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11354,7 +12127,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
  
  static void ggml_compute_forward_gated_delta_net_f32(
          const ggml_compute_params * params,
@@ -2756,7 +3268,7 @@ index 7a73e13..064e99f 100644
  
      ggml_tensor * V = dst->src[2];
      int64_t nr = V->ne[1] * V->ne[3];
-@@ -11388,7 +11815,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -11388,7 +12162,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
          const int64_t ir0 = dr * current_chunk;
          const int64_t ir1 = MIN(ir0 + dr, nr);
  
@@ -2765,7 +3277,7 @@ index 7a73e13..064e99f 100644
          current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
      }
  }
-@@ -11410,6 +11837,17 @@ void ggml_compute_forward_gated_delta_net(
+@@ -11410,6 +12184,17 @@ void ggml_compute_forward_gated_delta_net(
      }
  }
  
@@ -3256,7 +3768,7 @@ index 2632ae3..5be2275 100644
 +    moe_traits(down)->moe_down(params, down, weights, out);
 +}
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 605c23c..7ba4097 100644
+index 605c23c..3629d4e 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -3,6 +3,7 @@
@@ -3267,7 +3779,7 @@ index 605c23c..7ba4097 100644
  #include <stdlib.h>
  #include <string.h>
  #include <time.h>
-@@ -152,6 +153,17 @@ static size_t opt_mbuf_total  = 0;                        // total buffer space
+@@ -152,6 +153,18 @@ static size_t opt_mbuf_total  = 0;                        // total buffer space
  static int    opt_mm_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
  static int    opt_fa_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
  static int    opt_fa_head_split = 1; // 1 = partition flash_attn by KV heads in multicore (default on), 0 = token-based (original)
@@ -3277,6 +3789,7 @@ index 605c23c..7ba4097 100644
 +static int    opt_fa_norm_store = 1; // HMX flash_attn with FA_HMX_L: 1 = O / l on HVX in the O store, 0 = diag(1/l) + HMX norm
 +static int    opt_fa_il_opt     = 7; // HMX flash_attn IL softmax: 0 = F10 exp2, 7 = floor-based degree-2 exp2 + 2^k by integer multiply + clamp check per 64 rows, 14 = same with degree 3, 6 = F10 polynomial with the other two
 +static int    opt_fa_mscan      = 1; // HMX flash_attn: 1 = KV skip/trim from the parallel per-row mask scan, 0 = separate single-thread block scan
++static int    opt_fa_mscan_cache = 1; // HMX flash_attn (with FA_MSCAN): reuse the mask-scan results of the previous FA ops of the same batch
 +static int    opt_fa_ztail      = 1; // HMX flash_attn (with FA_MSCAN): 1 = P = 0 without the exp2 for chunks past a row's last unmasked chunk
 +static int    opt_fa_hmx_l      = 1; // HMX flash_attn: 1 = row sums l by HMX via a ones column appended to V (IL softmax only), 0 = HVX row sums
 +static int    opt_fa_hmx_l_max_kv = 32768; // HMX flash_attn: FA_HMX_L only up to this many KV rows (fp16 l <= n_kv)
@@ -3285,12 +3798,13 @@ index 605c23c..7ba4097 100644
  static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  static int    opt_ar_select  = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
-@@ -166,7 +178,70 @@ static int opt_opqueue  = 8;   // max number of pending batches
+@@ -166,7 +179,72 @@ static int opt_opqueue  = 8;   // max number of pending batches
  static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
  static int opt_oppoll   = 0;    // polling for batch completions
  static int opt_opfusion  = 1;    // enable/disable op fusion
 +static int opt_mm_add_ddr = 0;
 +static int opt_norm_tiled = 1;  // RMS_NORM+MUL read only by 2D HMX matmuls: fp16 activation tiles (HTP_NORM_PARAM_TILED / HTP_MM_ACT_TILED_IN)
++static int opt_norm_fuse = 7;  // bit-identical kernel variants: 1 = one-pass gated norm, 2 = tiled RMS_NORM+MUL output in the norm pass (HTP_NORM_PARAM_FUSE), 4 = 4-pair fp16 sigmoid gate (SIG_GATE, HTP_GLU_PARAM_HF bit 2); 0 = old kernels
 +static int opt_dense_f16_act = 1;  // dense MUL_MAT_NX+SWIGLU -> MUL_MAT(+ADD): fp16 tiled hand-off (HTP_MM_ACT_F16OUT / HTP_MM_ACT_TILED_IN)
 +static int opt_add_stage = 1;  // MUL_MAT+ADD with a DDR src2: DMA each src2 chunk into VTCM ahead of the output store (HTP_MM_ADD_STAGE)
 +static int opt_out_split = 1;  // HMX matmul output store split (HTP_MM_OUT_SPLIT_SHIFT mode): 1 = rows for a DDR src2 add
@@ -3311,14 +3825,15 @@ index 605c23c..7ba4097 100644
 +                                    // Not with GGML_HEXAGON_SWIGLU_HF=0. Bisecting the whole MoE+dense SWIGLU change back to
 +                                    // the old graph needs GGML_HEXAGON_MMID_SWIGLU=0 and GGML_HEXAGON_NX_SWIGLU=2.
 +static int opt_dq4_v2 = 1;         // v2 Q4_0 / IQ4_NL weight dequant kernel on the DSP (bit-identical; 0 = v1, HTP_OPFLAG_DQ4_V1)
-+static int opt_moe_qacc = 0;       // 1 = MOE_REDUCE keeps the weighted expert sum (+ residual) in qf32 and rounds once instead
-+                                   // of the per-step MUL / ADD rounding (changes numerics; no gain on its own, see below)
-+static int opt_moe_f16 = 0;        // 1 = expert down MUL_MAT_ID whose output only feeds a MOE_REDUCE (same batch) stores its fp16
++static int opt_moe_qacc = 0;       // 1 = MOE_REDUCE keeps the weighted expert sum (+ residual) in qf32 and rounds once. With 4
++                                   // experts and f32 inputs that is what the default path computes anyway (see binary-ops.c);
++                                   // with fp16 inputs (MOE_F16) it multiplies in qf32 x qf32 and changes numerics, no gain
++static int opt_moe_f16 = 1;        // 1 = expert down MUL_MAT_ID whose output only feeds a MOE_REDUCE (same batch) stores its fp16
 +                                   // HMX results as fp16 rows, and the MOE_REDUCE widens them (half the DDR bytes of that
-+                                   // intermediate). OFF by default: on LFM2.5-24B it is not bit-identical to the f32 hand-off
-+                                   // (ppl -ub 8 +0.3%, greedy text differs) although test-backend-ops cannot tell them apart
-+                                   // and the producer side was shown to be exact; root cause not found. Only pays off
-+                                   // together with GGML_HEXAGON_MOE_QACC=1 (LFM pp2048 +1.7% over DQ4_V2 alone).
++                                   // intermediate); bit-identical to the f32 hand-off (MOE_REDUCE runs the same qf32 chain on
++                                   // the widened values). LFM2.5-24B pp2048 +1.5%, pp4096 +0.8..1.4% (varies by run). 0 = f32
++                                   // hand-off; 2 = fp16 hand-off with every product and sum rounded (debug only: the numerics
++                                   // that =1 had before it became bit-identical; not bit-identical for 4 experts)
 +static int opt_mmid_act_tiled = 1; // fp16 SWIGLU intermediate (GGML_HEXAGON_MMID_SWIGLU_F16) of two expert ops with the same ids:
 +                                   // stored expert-sorted in HMX activation tiles, so the down kernel loads each M-chunk
 +                                   // with one prefetched block DMA instead of a per-row gather (0 = per-row layout)
@@ -3356,7 +3871,7 @@ index 605c23c..7ba4097 100644
  
  enum ggml_hexagon_fusion_flags {
      GGML_HEXAGON_FUSE_ALLREDUCE_ADD = (1 << 1), // 2
-@@ -175,6 +250,12 @@ enum ggml_hexagon_fusion_flags {
+@@ -175,6 +253,12 @@ enum ggml_hexagon_fusion_flags {
      GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
      GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
      GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
@@ -3369,7 +3884,7 @@ index 605c23c..7ba4097 100644
  };
  
  static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
-@@ -315,6 +396,10 @@ enum ggml_hexagon_tensor_flags {
+@@ -315,6 +399,10 @@ enum ggml_hexagon_tensor_flags {
      GGML_HEXAGON_TENSOR_WEIGHT    = (1 << 1),
      GGML_HEXAGON_TENSOR_FENCE     = (1 << 2),
      GGML_HEXAGON_TENSOR_FUSEABLE  = (1 << 3),
@@ -3380,7 +3895,7 @@ index 605c23c..7ba4097 100644
  };
  
  struct ggml_hexagon_session;
-@@ -483,6 +568,7 @@ struct ggml_hexagon_tensor_extra {
+@@ -483,6 +571,7 @@ struct ggml_hexagon_tensor_extra {
      std::vector<uint8_t> shadow_buf;
      size_t               shadow_size { 0 };
      uint32_t             flags { 0 };
@@ -3388,7 +3903,15 @@ index 605c23c..7ba4097 100644
  };
  
  static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
-@@ -618,7 +704,7 @@ struct ggml_hexagon_session {
+@@ -596,6 +685,7 @@ struct ggml_hexagon_session {
+     std::atomic<uint32_t> last_error{HTP_STATUS_OK};
+ 
+     uint64_t                cached_uid = 0;
++    bool                    graph_start_pending = false;  // tag the next enqueued op with HTP_OPFLAG_GRAPH_START
+     std::vector<htp_opnode> cached_nodes;
+ 
+     ggml_hexagon_mdev_group                mdev;
+@@ -618,7 +708,7 @@ struct ggml_hexagon_session {
      std::unordered_map<uint64_t, volatile uint32_t *> cpy_fence_slots;
  
      void enqueue_mdev_group();
@@ -3397,7 +3920,7 @@ index 605c23c..7ba4097 100644
      void enqueue_cpy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * sync_tensor = nullptr, uint32_t fence_seq = 0);
      void enqueue_fence(const ggml_tensor * sync_tensor, uint32_t fence_seq = 0, bool wait = true);
      void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors,
-@@ -1607,6 +1693,32 @@ struct ggml_hexagon_opbatch {
+@@ -1607,6 +1697,32 @@ struct ggml_hexagon_opbatch {
          return ti;
      }
  
@@ -3430,7 +3953,7 @@ index 605c23c..7ba4097 100644
      bool fit_op(const htp_opnode & node) const {
          if (n_ops >= n_ops_max) return false;
  
-@@ -1667,7 +1779,7 @@ struct ggml_hexagon_opbatch {
+@@ -1667,7 +1783,7 @@ struct ggml_hexagon_opbatch {
          memcpy(o.params,        node.node->op_params, sizeof(node.node->op_params));
          memcpy(o.kernel_params, node.kernel_params,   sizeof(o.kernel_params));
          o.opcode = node.opcode;
@@ -3439,7 +3962,7 @@ index 605c23c..7ba4097 100644
  
          ggml_hexagon_dump_op_exec(sess->c_name(), ops[n], o.flags);
  
-@@ -1918,7 +2030,10 @@ struct ggml_hexagon_opbatch {
+@@ -1918,7 +2034,10 @@ struct ggml_hexagon_opbatch {
          if (!ggml_are_same_shape(src0, node.dst())) {
              return false;
          }
@@ -3451,7 +3974,7 @@ index 605c23c..7ba4097 100644
              return false;
          }
  
-@@ -1998,34 +2113,50 @@ struct ggml_hexagon_opbatch {
+@@ -1998,34 +2117,50 @@ struct ggml_hexagon_opbatch {
          const struct htp_mm_kernel_params * orig_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
          struct htp_mm_kernel_params kparams;
          ggml_hexagon_precompute_fused_matmul_add_params(sess, src0, src1, src2, node.dst(), &kparams);
@@ -3525,7 +4048,7 @@ index 605c23c..7ba4097 100644
          }
  
          if (!try_fuse_common(src2, node.dst())) {
-@@ -2419,14 +2550,529 @@ struct ggml_hexagon_opbatch {
+@@ -2419,14 +2554,530 @@ struct ggml_hexagon_opbatch {
          return true;
      }
  
@@ -3781,6 +4304,7 @@ index 605c23c..7ba4097 100644
 +        if (cons.empty() || uses != ex->n_mm_uses) return;
 +
 +        h_ops[n].params[HTP_NORM_PARAM_TILED] = 1;
++        h_ops[n].params[HTP_NORM_PARAM_FUSE] |= opt_norm_fuse & 2;
 +        for (unsigned int j : cons) {
 +            ((struct htp_mm_kernel_params *) h_ops[j].kernel_params)->pipeline |= HTP_MM_ACT_TILED_IN;
 +            ((struct htp_mm_kernel_params *) ops[j].kernel_params)->pipeline |= HTP_MM_ACT_TILED_IN;
@@ -3902,7 +4426,7 @@ index 605c23c..7ba4097 100644
 +
 +            pk->pipeline |= HTP_MMID_STREAM_OUT_F16;
 +            ((struct htp_mm_kernel_params *) p.kernel_params)->pipeline |= HTP_MMID_STREAM_OUT_F16;
-+            h_ops[n].params[HTP_MOE_PARAM_X_F16] = 1;
++            h_ops[n].params[HTP_MOE_PARAM_X_F16] = opt_moe_f16 == 2 ? 2 : 1;  // 2: round-5 per-op rounding
 +            HEX_VERBOSE("ggml-hex: %s fp16 expert outputs #%d -> MOE_REDUCE #%u\n", sess->c_name(), j, n);
 +            return;
 +        }
@@ -4055,7 +4579,7 @@ index 605c23c..7ba4097 100644
          return false;
      }
  };
-@@ -2693,6 +3339,18 @@ void ggml_hexagon_session::start_batch() {
+@@ -2693,6 +3344,18 @@ void ggml_hexagon_session::start_batch() {
  void ggml_hexagon_session::flush_batch(size_t min_ops) {
      if (op_batch->n_ops < min_ops) { return; }
  
@@ -4074,7 +4598,7 @@ index 605c23c..7ba4097 100644
      op_batch->sort_buffers();
  
      htp_opbatch_req req {};
-@@ -2737,7 +3395,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+@@ -2737,7 +3400,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
      op_batch->reset();
  }
  
@@ -4083,7 +4607,7 @@ index 605c23c..7ba4097 100644
      auto clone_tensor_buffer = [this](const ggml_tensor * t) {
          auto sbuf = this->mmap_tensor(t);
          if (!sbuf) return;
-@@ -2762,6 +3420,11 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+@@ -2762,6 +3425,11 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
  
      if (!op_batch->fit_op(node)) {
          flush_async();
@@ -4095,10 +4619,16 @@ index 605c23c..7ba4097 100644
      }
  
      if (op_batch->empty()) {
-@@ -2774,6 +3437,12 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+@@ -2774,6 +3442,18 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
      }
  
      op_batch->add_op(node);
++    if (graph_start_pending) {
++        // the open batch may still hold ops of the previous graph (graph_compute does not flush at its end):
++        // the DSP drops the FA mask-scan cache entries here, so they never outlive the graph whose mask they scanned
++        op_batch->h_ops[op_batch->n_ops - 1].flags |= HTP_OPFLAG_GRAPH_START;
++        graph_start_pending = false;
++    }
 +    if (opt_mmid_swiglu_f16) {
 +        op_batch->try_f16_act(op_batch->n_ops - 1);
 +    }
@@ -4108,7 +4638,7 @@ index 605c23c..7ba4097 100644
  }
  
  void ggml_hexagon_session::enqueue_mdev_group() {
-@@ -3548,7 +4217,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3548,7 +4228,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
      kparams->logit_softcap = logit_softcap;
  
      kparams->head_split = (opt_fa_head_split != 0) ? 1 : 0;
@@ -4119,7 +4649,7 @@ index 605c23c..7ba4097 100644
      kparams->G = G;
  
      const uint32_t n_head = q->ne[2];
-@@ -3565,7 +4236,12 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3565,7 +4247,12 @@ static bool ggml_hexagon_precompute_flash_attn_params(
          const uint32_t DK_pad = hex_round_up(DK, 64);
          const uint32_t DV_pad = hex_round_up(DV, 64);
          size_t Br = 0, Bc = 0;
@@ -4133,12 +4663,12 @@ index 605c23c..7ba4097 100644
          if (ret == 0) {
              kparams->kernel_type = HTP_FA_KERNEL_HMX;
              if (logit_softcap == 0.0f) {
-@@ -3582,7 +4258,11 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3582,7 +4269,11 @@ static bool ggml_hexagon_precompute_flash_attn_params(
  
              kparams->u.hmx.g_br = hex_align_up(G * Br, 32);
              kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? 1 : 0;
 -            kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head);
-+            kparams->u.hmx.flags2   = (uint16_t) ((opt_fa_il_opt & 15) | (opt_fa_mscan ? 0 : HTP_FA_FLAG2_NO_MSCAN) | (opt_fa_ztail ? 0 : HTP_FA_FLAG2_NO_ZTAIL));
++            kparams->u.hmx.flags2   = (uint16_t) ((opt_fa_il_opt & 15) | (opt_fa_mscan ? 0 : HTP_FA_FLAG2_NO_MSCAN) | (opt_fa_ztail ? 0 : HTP_FA_FLAG2_NO_ZTAIL) | (opt_fa_mscan_cache ? HTP_FA_FLAG2_MSCAN_CACHE : 0));
 +            kparams->vtcm_size = hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, Br, Bc, kparams->n_threads, kparams->u.hmx.pipeline != 0, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, hmx_l);
 +            if (hmx_l) {
 +                kparams->flags |= HTP_FA_FLAG_HMX_L;
@@ -4146,7 +4676,7 @@ index 605c23c..7ba4097 100644
  
              const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
              kparams->u.hmx.row_buf_stride = row_vec_bytes / 128; // HVX vector is 128 bytes
-@@ -3889,10 +4569,37 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3889,10 +4580,37 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
          if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, m_for_solver_padded, cost_m, n_threads, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
              return false;
          }
@@ -4185,7 +4715,7 @@ index 605c23c..7ba4097 100644
      kparams->m_chunk = m_chunk;
      kparams->n_chunk = n_chunk;
      kparams->n_threads = n_threads;
-@@ -4504,6 +5211,12 @@ static void ggml_hexagon_precompute_unary_params(
+@@ -4504,6 +5222,12 @@ static void ggml_hexagon_precompute_unary_params(
      kparams->vtcm_dst_size  = L.dst_bytes * n_threads;
  
      kparams->block = col_tile ? 0 : ((L.src0_bytes / 2) / src0_row_size_aligned);
@@ -4198,7 +4728,7 @@ index 605c23c..7ba4097 100644
  
      const uint32_t tiles_per_row = col_tile > 0 ? (src0->ne[0] + col_tile - 1) / col_tile : 1;
      kparams->div_ne01  = init_fastdiv_values(src0->ne[1]);
-@@ -4559,6 +5272,13 @@ static void ggml_hexagon_precompute_get_rows_params(
+@@ -4559,6 +5283,13 @@ static void ggml_hexagon_precompute_get_rows_params(
      }
  
      kparams->vtcm_size = (total_tasks == 0) ? 0 : vtcm_layout.total_bytes;
@@ -4212,7 +4742,7 @@ index 605c23c..7ba4097 100644
      kparams->tasks_per_thread = kparams->n_threads > 0 ? (total_tasks + kparams->n_threads - 1) / kparams->n_threads : 0;
      kparams->total_tasks = total_tasks;
  
-@@ -4680,9 +5400,11 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4680,9 +5411,11 @@ static void ggml_hexagon_precompute_rope_params(
      const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, src0_nrows);
      const uint32_t n_freq_factors = src2 ? (uint32_t) src2->ne[0] : 0;
  
@@ -4225,7 +4755,7 @@ index 605c23c..7ba4097 100644
      kparams->n_threads              = n_threads;
      kparams->src0_nrows             = src0_nrows;
      kparams->src0_nrows_per_thread  = (src0_nrows + n_threads - 1) / n_threads;
-@@ -4692,6 +5414,9 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4692,6 +5425,9 @@ static void ggml_hexagon_precompute_rope_params(
      kparams->src0_row_size_aligned  = (uint32_t) layout.src0_row_size_aligned;
      kparams->freq_factors_offset    = (uint32_t) (layout.bytes_per_thread * n_threads);
      kparams->freq_factors_size      = (uint32_t) layout.freq_factors_size_aligned;
@@ -4235,7 +4765,7 @@ index 605c23c..7ba4097 100644
  
      if (src0_nrows > 0) {
          kparams->div_ne2_ne1 = init_fastdiv_values(dst->ne[2] * dst->ne[1]);
-@@ -4699,12 +5424,13 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4699,12 +5435,13 @@ static void ggml_hexagon_precompute_rope_params(
      }
  }
  
@@ -4251,7 +4781,7 @@ index 605c23c..7ba4097 100644
  ) {
      memset(kparams, 0, sizeof(*kparams));
  
-@@ -4714,7 +5440,7 @@ static void ggml_hexagon_precompute_ssm_conv_params(
+@@ -4714,7 +5451,7 @@ static void ggml_hexagon_precompute_ssm_conv_params(
      const uint32_t n_s     = (uint32_t) dst->ne[2];
      const uint32_t ncs     = (uint32_t) src0->ne[0];
  
@@ -4260,7 +4790,7 @@ index 605c23c..7ba4097 100644
  
      kparams->n_threads = n_threads;
      kparams->d_conv    = d_conv;
-@@ -4783,6 +5509,23 @@ static void ggml_hexagon_precompute_ssm_conv_params(
+@@ -4783,6 +5520,23 @@ static void ggml_hexagon_precompute_ssm_conv_params(
      kparams->vtcm_size      = kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size;
  }
  
@@ -4284,7 +4814,7 @@ index 605c23c..7ba4097 100644
  static void ggml_hexagon_precompute_gated_delta_net_params(
      const struct ggml_hexagon_session * sess,
      const struct ggml_tensor * op,
-@@ -4820,13 +5563,29 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
+@@ -4820,13 +5574,29 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
  
      if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout, S_v, HTP_GDN_CHUNK_SIZE, total_rows, sess->vtcm_size, n_threads, true, &n_heads_batch)) {
          kparams->kernel_type     = HTP_GDN_KERNEL_HMX_CHUNKED;
@@ -4315,7 +4845,7 @@ index 605c23c..7ba4097 100644
      } else {
          htp_gdn_vtcm_layout_build(&hvx_layout, S_v, n_threads);
          kparams->kernel_type     = HTP_GDN_KERNEL_HVX_RECURRENT;
-@@ -6125,7 +6884,8 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
+@@ -6125,7 +6895,8 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
      const uint32_t n_freq_factors = src2 ? (uint32_t) src2->ne[0] : 0;
  
      struct htp_rope_vtcm_layout layout;
@@ -4325,7 +4855,7 @@ index 605c23c..7ba4097 100644
      if (layout.total_bytes > sess->vtcm_size) {
          return false;
      }
-@@ -6905,6 +7665,921 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
+@@ -6905,12 +7676,928 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
      return true;
  }
  
@@ -5247,7 +5777,14 @@ index 605c23c..7ba4097 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -6927,9 +8602,69 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+     if (sess->last_error > HTP_STATUS_OK) {
+         return GGML_STATUS_FAILED;
+     }
++    sess->graph_start_pending = true;
+ 
+     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
+ 
+@@ -6927,9 +8614,69 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              auto * extra = (ggml_hexagon_tensor_extra *) graph->nodes[i]->extra;
              if (!extra) continue;
  
@@ -5319,7 +5856,7 @@ index 605c23c..7ba4097 100644
                  extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
              } else if ((graph->nodes[i]->op == GGML_OP_MUL_MAT &&
                          ggml_get_op_params_i32(graph->nodes[i], 1) != GGML_HINT_SRC0_IS_HADAMARD) ||
-@@ -6943,9 +8678,259 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6943,9 +8690,260 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -5453,6 +5990,7 @@ index 605c23c..7ba4097 100644
 +                    htp_opnode node(HTP_OP_RMS_NORM_MUL, n);
 +                    ggml_tensor * d = node.add_dummy(*n);   // carries the op params (eps + gate mode)
 +                    d->op_params[HTP_NORM_PARAM_GATE] = (opt_silu_hf & 2) ? 1 : 2;
++                    d->op_params[HTP_NORM_PARAM_FUSE] = opt_norm_fuse & 1;
 +                    node.node    = d;
 +                    node.name    = "RMS_NORM+MUL+SILU+MUL";
 +                    node.inputs  = { n->src[0], ngate.w, ngate.z };
@@ -5475,7 +6013,7 @@ index 605c23c..7ba4097 100644
 +                htp_opnode node(HTP_OP_GLU_SWIGLU, mul);
 +                ggml_tensor * d = node.add_dummy(*mul);   // carries the GLU params
 +                memset(d->op_params, 0, sizeof(d->op_params));
-+                d->op_params[HTP_GLU_PARAM_HF]   = opt_sig_gate == 1 ? 1 : 0;
++                d->op_params[HTP_GLU_PARAM_HF]   = opt_sig_gate == 1 ? (1 | ((opt_norm_fuse & 4) ? 2 : 0)) : 0;
 +                d->op_params[HTP_GLU_PARAM_MODE] = HTP_GLU_MODE_SIGMUL;
 +                node.node    = d;
 +                node.name    = "CONT+SIGMOID+MUL";
@@ -5580,7 +6118,7 @@ index 605c23c..7ba4097 100644
                  continue;
              }
  
-@@ -6991,8 +8976,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6991,8 +8989,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                  auto inputs = node.get_inputs();
                  const struct ggml_tensor * src0 = inputs[0];
                  const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
@@ -5615,7 +6153,7 @@ index 605c23c..7ba4097 100644
                      (struct htp_unary_kernel_params *)node.kernel_params
                  );
              } else if (node.opcode == HTP_OP_GET_ROWS) {
-@@ -7031,6 +9041,37 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -7031,6 +9054,37 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                      node.opcode == HTP_OP_TOP_K,
                      (struct htp_sort_kernel_params *) node.kernel_params
                  );
@@ -5653,7 +6191,7 @@ index 605c23c..7ba4097 100644
              } else if (node.opcode == HTP_OP_POOL_2D || node.opcode == HTP_OP_POOL_1D) {
                  ggml_hexagon_precompute_pool_2d_params(
                      sess, node.node->src[0], node.dst(),
-@@ -7074,8 +9115,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -7074,8 +9128,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
      }
  
      // Queue and execute
@@ -5664,7 +6202,7 @@ index 605c23c..7ba4097 100644
      }
  
      if (sess->last_error > HTP_STATUS_OK) {
-@@ -8369,7 +10410,56 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8369,7 +10423,57 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
      const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
      const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
@@ -5677,6 +6215,7 @@ index 605c23c..7ba4097 100644
 +    const char * str_add_stage      = getenv("GGML_HEXAGON_ADD_STAGE");
 +    const char * str_dense_f16_act  = getenv("GGML_HEXAGON_DENSE_F16_ACT");
 +    const char * str_norm_tiled     = getenv("GGML_HEXAGON_NORM_TILED");
++    const char * str_norm_fuse      = getenv("GGML_HEXAGON_NORM_FUSE");
 +    const char * str_mm_force       = getenv("GGML_HEXAGON_MM_FORCE"); // "k:mc:nc"
 +    if (str_mm_force) {
 +        if (sscanf(str_mm_force, "%d:%d:%d", &opt_mm_force_k, &opt_mm_force_mc, &opt_mm_force_nc) != 3 ||
@@ -5721,7 +6260,7 @@ index 605c23c..7ba4097 100644
      const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
      const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
      const char * str_etm      = getenv("GGML_HEXAGON_ETM");
-@@ -8378,6 +10468,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8378,6 +10482,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
      const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
      const char * str_fa_head_split = getenv("GGML_HEXAGON_FA_HEAD_SPLIT");
@@ -5739,7 +6278,7 @@ index 605c23c..7ba4097 100644
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
-@@ -8427,6 +10528,50 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8427,6 +10542,56 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
      opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
      opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
@@ -5752,6 +6291,7 @@ index 605c23c..7ba4097 100644
 +    opt_add_stage      = str_add_stage      ? atoi(str_add_stage)         : opt_add_stage;
 +    opt_dense_f16_act  = str_dense_f16_act  ? atoi(str_dense_f16_act)     : opt_dense_f16_act;
 +    opt_norm_tiled     = str_norm_tiled     ? atoi(str_norm_tiled)        : opt_norm_tiled;
++    opt_norm_fuse      = str_norm_fuse      ? atoi(str_norm_fuse)         : opt_norm_fuse;
 +    opt_mmid_stream    = str_mmid_stream    ? atoi(str_mmid_stream)       : opt_mmid_stream;
 +    opt_nx_swiglu = str_nx_swiglu ? atoi(str_nx_swiglu)                   : opt_nx_swiglu;
 +    opt_mmid_swiglu = str_mmid_swiglu ? atoi(str_mmid_swiglu)             : opt_mmid_swiglu;
@@ -5760,6 +6300,11 @@ index 605c23c..7ba4097 100644
 +    opt_mmid_act_tiled = str_mmid_act_tiled ? atoi(str_mmid_act_tiled)    : opt_mmid_act_tiled;
 +    opt_moe_f16     = str_moe_f16     ? atoi(str_moe_f16)                 : opt_moe_f16;
 +    opt_moe_qacc    = str_moe_qacc    ? atoi(str_moe_qacc)                : opt_moe_qacc;
++    if (opt_moe_f16 == 2 || (opt_moe_f16 && opt_moe_qacc)) {
++        // =1 used to mean these numerics; say so, since the same setting is now bit-identical to the f32 hand-off
++        GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_MOE_F16=%d%s: fp16 MoE hand-off NOT bit-identical to the f32 hand-off\n",
++                      opt_moe_f16, opt_moe_qacc ? " with MOE_QACC=1" : " (old per-op rounding)");
++    }
 +    opt_dq4_v2      = str_dq4_v2      ? atoi(str_dq4_v2)                  : opt_dq4_v2;
 +    opt_sort_topk   = str_sort_topk   ? atoi(str_sort_topk)               : opt_sort_topk;
 +    opt_conv_block_silu = str_conv_block_silu ? atoi(str_conv_block_silu) : opt_conv_block_silu;
@@ -5790,7 +6335,7 @@ index 605c23c..7ba4097 100644
      opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
      opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
      opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
-@@ -8443,6 +10588,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8443,6 +10608,18 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
      opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
      opt_fa_head_split = str_fa_head_split ? atoi(str_fa_head_split)       : opt_fa_head_split;
@@ -5801,6 +6346,7 @@ index 605c23c..7ba4097 100644
 +    opt_fa_hmx_l_max_kv = str_fa_hmx_l_max_kv ? atoi(str_fa_hmx_l_max_kv) : opt_fa_hmx_l_max_kv;
 +    opt_fa_ztail      = str_fa_ztail      ? atoi(str_fa_ztail)            : opt_fa_ztail;
 +    opt_fa_mscan      = str_fa_mscan      ? atoi(str_fa_mscan)            : opt_fa_mscan;
++    { const char * e = getenv("GGML_HEXAGON_FA_MSCAN_CACHE"); if (e) opt_fa_mscan_cache = atoi(e); }
 +    opt_fa_il_opt     = str_fa_il_opt     ? atoi(str_fa_il_opt)           : opt_fa_il_opt;
 +    opt_fa_norm_store = str_fa_norm_store ? atoi(str_fa_norm_store)       : opt_fa_norm_store;
 +    opt_fa_br_max     = str_fa_br_max     ? strtoul(str_fa_br_max, NULL, 0) : opt_fa_br_max;
@@ -5822,10 +6368,10 @@ index 57cd5f2..08cfaf5 100644
              const auto * kparams = (const struct htp_unary_kernel_params *) node.kernel_params;
              snprintf(str, max_size, "%s vtcm %d", kparams->col_tile ? "wide-row" : "row-block", (int) kparams->vtcm_size);
 diff --git a/ggml/src/ggml-hexagon/htp/act-ops.c b/ggml/src/ggml-hexagon/htp/act-ops.c
-index 59a0575..744708d 100644
+index 59a0575..a118d4e 100644
 --- a/ggml/src/ggml-hexagon/htp/act-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/act-ops.c
-@@ -162,8 +162,51 @@ static void swiglu_f32(const float * restrict src0,
+@@ -162,8 +162,57 @@ static void swiglu_f32(const float * restrict src0,
          const uint8_t * restrict src1_ptr = (const uint8_t *) src1 + (ib * src1_row_size_aligned);
          uint8_t * restrict dst_ptr        = (uint8_t *) dst + (ib * dst_row_size_aligned);
  
@@ -5873,13 +6419,19 @@ index 59a0575..744708d 100644
 +                          const struct htp_act_context * actx) {
 +    htp_glu_op_preamble;
 +
++    const bool x4 = (actx->octx->op_params[HTP_GLU_PARAM_HF] & 2) != 0;
 +    for (uint32_t ib = 0; ib < num_rows; ib++) {
++        if (x4) {
++            hvx_sigmul_f32_hf_aa4((uint8_t *) dst + ib * dst_row_size_aligned, (const uint8_t *) src0 + ib * src0_row_size_aligned,
++                                  (const uint8_t *) src1 + ib * src1_row_size_aligned, nc);
++        } else {
 +        hvx_sigmul_f32_hf_aa((uint8_t *) dst + ib * dst_row_size_aligned, (const uint8_t *) src0 + ib * src0_row_size_aligned,
 +                             (const uint8_t *) src1 + ib * src1_row_size_aligned, nc);
++        }
      }
  }
  
-@@ -695,12 +738,20 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
+@@ -695,12 +744,20 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
          return HTP_STATUS_NO_SUPPORT;
      }
  
@@ -5901,7 +6453,7 @@ index 59a0575..744708d 100644
              op_type    = "swiglu-f32";
              break;
  
-@@ -735,7 +786,11 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
+@@ -735,7 +792,11 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
      }
  
      const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
@@ -5914,7 +6466,7 @@ index 59a0575..744708d 100644
  
      uint32_t row_start = 0;
      uint32_t nrows     = src0_nrows;
-@@ -760,7 +815,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
+@@ -760,7 +821,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
      const size_t src0_row_size   = nc_bytes;
      const size_t src1_row_size   = nc_bytes;
      const size_t src0_row_stride = src0->nb[1];
@@ -5923,7 +6475,7 @@ index 59a0575..744708d 100644
  
      const size_t src0_row_size_aligned = hex_round_up(src0_row_size, VLEN);
      const size_t src1_row_size_aligned = hex_round_up(src1_row_size, VLEN);
-@@ -821,16 +876,18 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
+@@ -821,16 +882,18 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
      actx.dst_spad_half_size  = L.dst_bytes_per_thread / 2;
  
      actx.block = actx.src0_spad_half_size / actx.src0_row_size_aligned;
@@ -5944,7 +6496,7 @@ index 59a0575..744708d 100644
                    octx->op == HTP_OP_GLU_SWIGLU_OAI ||
                    octx->op == HTP_OP_GLU_SWIGLU_CLAMP ||
                    octx->op == HTP_OP_GLU_GEGLU ||
-@@ -857,6 +914,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
+@@ -857,6 +920,7 @@ static int execute_op_activations_f32(struct htp_ops_context * octx) {
  }
  
  static int execute_op_activations_f16(struct htp_ops_context * octx) {
@@ -5952,7 +6504,7 @@ index 59a0575..744708d 100644
      const struct htp_tensor * src0 = octx->src[0];
      const struct htp_tensor * src1 = octx->src[1];
      const struct htp_tensor * dst  = octx->dst;
-@@ -921,7 +979,7 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
+@@ -921,7 +985,7 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
      const size_t src0_row_size   = nc_bytes;
      const size_t src1_row_size   = nc_bytes;
      const size_t src0_row_stride = src0->nb[1];
@@ -5961,7 +6513,7 @@ index 59a0575..744708d 100644
  
      const size_t src0_row_size_aligned = hex_round_up(src0_row_size, VLEN);
      const size_t src1_row_size_aligned = hex_round_up(src1_row_size, VLEN);
-@@ -982,16 +1040,18 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
+@@ -982,16 +1046,18 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
      actx.dst_spad_half_size  = L.dst_bytes_per_thread / 2;
  
      actx.block = actx.src0_spad_half_size / actx.src0_row_size_aligned;
@@ -5982,7 +6534,7 @@ index 59a0575..744708d 100644
                    octx->op == HTP_OP_GLU_SWIGLU_OAI ||
                    octx->op == HTP_OP_GLU_SWIGLU_CLAMP ||
                    octx->op == HTP_OP_GLU_GEGLU)) {
-@@ -1016,10 +1076,54 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
+@@ -1016,10 +1082,54 @@ static int execute_op_activations_f16(struct htp_ops_context * octx) {
  }
  
  
@@ -6286,10 +6838,10 @@ index 05320a2..608eb7f 100644
  
  struct htp_sort_vtcm_layout {
 diff --git a/ggml/src/ggml-hexagon/htp/binary-ops.c b/ggml/src/ggml-hexagon/htp/binary-ops.c
-index 78ce4bb..b30dd72 100644
+index 78ce4bb..c5ec1ae 100644
 --- a/ggml/src/ggml-hexagon/htp/binary-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/binary-ops.c
-@@ -1345,3 +1345,296 @@ int op_binary(struct htp_ops_context * octx) {
+@@ -1345,3 +1345,353 @@ int op_binary(struct htp_ops_context * octx) {
  
      return HTP_STATUS_NO_SUPPORT;
  }
@@ -6319,6 +6871,8 @@ index 78ce4bb..b30dd72 100644
 +    size_t                    thread_bytes; // VTCM per thread
 +    bool                      x_f16;        // HTP_MOE_PARAM_X_F16: x rows are fp16 in the first half of each f32 row slot
 +    bool                      qacc;         // HTP_MOE_PARAM_QACC: qf32 products and sums, one rounding at the end
++    bool                      f16_chain;    // x_f16, 4 experts: the qf32 chain of the f32 branch (bit-identical); else
++                                            // every op rounded (HTP_MOE_PARAM_X_F16 = 2, the round-5 numerics)
 +} moe_reduce_ctx_t;
 +
 +// bytes of one expert row of x in VTCM (packed)
@@ -6347,6 +6901,23 @@ index 78ce4bb..b30dd72 100644
 +    if (st->r) {
 +        dma_queue_push(q, dma_make_data(rv, st->r->data + (size_t) t * st->r->nb[1]), row, st->r->nb[1], row, nt);
 +    }
++}
++
++// Rounding barrier: hexagon-clang may fold an sf conversion into the following qf32 op (it does so in the straight-
++// line form of a 4-expert sum, see the n_e == 4 branch), which skips that rounding. The f32 and fp16 hand-offs are
++// bit-identical only while both run exactly the same roundings, so every rounding the per-op loops rely on goes
++// through this empty asm: the value has to exist as a rounded sf vector whatever the compiler does around it.
++static inline HVX_Vector moe_keep(HVX_Vector r) {
++    __asm__("" : "+v"(r));
++    return r;
++}
++
++static inline HVX_Vector moe_mul_f32(HVX_Vector a, HVX_Vector b) {
++    return moe_keep(hvx_vec_mul_f32_f32(a, b));
++}
++
++static inline HVX_Vector moe_add_f32(HVX_Vector a, HVX_Vector b) {
++    return moe_keep(hvx_vec_add_f32_f32(a, b));
 +}
 +
 +static void moe_reduce_worker(unsigned int nth, unsigned int ith, void * data) {
@@ -6455,25 +7026,56 @@ index 78ce4bb..b30dd72 100644
 +                    }
 +                    dr[v] = Q6_Vsf_equals_Vqf32(s0);
 +                }
-+            } else if (st->x_f16) {
-+                // fp16 rows (n % 64 == 0): each vector widens exactly (as the f32 scatter of the producer did) to the
-+                // even / odd elements of 64 columns; the sums run on that lane order and are re-interleaved once
++            } else if (st->x_f16 && n_e == 4 && st->f16_chain) {
++                // fp16 rows, 4 experts: each vector widens exactly (as the f32 scatter of the producer did) to the
++                // even / odd elements of 64 columns, then the same qf32 chain as the f32 branch below (bit-identical
++                // results); the sums run on that lane order and are re-interleaved once
 +                const HVX_Vector one = hvx_vec_splat_f16(1.0);
-+                #define MOE_X16(e, v, lo_, hi_) do { const HVX_VectorPair p_ = Q6_Wqf32_vmpy_VhfVhf(xs[(e)][(v)], one); lo_ = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(p_)); hi_ = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(p_)); } while (0)
 +                for (uint32_t v = 0; v < nvec / 2; ++v) {
-+                    HVX_Vector a0, a1, b0, b1;
-+                    MOE_X16(0, v, a0, a1);
-+                    HVX_Vector s0 = hvx_vec_mul_f32_f32(a0, ws[0]);
-+                    HVX_Vector s1 = hvx_vec_mul_f32_f32(a1, ws[0]);
-+                    for (uint32_t e = 1; e < n_e; ++e) {
-+                        MOE_X16(e, v, b0, b1);
-+                        s0 = hvx_vec_add_f32_f32(s0, hvx_vec_mul_f32_f32(b0, ws[e]));
-+                        s1 = hvx_vec_add_f32_f32(s1, hvx_vec_mul_f32_f32(b1, ws[e]));
++                    HVX_Vector a[4], b[4];
++                    for (uint32_t e = 0; e < 4; ++e) {
++                        const HVX_VectorPair p = Q6_Wqf32_vmpy_VhfVhf(xs[e][v], one);
++                        // no moe_keep on this exact widening: the barrier here cost ~1.5% of LFM prefill (worse
++                        // scheduling). Folding it would turn the next vmpy into qf32 x qf32 and break the bit-exact
++                        // match, which GGML_TEST_SEED + GGML_TEST_HASH runs of MOE_DOWN_REDUCE (F16=0 vs 1) detect
++                        a[e] = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(p));
++                        b[e] = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(p));
++                    }
++                    HVX_Vector s0 = Q6_Vqf32_vmpy_VsfVsf(a[0], ws[0]);
++                    HVX_Vector s1 = Q6_Vqf32_vmpy_VsfVsf(b[0], ws[0]);
++                    for (uint32_t e = 1; e < 4; ++e) {
++                        s0 = Q6_Vqf32_vadd_Vqf32Vqf32(s0, Q6_Vqf32_vmpy_VsfVsf(a[e], ws[e]));
++                        s1 = Q6_Vqf32_vadd_Vqf32Vqf32(s1, Q6_Vqf32_vmpy_VsfVsf(b[e], ws[e]));
 +                    }
 +                    if (has_r) {
 +                        const HVX_VectorPair rd = Q6_W_vdeal_VVR(rr[2 * v + 1], rr[2 * v], -4);
-+                        s0 = hvx_vec_add_f32_f32(Q6_V_lo_W(rd), s0);
-+                        s1 = hvx_vec_add_f32_f32(Q6_V_hi_W(rd), s1);
++                        s0 = Q6_Vqf32_vadd_Vqf32Vsf(s0, Q6_V_lo_W(rd));
++                        s1 = Q6_Vqf32_vadd_Vqf32Vsf(s1, Q6_V_hi_W(rd));
++                    }
++                    const HVX_VectorPair o = Q6_W_vshuff_VVR(Q6_Vsf_equals_Vqf32(s1), Q6_Vsf_equals_Vqf32(s0), -4);
++                    dr[2 * v]     = Q6_V_lo_W(o);
++                    dr[2 * v + 1] = Q6_V_hi_W(o);
++                }
++            } else if (st->x_f16) {
++                // fp16 rows (n % 64 == 0): each vector widens exactly (as the f32 scatter of the producer did) to the
++                // even / odd elements of 64 columns; the sums run on that lane order and are re-interleaved once.
++                // Every product and sum is rounded to f32 (moe_keep), as in the generic f32 loop below (n_e != 4).
++                const HVX_Vector one = hvx_vec_splat_f16(1.0);
++                #define MOE_X16(e, v, lo_, hi_) do { const HVX_VectorPair p_ = Q6_Wqf32_vmpy_VhfVhf(xs[(e)][(v)], one); lo_ = moe_keep(Q6_Vsf_equals_Vqf32(Q6_V_lo_W(p_))); hi_ = moe_keep(Q6_Vsf_equals_Vqf32(Q6_V_hi_W(p_))); } while (0)
++                for (uint32_t v = 0; v < nvec / 2; ++v) {
++                    HVX_Vector a0, a1, b0, b1;
++                    MOE_X16(0, v, a0, a1);
++                    HVX_Vector s0 = moe_mul_f32(a0, ws[0]);
++                    HVX_Vector s1 = moe_mul_f32(a1, ws[0]);
++                    for (uint32_t e = 1; e < n_e; ++e) {
++                        MOE_X16(e, v, b0, b1);
++                        s0 = moe_add_f32(s0, moe_mul_f32(b0, ws[e]));
++                        s1 = moe_add_f32(s1, moe_mul_f32(b1, ws[e]));
++                    }
++                    if (has_r) {
++                        const HVX_VectorPair rd = Q6_W_vdeal_VVR(rr[2 * v + 1], rr[2 * v], -4);
++                        s0 = moe_add_f32(Q6_V_lo_W(rd), s0);
++                        s1 = moe_add_f32(Q6_V_hi_W(rd), s1);
 +                    }
 +                    const HVX_VectorPair o = Q6_W_vshuff_VVR(s1, s0, -4);
 +                    dr[2 * v]     = Q6_V_lo_W(o);
@@ -6481,21 +7083,27 @@ index 78ce4bb..b30dd72 100644
 +                }
 +                #undef MOE_X16
 +            } else if (n_e == 4) {
++                // qf32 products and sums, one rounding at the end: written out, this is the code hexagon-clang
++                // generated for the per-op rounded form of this straight-line sum (it folds each sf conversion into
++                // the next qf32 add), so results do not depend on that optimization; the fp16 branch above matches it
 +                #pragma unroll(2)
 +                for (uint32_t v = 0; v < nvec; ++v) {
-+                    HVX_Vector s0 = hvx_vec_mul_f32_f32(xs[0][v], ws[0]);
-+                    s0 = hvx_vec_add_f32_f32(s0, hvx_vec_mul_f32_f32(xs[1][v], ws[1]));
-+                    s0 = hvx_vec_add_f32_f32(s0, hvx_vec_mul_f32_f32(xs[2][v], ws[2]));
-+                    s0 = hvx_vec_add_f32_f32(s0, hvx_vec_mul_f32_f32(xs[3][v], ws[3]));
-+                    dr[v] = has_r ? hvx_vec_add_f32_f32(rr[v], s0) : s0;
++                    HVX_Vector s0 = Q6_Vqf32_vmpy_VsfVsf(xs[0][v], ws[0]);
++                    s0 = Q6_Vqf32_vadd_Vqf32Vqf32(s0, Q6_Vqf32_vmpy_VsfVsf(xs[1][v], ws[1]));
++                    s0 = Q6_Vqf32_vadd_Vqf32Vqf32(s0, Q6_Vqf32_vmpy_VsfVsf(xs[2][v], ws[2]));
++                    s0 = Q6_Vqf32_vadd_Vqf32Vqf32(s0, Q6_Vqf32_vmpy_VsfVsf(xs[3][v], ws[3]));
++                    if (has_r) {
++                        s0 = Q6_Vqf32_vadd_Vqf32Vsf(s0, rr[v]);
++                    }
++                    dr[v] = Q6_Vsf_equals_Vqf32(s0);
 +                }
 +            } else {
 +                for (uint32_t v = 0; v < nvec; ++v) {
-+                    HVX_Vector s0 = hvx_vec_mul_f32_f32(xs[0][v], ws[0]);
++                    HVX_Vector s0 = moe_mul_f32(xs[0][v], ws[0]);
 +                    for (uint32_t e = 1; e < n_e; ++e) {
-+                        s0 = hvx_vec_add_f32_f32(s0, hvx_vec_mul_f32_f32(xs[e][v], ws[e]));
++                        s0 = moe_add_f32(s0, moe_mul_f32(xs[e][v], ws[e]));
 +                    }
-+                    dr[v] = has_r ? hvx_vec_add_f32_f32(rr[v], s0) : s0;
++                    dr[v] = has_r ? moe_add_f32(rr[v], s0) : s0;
 +                }
 +            }
 +            if (has_n) {
@@ -6538,7 +7146,8 @@ index 78ce4bb..b30dd72 100644
 +    st.nd    = NULL;
 +    st.nw    = NULL;
 +    st.eps   = 0.0f;
-+    st.x_f16 = octx->op_params[HTP_MOE_PARAM_X_F16] == 1;
++    st.x_f16 = octx->op_params[HTP_MOE_PARAM_X_F16] == 1 || octx->op_params[HTP_MOE_PARAM_X_F16] == 2;
++    st.f16_chain = octx->op_params[HTP_MOE_PARAM_X_F16] == 1;
 +    st.qacc  = octx->op_params[HTP_MOE_PARAM_QACC] == 1;
 +    if (st.x_f16 && (d->ne[0] % 64 != 0 || x->nb[1] < (size_t) d->ne[0] * sizeof(float))) {
 +        return HTP_STATUS_NO_SUPPORT;
@@ -6587,10 +7196,18 @@ index 78ce4bb..b30dd72 100644
 +    return HTP_STATUS_OK;
 +}
 diff --git a/ggml/src/ggml-hexagon/htp/flash-attn-ops.c b/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
-index a0473c1..0f83988 100644
+index a0473c1..1734fe2 100644
 --- a/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/flash-attn-ops.c
-@@ -143,6 +143,9 @@ struct hmx_fa_context {
+@@ -10,6 +10,7 @@
+ #include <stdatomic.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "dma-queue.h"
+@@ -143,6 +144,9 @@ struct hmx_fa_context {
      __fp16 *     vtcm_p_tiles[2];      // P = softmax(S) [g_br, Bc]
      __fp16 *     vtcm_d_tiles[2];      // Diagonal rescale, g_br/32 packed diagonal tiles (double-buffered)
      __fp16 *     vtcm_d_inv_l;         // Diagonal rescale (1/l), same packed layout
@@ -6600,7 +7217,7 @@ index a0473c1..0f83988 100644
      HVX_Vector * vtcm_m_vec;           // Row max [g_br]
      HVX_Vector * vtcm_l_vec;           // Row sum [g_br]
      HVX_Vector * vtcm_s_rowmax;        // Softmax intermediate [g_br]
-@@ -946,6 +949,91 @@ static void fa_o_store_thread_f32(unsigned int n, unsigned int i, void * data) {
+@@ -946,6 +950,91 @@ static void fa_o_store_thread_f32(unsigned int n, unsigned int i, void * data) {
      htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) (args->q_start * G + start));
  }
  
@@ -6692,7 +7309,7 @@ index a0473c1..0f83988 100644
  static void fa_o_store_thread_f16(unsigned int n, unsigned int i, void * data) {
      fa_o_store_args_t *     args  = (fa_o_store_args_t *) data;
      struct hmx_fa_context * factx = args->factx;
-@@ -1030,7 +1118,8 @@ static void fa_phase_o_store(struct hmx_fa_context *   factx,
+@@ -1030,7 +1119,8 @@ static void fa_phase_o_store(struct hmx_fa_context *   factx,
      }
      size_t rows_per_t = hmx_ceil_div(n_rows_g, n);
      fa_o_store_args_t args = { factx, dst, o_tile_src, q_start, kv_head, ib3, n_rows_g, rows_per_t };
@@ -6702,7 +7319,7 @@ index a0473c1..0f83988 100644
      if (n > 1) {
          work_queue_run(wp, store_fn, &args, n);
      } else {
-@@ -1058,10 +1147,362 @@ typedef struct {
+@@ -1058,10 +1148,362 @@ typedef struct {
      const struct htp_tensor * mask;
      const __fp16 *            mask_vtcm;             // VTCM mask buffer base (NULL = DDR fallback)
      size_t                    mask_vtcm_row_stride;  // elements (__fp16) per row in VTCM mask buffer
@@ -7066,7 +7683,7 @@ index a0473c1..0f83988 100644
      unsigned int n, unsigned int i, void * data,
      const bool has_mask,
      const bool mask_broadcast,
-@@ -1071,6 +1512,7 @@ static inline void fa_softmax_impl(
+@@ -1071,6 +1513,7 @@ static inline void fa_softmax_impl(
  ) {
      fa_softmax_args_t *     args  = (fa_softmax_args_t *) data;
      struct hmx_fa_context * factx = args->factx;
@@ -7074,7 +7691,7 @@ index a0473c1..0f83988 100644
  
      const size_t n_rows_g       = args->n_rows_g;
      const size_t kv_rows        = args->kv_rows;
-@@ -1100,7 +1542,7 @@ static inline void fa_softmax_impl(
+@@ -1100,7 +1543,7 @@ static inline void fa_softmax_impl(
      HVX_Vector * my_row_buf0    = factx->vtcm_row_bufs + i * 2 * row_buf_stride;
      HVX_Vector * my_row_buf1    = my_row_buf0 + row_buf_stride;
  
@@ -7083,7 +7700,7 @@ index a0473c1..0f83988 100644
  
      for (size_t r_vec_idx = vec_start; r_vec_idx < vec_end; ++r_vec_idx) {
          HVX_Vector rowmax_acc_v = v_neg_inf;
-@@ -1125,6 +1567,9 @@ static inline void fa_softmax_impl(
+@@ -1125,6 +1568,9 @@ static inline void fa_softmax_impl(
              const __fp16 * s_ld_base = factx->vtcm_s_tiles[args->buf_idx] + r0 * HMX_FP16_TILE_N_ROWS * Bc;
              __fp16 *       p_st_base = factx->vtcm_p_tiles[args->buf_idx] + r0 * HMX_FP16_TILE_N_ROWS * Bc;
  
@@ -7093,7 +7710,7 @@ index a0473c1..0f83988 100644
              // Decode 2 rows from S tiles into per-thread row buffers
              if (has_softcap) {
                  const HVX_Vector v_cap = hvx_vec_splat_f16(factx->logit_softcap);
-@@ -1144,7 +1589,7 @@ static inline void fa_softmax_impl(
+@@ -1144,7 +1590,7 @@ static inline void fa_softmax_impl(
                      HVX_Vector t1   = hvx_vec_tanh_f16(v_s_row1);
                      my_row_buf1[ci] = hvx_vec_mul_f16_f16(t1, v_cap);
                  }
@@ -7102,7 +7719,7 @@ index a0473c1..0f83988 100644
                  size_t c = 0;
                  for (; c + 64 < kv_rows; c += 128) {
                      size_t             ci0       = c / 64;
-@@ -1188,7 +1633,50 @@ static inline void fa_softmax_impl(
+@@ -1188,7 +1634,50 @@ static inline void fa_softmax_impl(
  
              HVX_Vector v_s_rowmax0 = v_neg_inf;
              HVX_Vector v_s_rowmax1 = v_neg_inf;
@@ -7154,7 +7771,7 @@ index a0473c1..0f83988 100644
                  for (size_t c = 0; c < kv_rows; c += 64) {
                      size_t         ci          = c / 64;
                      const size_t   ne          = hex_smin(kv_rows - c, 64);
-@@ -1301,6 +1789,12 @@ static inline void fa_softmax_impl(
+@@ -1301,6 +1790,12 @@ static inline void fa_softmax_impl(
  
              HVX_Vector v_dup_m0 = Q6_Vhf_vmax_VhfVhf(v_m_prev0, v_s_rowmax0);
              HVX_Vector v_dup_m1 = Q6_Vhf_vmax_VhfVhf(v_m_prev1, v_s_rowmax1);
@@ -7167,7 +7784,7 @@ index a0473c1..0f83988 100644
  
              // Insert row r, r+1 rowmax into rowmax_acc_v
              {
-@@ -1319,6 +1813,52 @@ static inline void fa_softmax_impl(
+@@ -1319,6 +1814,52 @@ static inline void fa_softmax_impl(
              HVX_Vector       v_p_rowsum1 = v_zero;
  
              size_t c = 0;
@@ -7220,7 +7837,7 @@ index a0473c1..0f83988 100644
              for (; c + 64 < kv_rows; c += 128) {
                  size_t     ci0          = c / 64;
                  size_t     ci1          = ci0 + 1;
-@@ -1328,10 +1868,10 @@ static inline void fa_softmax_impl(
+@@ -1328,10 +1869,10 @@ static inline void fa_softmax_impl(
                  HVX_Vector v_s_minus_m0_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci1], v_dup_m0);
                  HVX_Vector v_s_minus_m1_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci1], v_dup_m1);
  
@@ -7235,7 +7852,7 @@ index a0473c1..0f83988 100644
  
                  __fp16 *     out_dtile0  = p_st_base + ci0 * HMX_FP16_TILE_N_ELMS * 2;
                  __fp16 *     out_dtile1  = p_st_base + ci1 * HMX_FP16_TILE_N_ELMS * 2;
-@@ -1348,23 +1888,18 @@ static inline void fa_softmax_impl(
+@@ -1348,23 +1889,18 @@ static inline void fa_softmax_impl(
                  *pv_p_out0_1               = Q6_V_lo_W(vp_p_dual1);
                  *pv_p_out1_1               = Q6_V_hi_W(vp_p_dual1);
  
@@ -7265,7 +7882,7 @@ index a0473c1..0f83988 100644
                  __fp16 *     out_dtile  = p_st_base + ci * HMX_FP16_TILE_N_ELMS * 2;
                  HVX_Vector * pv_p_out0  = ((HVX_Vector *) out_dtile) + r1 / 2;
                  HVX_Vector * pv_p_out1  = pv_p_out0 + 16;
-@@ -1373,11 +1908,8 @@ static inline void fa_softmax_impl(
+@@ -1373,11 +1909,8 @@ static inline void fa_softmax_impl(
                  *pv_p_out0               = Q6_V_lo_W(vp_p_dual);
                  *pv_p_out1               = Q6_V_hi_W(vp_p_dual);
  
@@ -7279,7 +7896,7 @@ index a0473c1..0f83988 100644
              }
  
              HVX_Vector rowsum0_sf = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(v_p_rowsum0));
-@@ -1452,6 +1984,344 @@ static inline void fa_softmax_impl(
+@@ -1452,6 +1985,344 @@ static inline void fa_softmax_impl(
      htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_FA_SFM, (uint16_t) (args->q_start * G + vec_start * 64));
  }
  
@@ -7624,7 +8241,7 @@ index a0473c1..0f83988 100644
  static void fa_softmax_thread_nomask(unsigned int n, unsigned int i, void * data) {
      fa_softmax_impl(n, i, data,
                      /*has_mask=*/false,
-@@ -1501,6 +2371,16 @@ static inline HVX_Vector hvx_fa_load_sinks(const float * sinks_data, size_t idx,
+@@ -1501,6 +2372,16 @@ static inline HVX_Vector hvx_fa_load_sinks(const float * sinks_data, size_t idx,
          : Q6_V_vror_VR(v_src[0], byte_off);
  }
  
@@ -7641,7 +8258,7 @@ index a0473c1..0f83988 100644
  static __attribute__((noinline)) void fa_build_d_diag_inv_l(struct hmx_fa_context * factx,
                                                              size_t                  n_row_tiles,
                                                              size_t                  n_row_tiles_g_br,
-@@ -1589,6 +2469,10 @@ static void fa_phase_softmax_and_build_d(struct hmx_fa_context * factx,
+@@ -1589,6 +2470,10 @@ static void fa_phase_softmax_and_build_d(struct hmx_fa_context * factx,
          }
      }
  
@@ -7652,7 +8269,7 @@ index a0473c1..0f83988 100644
      if (factx->n_threads > 1 && n_row_vec_cnt >= 2) {
          uint32_t n_use = (uint32_t) hex_smin((size_t) factx->n_threads, n_row_vec_cnt);
          sargs->thread_div = init_fastdiv_values(n_use);
-@@ -1647,6 +2531,7 @@ typedef struct {
+@@ -1647,6 +2532,7 @@ typedef struct {
      const __fp16 * p_tiles;
      const __fp16 * v_tiles;
      const __fp16 * d_tiles;
@@ -7660,7 +8277,7 @@ index a0473c1..0f83988 100644
      uint8_t *      hmx_scales;
      size_t         n_row_tiles;
      size_t         n_col_tiles;
-@@ -1687,6 +2572,9 @@ static void hmx_fa_o_update_worker(void * data) {
+@@ -1687,6 +2573,9 @@ static void hmx_fa_o_update_worker(void * data) {
              v_tile_in  += v_stride;
              o_tile_out += o_stride;
          }
@@ -7670,7 +8287,7 @@ index a0473c1..0f83988 100644
      }
  }
  
-@@ -1820,6 +2708,265 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor
+@@ -1820,6 +2709,290 @@ static inline void fa_prefetch_block(dma_queue * dma_q, const struct htp_tensor
      }
  }
  
@@ -7908,6 +8525,31 @@ index a0473c1..0f83988 100644
 +
 +// zc != NULL: leading all-zero chunks per row. want_lu: returns the end of the unmasked columns of rows
 +// [q_start, q_start + n_rows_q) in 64-column chunks (0 when every value is masked), else 0.
++// MSCAN result cache: the FA ops of one op batch (e.g. every attention layer of a prefill graph) read the same
++// broadcast mask, so the per-query-block scan results (lu_cols, zero chunks per row, last unmasked chunk per row)
++// are the same for each of them. Entries are keyed by the mask rows address, row stride, nek1, rows and scan mode
++// and are valid only within the op batch and graph that wrote them (htp_fa_mscan_gen is bumped at every batch start
++// and at the first op of every graph_compute, HTP_OPFLAG_GRAPH_START; the mask is a graph input that no op writes).
++// Not safe for concurrent sessions in one PD (the table is process-global); sessions run one at a time today.
++uint32_t htp_fa_mscan_gen = 1;
++#define FA_MSC_SLOTS 64
++struct fa_msc_entry {
++    uint32_t        gen;
++    const uint8_t * rows;
++    uint32_t        stride, nek1, n_rows, mode, lu_cols;
++};
++static struct fa_msc_entry fa_msc_tab[FA_MSC_SLOTS];
++static uint16_t *          fa_msc_buf      = NULL;  // FA_MSC_SLOTS x 2 x FA_ZC_MAX_ROWS (zc, lu)
++static bool                fa_msc_buf_fail = false;
++
++static uint16_t * fa_msc_arrays(uint32_t slot) {
++    if (!fa_msc_buf && !fa_msc_buf_fail) {
++        fa_msc_buf = (uint16_t *) memalign(128, (size_t) FA_MSC_SLOTS * 2 * FA_ZC_MAX_ROWS * sizeof(uint16_t));
++        fa_msc_buf_fail = fa_msc_buf == NULL;
++    }
++    return fa_msc_buf ? fa_msc_buf + (size_t) slot * 2 * FA_ZC_MAX_ROWS : NULL;
++}
++
 +static uint32_t fa_mask_zscan(struct hmx_fa_context * factx, const struct htp_tensor * mask, uint32_t q_start, uint32_t n_rows_q,
 +                              uint32_t im3, uint32_t nek1, uint16_t * zc, bool want_lu, uint16_t * lu_rows) {
 +    fa_zscan_args_t args;
@@ -7936,7 +8578,7 @@ index a0473c1..0f83988 100644
  // ============================================================================
  // Core HMX flash attention algorithm (GQA-merged)
  // ============================================================================
-@@ -1913,6 +3060,18 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -1913,6 +3086,19 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
      const bool pipeline = factx.pipeline;
      const uint32_t n_threads = factx.n_threads;
      const uint32_t G = factx.G;
@@ -7952,10 +8594,11 @@ index a0473c1..0f83988 100644
 +    // ZTAIL: chunks past a row pair's last unmasked chunk get P = 0 without the mask math and the exp2 (bit-identical:
 +    // those P were exactly 0); needs the per-row ends from the MSCAN pass
 +    const bool ztail = kv_zchunk && mscan && !(kparams->u.hmx.flags2 & HTP_FA_FLAG2_NO_ZTAIL);
++    const bool msc_cache = mscan && (kparams->u.hmx.flags2 & HTP_FA_FLAG2_MSCAN_CACHE) && ctx->mdev.count <= 1;
  
      // Multi-device: prefer head-parallel partitioning (each core owns a disjoint head
      // shard), falling back to Q-block (token) split when heads don't divide evenly.
-@@ -1959,7 +3118,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -1959,7 +3145,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
      // Build the VTCM layout once (shared with the host estimator) and place every
      // scratch buffer at its computed offset. Padded head dims size the HMX tiles.
      struct hmx_fa_vtcm_layout L;
@@ -7969,7 +8612,7 @@ index a0473c1..0f83988 100644
  
      if (L.total_bytes > ctx->vtcm_size) {
          return HTP_STATUS_VTCM_TOO_SMALL;
-@@ -1986,6 +3150,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -1986,6 +3177,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
      factx.vtcm_d_tiles[0]     = VTCM_LAYOUT_PTR(__fp16, base, L.off_d_tiles[0]);
      factx.vtcm_d_tiles[1]     = VTCM_LAYOUT_PTR_OPTIONAL(__fp16, base, L.off_d_tiles[1], pipeline);
      factx.vtcm_d_inv_l        = VTCM_LAYOUT_PTR(__fp16, base, L.off_d_inv_l);
@@ -7980,7 +8623,7 @@ index a0473c1..0f83988 100644
      factx.vtcm_m_vec          = VTCM_LAYOUT_PTR(HVX_Vector, base, L.off_m_vec);
      factx.vtcm_l_vec          = VTCM_LAYOUT_PTR(HVX_Vector, base, L.off_l_vec);
      factx.vtcm_s_rowmax       = VTCM_LAYOUT_PTR(HVX_Vector, base, L.off_s_rowmax);
-@@ -2065,6 +3233,54 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2065,6 +3260,73 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
              const size_t   g_br_actual = hex_align_up(n_rows_g, HMX_FP16_TILE_N_ROWS);
              const size_t   n_row_tiles = g_br_actual / HMX_FP16_TILE_N_ROWS;
  
@@ -7998,8 +8641,27 @@ index a0473c1..0f83988 100644
 +                // the unmasked columns; the trailing-block skip and the last-block trim follow from the latter
 +                // (same results as fa_mask_kv_blk_end, which scans the masked tail on one thread).
 +                htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start);
-+                const uint32_t lu_cols = hex_smin(fa_mask_zscan(&factx, mask, q_start, n_rows_q, im3, nek1, kv_zchunk ? zc_buf : NULL, true,
-+                                                                     ztail ? lu_buf : NULL) * 64, nek1);
++                const uint8_t * m_rows = (const uint8_t *) mask->data + (size_t) q_start * mask->nb[1] + (size_t) im3 * mask->nb[3];
++                const uint32_t  m_mode = (kv_zchunk ? 1u : 0u) | (ztail ? 2u : 0u);
++                const uint32_t  slot   = (q_start / Br) % FA_MSC_SLOTS;
++                struct fa_msc_entry * e = &fa_msc_tab[slot];
++                uint16_t * carr = msc_cache ? fa_msc_arrays(slot) : NULL;
++                uint32_t lu_cols;
++                if (carr && e->gen == htp_fa_mscan_gen && e->rows == m_rows && e->stride == (uint32_t) mask->nb[1] &&
++                    e->nek1 == nek1 && e->n_rows == n_rows_q && e->mode == m_mode) {
++                    lu_cols = e->lu_cols;
++                    if (kv_zchunk) memcpy(zc_buf, carr, n_rows_q * sizeof(uint16_t));
++                    if (ztail) memcpy(lu_buf, carr + FA_ZC_MAX_ROWS, n_rows_q * sizeof(uint16_t));
++                } else {
++                    lu_cols = hex_smin(fa_mask_zscan(&factx, mask, q_start, n_rows_q, im3, nek1, kv_zchunk ? zc_buf : NULL, true,
++                                                     ztail ? lu_buf : NULL) * 64, nek1);
++                    if (carr && n_rows_q <= FA_ZC_MAX_ROWS) {
++                        if (kv_zchunk) memcpy(carr, zc_buf, n_rows_q * sizeof(uint16_t));
++                        if (ztail) memcpy(carr + FA_ZC_MAX_ROWS, lu_buf, n_rows_q * sizeof(uint16_t));
++                        e->gen = htp_fa_mscan_gen; e->rows = m_rows; e->stride = (uint32_t) mask->nb[1];
++                        e->nek1 = nek1; e->n_rows = n_rows_q; e->mode = m_mode; e->lu_cols = lu_cols;
++                    }
++                }
 +                htp_trace_event_stop(tr_hvx, HTP_TRACE_EVT_HVX_A_PREP, (uint16_t) q_start);
 +                kv_blk_end = hex_smax(1u, (lu_cols + Bc - 1) / Bc);
 +                if (kv_blk_end > factx.n_kv_blocks) {
@@ -8035,7 +8697,7 @@ index a0473c1..0f83988 100644
              for (uint32_t kv_head = kv_head_min; kv_head < kv_head_max; ++kv_head) {
                  const uint32_t ik2 = kv_head;
                  const uint32_t ik3 = fastdiv(ib3, &kparams->broadcast_rk3);
-@@ -2125,28 +3341,29 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2125,28 +3387,29 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                      hmx_fa_o_update_job_t ou_job[2];
  
                      // Prefetch block 1 early if there are multiple blocks
@@ -8070,7 +8732,7 @@ index a0473c1..0f83988 100644
                          const size_t   n_col_tiles = hmx_ceil_div(kv_rows, HMX_FP16_TILE_N_COLS);
  
                          // ---- 1. Pop and run V-prep for current block ----
-@@ -2179,18 +3396,18 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2179,18 +3442,18 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                              ou_job[prev_buf].d_tiles     = factx.vtcm_d_tiles[prev_buf];
                              ou_job[prev_buf].hmx_scales  = factx.vtcm_hmx_scales_id;
                              ou_job[prev_buf].n_row_tiles = n_row_tiles;
@@ -8093,7 +8755,7 @@ index a0473c1..0f83988 100644
                              const size_t   next_buf   = 1 - buf_idx;
  
                              void * next_k = (void *) dma_queue_pop(dma_q).dst;
-@@ -2232,6 +3449,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2232,6 +3495,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                          sargs.mask_vtcm            = current_mask_vtcm;
                          sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                          sargs.slopes               = factx.vtcm_slopes;
@@ -8106,7 +8768,7 @@ index a0473c1..0f83988 100644
  
                          // Run Softmax on HVX (blocking call)
                          fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
-@@ -2243,7 +3466,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2243,7 +3512,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                          }
  
                          // Prefetch block kv_blk + 2
@@ -8115,7 +8777,7 @@ index a0473c1..0f83988 100644
                              fa_prefetch_block(dma_q, k, v, mask, kv_blk + 2, Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                                ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, buf_idx, &factx);
                          }
-@@ -2252,9 +3475,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2252,9 +3521,9 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                      }
  
                      // Epilogue
@@ -8128,7 +8790,7 @@ index a0473c1..0f83988 100644
                          ou_job[0].o_curr           = o_tile_curr;
                          ou_job[0].o_prev           = o_tile_prev;
                          ou_job[0].p_tiles          = factx.vtcm_p_tiles[1 - buf_idx];
-@@ -2266,34 +3489,44 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2266,34 +3535,44 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                          ou_job[0].n_row_tiles_g_br = n_row_tiles_g_br;
                          ou_job[0].n_tiles_per_bc   = n_tiles_per_bc;
                          ou_job[0].DV               = DV_pad;
@@ -8181,7 +8843,7 @@ index a0473c1..0f83988 100644
                              const uint32_t  prefetch_start = (kv_blk + 1) * Bc;
                              const uint32_t  prefetch_rows  = hex_smin(Bc, nek1 - prefetch_start);
                              const size_t    prefetch_buf   = 1 - buf_idx;
-@@ -2356,6 +3589,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2356,6 +3635,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                          sargs.mask_vtcm            = current_mask_vtcm;
                          sargs.mask_vtcm_row_stride = factx.mask_buf_row_stride;
                          sargs.slopes               = factx.vtcm_slopes;
@@ -8194,7 +8856,7 @@ index a0473c1..0f83988 100644
                          fa_phase_softmax_and_build_d(&factx, &sargs, n_row_tiles, n_row_tiles_g_br);
  
                          {
-@@ -2370,9 +3609,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2370,9 +3655,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                              ou_job.n_row_tiles_g_br = n_row_tiles_g_br;
                              ou_job.n_tiles_per_bc   = n_tiles_per_bc;
                              ou_job.DV               = DV_pad;
@@ -8206,7 +8868,7 @@ index a0473c1..0f83988 100644
                                  // Overlapped: run HVX build diag inv L while HMX is busy executing the update
                                  htp_trace_event_start(tr_hvx, HTP_TRACE_EVT_HVX_O_PROC, (uint16_t) q_start);
                                  fa_build_d_diag_inv_l(&factx, n_row_tiles, n_row_tiles_g_br, kv_head, n_rows_g);
-@@ -2381,6 +3621,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2381,6 +3667,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                              hmx_queue_pop(ctx->hmx_queue);
  
                              hex_swap_ptr((void **) &o_tile_curr, (void **) &o_tile_prev);
@@ -8219,7 +8881,7 @@ index a0473c1..0f83988 100644
                          }
  
                          buf_idx = 1 - buf_idx;
-@@ -2440,7 +3686,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2440,7 +3732,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                  }
  
                  // ---- Final normalization ----
@@ -8231,7 +8893,7 @@ index a0473c1..0f83988 100644
                      on_job.o_curr           = o_tile_curr;
                      on_job.o_prev           = o_tile_prev;
                      on_job.d_tiles          = factx.vtcm_d_inv_l;
-@@ -2450,11 +3699,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
+@@ -2450,11 +3745,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                      on_job.DV               = DV_pad;
                      hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_fa_o_norm_worker, &on_job));
                      hmx_queue_pop(ctx->hmx_queue);
@@ -8248,16 +8910,17 @@ index a0473c1..0f83988 100644
      }
  
 diff --git a/ggml/src/ggml-hexagon/htp/flash-attn-ops.h b/ggml/src/ggml-hexagon/htp/flash-attn-ops.h
-index 0453884..c3f460c 100644
+index 0453884..619ebbc 100644
 --- a/ggml/src/ggml-hexagon/htp/flash-attn-ops.h
 +++ b/ggml/src/ggml-hexagon/htp/flash-attn-ops.h
-@@ -26,6 +26,19 @@ extern "C" {
+@@ -26,6 +26,20 @@ extern "C" {
  
  #define HTP_FA_M_INITIAL_VAL  -10000.0f
  
 +// htp_fa_kernel_params.u.hmx.flags2: bits 0..3 = IL softmax options (FA_IL_OPT_DEG2 1, MPYI 2, CCHK 4, SPLIT 8; supported
 +// combinations 0, 6, 7, 14, others run 0)
 +#define HTP_FA_FLAG2_NO_MSCAN   0x10  // u.hmx.flags2: mask skip/trim scan on one thread (fa_mask_kv_blk_end) instead of with the zero-chunk scan
++#define HTP_FA_FLAG2_MSCAN_CACHE 0x40 // u.hmx.flags2: reuse the MSCAN results of an earlier FA op of the same op batch (same mask rows)
 +#define HTP_FA_FLAG2_NO_ZTAIL   0x20  // u.hmx.flags2: run the mask math and exp2 also on chunks past a row pair's last unmasked chunk
 +// htp_fa_kernel_params.flags
 +#define HTP_FA_FLAG_NO_KV_SKIP  0x01  // HMX: disable the trailing fully-masked KV-block skip
@@ -8271,7 +8934,7 @@ index 0453884..c3f460c 100644
  enum htp_fa_kernel_type {
      HTP_FA_KERNEL_UNSUPPORTED = 0,
      HTP_FA_KERNEL_HVX,
-@@ -35,7 +48,7 @@ enum htp_fa_kernel_type {
+@@ -35,7 +49,7 @@ enum htp_fa_kernel_type {
  struct htp_fa_kernel_params {
      uint8_t  kernel_type;        // enum htp_fa_kernel_type
      uint8_t  head_split;         // 1 = partition by KV heads in multicore, 0 = token partition
@@ -8280,7 +8943,7 @@ index 0453884..c3f460c 100644
      uint8_t  n_threads;          // Number of threads to run
  
      // Common parameters
-@@ -70,7 +83,8 @@ struct htp_fa_kernel_params {
+@@ -70,7 +84,8 @@ struct htp_fa_kernel_params {
              uint32_t row_buf_stride;
              uint32_t mask_buf_row_stride;
              int32_t  mask_broadcast;
@@ -8290,7 +8953,7 @@ index 0453884..c3f460c 100644
              struct fastdiv_values div_G;
          } hmx;
          struct {
-@@ -112,6 +126,7 @@ struct hmx_fa_vtcm_layout {
+@@ -112,6 +127,7 @@ struct hmx_fa_vtcm_layout {
      size_t off_p_tiles[2];
      size_t off_d_tiles[2];
      size_t off_d_inv_l;
@@ -8298,7 +8961,7 @@ index 0453884..c3f460c 100644
      size_t off_m_vec;
      size_t off_l_vec;
      size_t off_s_rowmax;
-@@ -147,10 +162,11 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
+@@ -147,10 +163,11 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
                                              size_t gqa_factor, size_t DK, size_t DV,
                                              size_t Br, size_t Bc, size_t n_threads,
                                              bool pipeline, bool is_q_fp32,
@@ -8312,7 +8975,7 @@ index 0453884..c3f460c 100644
      const size_t k_tile_size  = hex_align_up(Bc   * DK   * sizeof(__fp16), HTP_FA_HMX_TILE_SIZE);
      const size_t v_tile_size  = hex_align_up(Bc   * DV   * sizeof(__fp16), HTP_FA_HMX_TILE_SIZE);
      const size_t s_tile_size  = hex_align_up(g_br * Bc   * sizeof(__fp16), HTP_FA_HMX_TILE_SIZE);
-@@ -181,6 +197,7 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
+@@ -181,6 +198,7 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
      VTCM_LAYOUT_ALLOC(off, off_d_tiles[0],    d_tile_size);
      VTCM_LAYOUT_ALLOC_OPTIONAL(off, off_d_tiles[1], d_tile_size, pipeline);
      VTCM_LAYOUT_ALLOC(off, off_d_inv_l,       d_tile_size);
@@ -8320,7 +8983,7 @@ index 0453884..c3f460c 100644
  
      // Group B & C share start offset (Group B tiles must be 2KB aligned)
      size_t off_group_b_c = hex_align_up(off, HTP_FA_HMX_TILE_SIZE);
-@@ -240,9 +257,9 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
+@@ -240,9 +258,9 @@ static inline void hmx_fa_vtcm_layout_build(struct hmx_fa_vtcm_layout * L,
  }
  
  // Exact VTCM usage for a given (gqa_factor, DK, DV, Br, Bc) configuration.
@@ -8332,7 +8995,7 @@ index 0453884..c3f460c 100644
      return L.total_bytes;
  }
  
-@@ -321,19 +338,28 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
+@@ -321,19 +339,28 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
                                           size_t   n_threads,
                                           bool     is_q_fp32,
                                           bool     has_sinks,
@@ -8364,7 +9027,7 @@ index 0453884..c3f460c 100644
      // Cost coefficients calibrated from profiling
      const size_t c_q_fixed    = 800;   // per-Q-block: q_load + epilogue o_update + o_norm + o_store
      const size_t c_iter_base  = 200;   // per-KV-iter base (HMX dot/update + DMA)
-@@ -345,7 +371,7 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
+@@ -345,7 +372,7 @@ static inline int hmx_fa_find_chunk_size(size_t * Br_out,
      for (size_t Br = Br_max; Br >= br_unit; Br -= br_unit) {
          // Try all Bc candidates from Bc_limit down to bc_unit
          for (size_t Bc = Bc_limit; Bc >= bc_unit; Bc -= bc_unit) {
@@ -11283,7 +11946,7 @@ index 22a05b9..bddeabc 100644
  int op_diag(struct htp_ops_context * octx);
  int op_solve_tri(struct htp_ops_context * octx);
 diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
-index 9b4b86d..06801bd 100644
+index 9b4b86d..25b5123 100644
 --- a/ggml/src/ggml-hexagon/htp/htp-ops.h
 +++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
 @@ -115,6 +115,7 @@ enum htp_op_code {
@@ -11294,7 +11957,7 @@ index 9b4b86d..06801bd 100644
  
      HTP_OP_INVALID
  };
-@@ -123,6 +124,27 @@ enum htp_op_code {
+@@ -123,6 +124,31 @@ enum htp_op_code {
  #define HTP_OP_MAX_INPUTS  10   // aka GGML_MAX_SRCS
  #define HTP_OP_MAX_OUTPUTS 4
  #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
@@ -11310,11 +11973,15 @@ index 9b4b86d..06801bd 100644
 +// HTP_OP_RMS_NORM_MUL params index: != 0 = store dst as fp16 HMX activation tiles (32-row tile rows of ne0/32 tiles,
 +// row pairs interleaved) for 2D HMX matmul consumers with HTP_MM_ACT_TILED_IN (host pairing at batch flush)
 +#define HTP_NORM_PARAM_TILED 5
++// HTP_OP_RMS_NORM_MUL params index: bit 1 = one-pass gated norm kernel (packed 128-wide rows, fp16 silu; bit-identical),
++// bit 2 = tiled output converted in the norm pass (no in-place f32 store/reload; bit-identical)
++#define HTP_NORM_PARAM_FUSE 6
 +// HTP_OP_MOE_REDUCE params: [0] eps (f32 bits), [1] = 1: also emit dsts[1] = rms_norm(dst) * src[3] (the next
 +// layer's input norm, host fusion of the RMS_NORM + MUL that reads the MOE_REDUCE output)
 +#define HTP_MOE_PARAM_NORM_EPS 0
 +#define HTP_MOE_PARAM_NORM     1
-+// [2] = 1: src0 rows hold fp16 values in the first half of each f32 row slot (HTP_MMID_STREAM_OUT_F16 producer)
++// [2] = 1: src0 rows hold fp16 values in the first half of each f32 row slot (HTP_MMID_STREAM_OUT_F16 producer),
++// results bit-identical to f32 rows; 2: same rows, every product and sum rounded to f32 (round-5 numerics)
 +#define HTP_MOE_PARAM_X_F16    2
 +// [3] = 1: products and the sum over the experts (+ residual) in qf32, rounded to f32 once (host GGML_HEXAGON_MOE_QACC)
 +#define HTP_MOE_PARAM_QACC     3
@@ -11322,11 +11989,12 @@ index 9b4b86d..06801bd 100644
  #define HTP_OP_MAX_KERN_PARAMS 32
  
  #define HTP_OP_MAX_BUFS    16
-@@ -167,9 +189,11 @@ struct htp_buf_desc {
+@@ -167,9 +193,12 @@ struct htp_buf_desc {
  
  enum htp_op_flags {
      HTP_OPFLAGS_STUB  = (1U << 0),
 +    HTP_OPFLAG_DQ4_V1 = (1U << 1),  // matmuls: the v1 Q4_0 / IQ4_NL dequant kernel (host GGML_HEXAGON_DQ4_V2=0)
++    HTP_OPFLAG_GRAPH_START = (1U << 2),  // first op enqueued by a graph_compute: ends the validity of per-graph DSP caches
  };
  
  // Op descriptor
@@ -11335,7 +12003,7 @@ index 9b4b86d..06801bd 100644
      uint32_t opcode;                    // GGML/HTP Op
      uint32_t flags;                     // Op flags
 diff --git a/ggml/src/ggml-hexagon/htp/hvx-norm.h b/ggml/src/ggml-hexagon/htp/hvx-norm.h
-index 7ea945a..efc614b 100644
+index 7ea945a..188ade7 100644
 --- a/ggml/src/ggml-hexagon/htp/hvx-norm.h
 +++ b/ggml/src/ggml-hexagon/htp/hvx-norm.h
 @@ -68,11 +68,138 @@ static inline void hvx_fast_rms_norm_f32(const uint8_t * restrict src,
@@ -11560,8 +12228,41 @@ index 7ea945a..efc614b 100644
      HVX_Vector mean_epsilon_v = Q6_Vqf32_vadd_Vqf32Vsf(mean_v, epsilon_v);
  
      // Scale and multiply
+@@ -133,6 +320,32 @@ static inline void hvx_fast_rms_norm_mul_f32(const uint8_t * restrict src,
+     }
+ }
+ 
++// rsqrt(mean(x^2) + eps) of one row of nvec full vectors (splat), exactly the scale of hvx_fast_rms_norm_mul_f32
++static inline HVX_Vector hvx_rms_row_scale_f32(const HVX_Vector * restrict a, int nvec, HVX_Vector inv_n_v, HVX_Vector epsilon_v) {
++    HVX_Vector sa = Q6_V_vsplat_R(0);
++    #pragma unroll(4)
++    for (int i = 0; i < nvec; i++) {
++        sa = Q6_Vqf32_vadd_Vqf32Vqf32(sa, Q6_Vqf32_vmpy_VsfVsf(a[i], a[i]));
++    }
++    sa = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sa));
++    return hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(sa, inv_n_v), epsilon_v)));
++}
++
++// hvx_rms_row_scale_f32 of two rows with the two accumulation chains interleaved (each chain in the same order)
++static inline void hvx_rms_row_scale2_f32(const HVX_Vector * restrict a, const HVX_Vector * restrict b, int nvec,
++                                          HVX_Vector inv_n_v, HVX_Vector epsilon_v, HVX_Vector * s0, HVX_Vector * s1) {
++    HVX_Vector sa = Q6_V_vsplat_R(0), sb = Q6_V_vsplat_R(0);
++    #pragma unroll(4)
++    for (int i = 0; i < nvec; i++) {
++        sa = Q6_Vqf32_vadd_Vqf32Vqf32(sa, Q6_Vqf32_vmpy_VsfVsf(a[i], a[i]));
++        sb = Q6_Vqf32_vadd_Vqf32Vqf32(sb, Q6_Vqf32_vmpy_VsfVsf(b[i], b[i]));
++    }
++    sa = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sa));
++    sb = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(sb));
++    *s0 = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(sa, inv_n_v), epsilon_v)));
++    *s1 = hvx_vec_rsqrt_f32(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(sb, inv_n_v), epsilon_v)));
++}
++
+ static inline void hvx_fast_norm_f32(const uint8_t * restrict src,
+                                      uint8_t * restrict dst,
+                                      const int num_elems,
 diff --git a/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h b/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
-index b7c2d74..6ec49e3 100644
+index b7c2d74..40186b4 100644
 --- a/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
 +++ b/ggml/src/ggml-hexagon/htp/hvx-sigmoid.h
 @@ -52,6 +52,106 @@ static inline HVX_Vector hvx_vec_fast_sigmoid_f32_guard(HVX_Vector v,
@@ -11671,7 +12372,7 @@ index b7c2d74..6ec49e3 100644
  static inline HVX_Vector hvx_vec_tanh_f32(HVX_Vector x) {
      // tanh(x) = 2 * sigmoid(2x) - 1
      HVX_Vector two = hvx_vec_splat_f32(2.0f);
-@@ -232,4 +332,315 @@ static inline void hvx_tanh_f16_aa(uint8_t * restrict dst, const uint8_t * restr
+@@ -232,4 +332,350 @@ static inline void hvx_tanh_f16_aa(uint8_t * restrict dst, const uint8_t * restr
      hvx_tanh_f16_loop_body(HVX_Vector, HVX_Vector, hvx_vec_store_a);
  }
  
@@ -11896,6 +12597,41 @@ index b7c2d74..6ec49e3 100644
 +    }
 +}
 +
++// hvx_sigmul_f32_hf_aa with four 64-lane pairs per iteration and all loads ahead of the stores (same math per
++// element, bit-identical; the tail goes through hvx_sigmul_f32_hf_aa)
++static inline void hvx_sigmul_f32_hf_aa4(uint8_t * restrict dst, const uint8_t * restrict g, const uint8_t * restrict u, uint32_t n) {
++    const struct hvx_silu_hf_consts c = hvx_silu_hf_consts_init();
++    const HVX_Vector one_hf  = hvx_vec_splat_f16((_Float16) 1.0f);
++    const HVX_Vector one_f32 = hvx_vec_splat_f32(1.0f);
++    const HVX_Vector m1      = Q6_V_vsplat_R(-1);
++
++    HVX_Vector * restrict vdst     = (HVX_Vector *) dst;
++    const HVX_Vector * restrict vg = (const HVX_Vector *) g;
++    const HVX_Vector * restrict vu = (const HVX_Vector *) u;
++
++    const uint32_t nq = n / (8 * VLEN_FP32);
++    for (uint32_t i = 0; i < nq; i++) {
++        HVX_Vector x[8], uu[8], y[8];
++        #pragma unroll
++        for (int j = 0; j < 8; j++) {
++            x[j]  = vg[8 * i + j];
++            uu[j] = vu[8 * i + j];
++        }
++        #pragma unroll
++        for (int j = 0; j < 4; j++) {
++            hvx_vec_sigmoid2_f32_hf(x[2 * j], x[2 * j + 1], &y[2 * j], &y[2 * j + 1], &c, one_hf, one_f32, m1);
++        }
++        #pragma unroll
++        for (int j = 0; j < 8; j++) {
++            vdst[8 * i + j] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(y[j], uu[j]));
++        }
++    }
++    const uint32_t done = nq * 8 * VLEN_FP32;
++    if (done < n) {
++        hvx_sigmul_f32_hf_aa(dst + done * sizeof(float), g + done * sizeof(float), u + done * sizeof(float), n - done);
++    }
++}
++
 +// dst = sigmoid(g) * u with the f32 sigmoid of the standalone SIGMOID op (all 128-byte aligned)
 +static inline void hvx_sigmul_f32_aa(uint8_t * restrict dst, const uint8_t * restrict g, const uint8_t * restrict u, uint32_t n) {
 +    const HVX_Vector one     = hvx_vec_splat_f32(1.f);
@@ -11988,7 +12724,7 @@ index b7c2d74..6ec49e3 100644
 +
  #endif /* HVX_SIGMOID_H */
 diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
-index b72ef2b..159fa9c 100644
+index b72ef2b..40a709e 100644
 --- a/ggml/src/ggml-hexagon/htp/main.c
 +++ b/ggml/src/ggml-hexagon/htp/main.c
 @@ -666,7 +666,9 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
@@ -12057,6 +12793,33 @@ index b72ef2b..159fa9c 100644
      octx->op            = op->opcode;
      octx->n_threads     = octx->ctx->n_threads;
      octx->n_threads_div = octx->ctx->n_threads_div;
+@@ -1245,6 +1253,8 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
+     return octx->status;
+ }
+ 
++extern uint32_t htp_fa_mscan_gen;  // flash-attn-ops.c: validity generation of the FA mask-scan result cache
++
+ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
+     dspqueue_t queue = ctx->dsp_queue;
+     int err;
+@@ -1306,6 +1316,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+     octx->ctx           = ctx;
+ 
+     mdev_group_init(ctx, req);
++    htp_fa_mscan_gen++;  // FA mask-scan results are reused only within this batch
+ 
+     work_queue_wakeup(ctx->work_queue);
+     if (ctx->hmx_queue) {
+@@ -1319,6 +1330,9 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+ 
+         profile_start(ctx->profiler, &prof);
+ 
++        if (ops[i].flags & HTP_OPFLAG_GRAPH_START) {
++            htp_fa_mscan_gen++;  // a new graph starts in this batch: its mask may differ at the same address
++        }
+         op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
+ 
+         profile_stop(ctx->profiler, &prof);
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 index 9af3129..fbc6843 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
@@ -15192,7 +15955,7 @@ index a071d74..82af319 100644
  static_assert(sizeof(struct htp_ssm_conv_kernel_params) <= 128, "htp_ssm_conv_kernel_params is too large for kernel_params blob");
  #else
 diff --git a/ggml/src/ggml-hexagon/htp/unary-ops.c b/ggml/src/ggml-hexagon/htp/unary-ops.c
-index ea3d92a..43c21cd 100644
+index ea3d92a..58d7068 100644
 --- a/ggml/src/ggml-hexagon/htp/unary-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/unary-ops.c
 @@ -212,14 +212,29 @@ static void rms_norm_f32(const void * restrict src,
@@ -15276,7 +16039,73 @@ index ea3d92a..43c21cd 100644
  }
  
  static void tile_gelu_f32(void * restrict dst, const void * restrict src, uint32_t tw, const struct htp_unary_context * uctx) {
-@@ -1310,6 +1336,26 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
+@@ -1240,6 +1266,65 @@ static void unary_thread_row_block(unsigned int nth, unsigned int ith, void * da
+     dma_queue_flush(dma_q);
+ }
+ 
++// Gated norm (RMS_NORM + MUL + SILU + MUL, fp16 silu) in one pass over a block of packed 128-wide rows:
++// the same per-row scales as rms_norm_mul_f32 (rows32 groups for >= 8 rows, per-row tail) and the same
++// arithmetic per element as the norm pass followed by hvx_swiglu_f32_hf_inplace, but two rows (four silu pairs)
++// per iteration with every load ahead of the stores and no store/reload of the normalized rows. Bit-identical.
++static void rms_norm_mul_gate_hf_fused_128(const uint8_t * restrict src, const uint8_t * restrict w,
++                                           const uint8_t * restrict z, uint8_t * restrict dst, uint32_t num_rows,
++                                           float epsilon) {
++    const HVX_Vector inv_n_v   = hvx_vec_inverse_f32(hvx_vec_splat_f32(128.0f));
++    const HVX_Vector epsilon_v = hvx_vec_splat_f32(epsilon);
++    const HVX_Vector one_v     = hvx_vec_splat_f32(1.f);
++    const struct hvx_silu_hf_consts c = hvx_silu_hf_consts_init();
++    const HVX_Vector * restrict vw = (const HVX_Vector *) w;
++    const HVX_Vector w0 = vw[0], w1 = vw[1], w2 = vw[2], w3 = vw[3];
++    const uint32_t RB = 128 * sizeof(float);
++
++    uint32_t ir = 0;
++    for (; ir + 8 <= num_rows; ir += 32) {
++        const uint32_t nr = MIN(32, num_rows - ir);
++        float scv[32] __attribute__((aligned(128)));
++        *(HVX_Vector *) scv = hvx_rms_norm_rows32_scales(src + ir * RB, RB, 4, nr, inv_n_v, epsilon_v, one_v);
++        for (uint32_t r = 0; r < nr; r += 2) {
++            const uint32_t nrr = MIN(2, nr - r);
++            const HVX_Vector * restrict x = (const HVX_Vector *) (src + (ir + r) * RB);
++            const HVX_Vector * restrict g = (const HVX_Vector *) (z + (ir + r) * RB);
++            HVX_Vector * restrict o = (HVX_Vector *) (dst + (ir + r) * RB);
++            const HVX_Vector k0 = hvx_vec_splat_f32(scv[r]);
++            const HVX_Vector k1 = hvx_vec_splat_f32(scv[nrr > 1 ? r + 1 : r]);
++            HVX_Vector gg[8], yy[8], s[8];
++            const uint32_t nv = nrr * 4;
++            #pragma unroll
++            for (int j = 0; j < 8; j++) {
++                gg[j] = j < (int) nv ? g[j] : c.zero;
++            }
++            #pragma unroll
++            for (int j = 0; j < 8; j++) {
++                const HVX_Vector xj = j < (int) nv ? x[j] : c.zero;
++                const HVX_Vector wj = (j & 3) == 0 ? w0 : (j & 3) == 1 ? w1 : (j & 3) == 2 ? w2 : w3;
++                const HVX_Vector t  = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(xj, j < 4 ? k0 : k1));
++                yy[j] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(t, wj));
++            }
++            #pragma unroll
++            for (int j = 0; j < 4; j++) {
++                hvx_vec_silu2_f32_hf(gg[2 * j], gg[2 * j + 1], &s[2 * j], &s[2 * j + 1], &c);
++            }
++            #pragma unroll
++            for (int j = 0; j < 8; j++) {
++                if (j < (int) nv) {
++                    o[j] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(s[j], yy[j]));
++                }
++            }
++        }
++    }
++    // tail rows (< 8): the per-row norm of rms_norm_mul_f32, then the gate
++    for (; ir < num_rows; ir++) {
++        hvx_fast_rms_norm_mul_f32(src + ir * RB, w, dst + ir * RB, 128, inv_n_v, epsilon_v);
++        hvx_swiglu_f32_hf_inplace(dst + ir * RB, z + ir * RB, 128);
++    }
++}
++
+ // 2. RMS_NORM_MUL row-block task with weight buffer.
+ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, void * data) {
+     (void) nth;
+@@ -1310,6 +1395,30 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
  
      dma_queue * dma_q = octx->ctx->dma[ith];
  
@@ -15296,6 +16125,10 @@ index ea3d92a..43c21cd 100644
 +        FARF(ERROR, "unary-rms-norm-mul : unsupported tiled layout\n");
 +        return;
 +    }
++    // HTP_NORM_PARAM_FUSE bit 1: one-pass gated norm for packed 128-wide rows with the fp16 silu (bit-identical)
++    const bool gate_fused = gate == 1 && (octx->op_params[HTP_NORM_PARAM_FUSE] & 1) && ne0 == 128 &&
++                            src0_row_size_aligned == 128 * sizeof(float) && dst_row_size_aligned == 128 * sizeof(float);
++    const bool tiled_fused = tiled && (octx->op_params[HTP_NORM_PARAM_FUSE] & 2);
 +    const uint32_t BLK        = tiled ? (BLOCK & ~31u) : gate ? MAX(1, BLOCK / 2) : BLOCK;
 +    const size_t   z_slot_off = (size_t) BLK * dst_row_size_aligned;
 +    const uint32_t zb1        = gate ? zt->nb[1] : 0;
@@ -15303,7 +16136,7 @@ index ea3d92a..43c21cd 100644
      if (uctx->broadcast_weight) {
          dma_queue_push(dma_q, dma_make_data(src1_vtcm_data, data_src1),
                         uctx->src1_row_size_aligned, 0, uctx->src1_data_row_size, 1);
-@@ -1317,7 +1363,7 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
+@@ -1317,7 +1426,7 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
      }
  
      for (uint32_t ir = src0_start_row, vtcm_idx = 0; ir < src0_end_row && vtcm_idx < 2; vtcm_idx++) {
@@ -15312,7 +16145,7 @@ index ea3d92a..43c21cd 100644
                                                       ne01, div_ne01);
  
          dma_queue_push(dma_q,
-@@ -1330,6 +1376,12 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
+@@ -1330,6 +1439,12 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
              dma_make_data(src0_vtcm_data + (vtcm_idx * src0_vtcm_half_size), data_src + src0_off),
              src0_row_size_aligned, nb01, src0_data_row_size, block_size);
  
@@ -15325,7 +16158,7 @@ index ea3d92a..43c21cd 100644
          if (!uctx->broadcast_weight) {
              const size_t src1_off = src1_contig ? (ir * nb11) :
                  unary_row_offset(ir, ne01, ne02, div_ne01, div_ne02, div_ne012, nb11_bc, nb12_bc, nb13_bc);
-@@ -1344,34 +1396,87 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
+@@ -1344,34 +1459,126 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
      unary_rms_norm_mul_compute_fn_t compute = (unary_rms_norm_mul_compute_fn_t) uctx->compute;
  
      for (uint32_t ir = src0_start_row; ir < src0_end_row; ) {
@@ -15351,13 +16184,44 @@ index ea3d92a..43c21cd 100644
 +            memcpy(&epsilon, octx->op_params, sizeof(float));
 +            const HVX_Vector inv_n_v   = hvx_vec_inverse_f32(hvx_vec_splat_f32((float) ne0));
 +            const HVX_Vector epsilon_v = hvx_vec_splat_f32(epsilon);
++            const uint32_t k_tiles = ne0 / 32;
++            const uint32_t padded  = (block_size + 31) & ~31u;
++            if (tiled_fused) {
++                // norm and conversion in one pass per row pair: same per-row scale and per-element arithmetic as the
++                // in-place norm below, without the f32 store / reload (bit-identical)
++                const HVX_Vector * restrict vw = (const HVX_Vector *) w;
++                for (uint32_t r = 0; r < padded; r += 2) {
++                    const bool v0 = r < block_size, v1 = r + 1 < block_size;
++                    const HVX_Vector * row0 = (const HVX_Vector *) ((const uint8_t *) src0_vtcm + r * src0_row_size_aligned);
++                    const HVX_Vector * row1 = (const HVX_Vector *) ((const uint8_t *) src0_vtcm + (r + 1) * src0_row_size_aligned);
++                    HVX_Vector * restrict tbase = (HVX_Vector *) ((__fp16 *) dst_vtcm + (size_t) (r / 32) * k_tiles * 1024) + (r % 32) / 2;
++                    if (v0 && v1) {
++                        HVX_Vector s0, s1;
++                        hvx_rms_row_scale2_f32(row0, row1, (int) k_tiles, inv_n_v, epsilon_v, &s0, &s1);
++                        #pragma unroll(4)
++                        for (uint32_t c = 0; c < k_tiles; c++) {
++                            const HVX_Vector a = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(row0[c], s0)), vw[c]));
++                            const HVX_Vector b = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(row1[c], s1)), vw[c]));
++                            tbase[c * 16] = hvx_vec_f32_to_f16_shuff(a, b);
++                        }
++                    } else if (v0) {
++                        const HVX_Vector s0 = hvx_rms_row_scale_f32(row0, (int) k_tiles, inv_n_v, epsilon_v);
++                        for (uint32_t c = 0; c < k_tiles; c++) {
++                            const HVX_Vector a = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(row0[c], s0)), vw[c]));
++                            tbase[c * 16] = hvx_vec_f32_to_f16_shuff(a, Q6_V_vzero());
++                        }
++                    } else {
++                        for (uint32_t c = 0; c < k_tiles; c++) {
++                            tbase[c * 16] = hvx_vec_f32_to_f16_shuff(Q6_V_vzero(), Q6_V_vzero());
++                        }
++                    }
++                }
++            } else {
 +            for (uint32_t r = 0; r < block_size; r++) {
 +                hvx_fast_rms_norm_mul_f32_inplace((uint8_t *) src0_vtcm + r * src0_row_size_aligned, (const uint8_t *) w, ne0,
 +                                                  inv_n_v, epsilon_v);
 +            }
 +            // row pairs -> tiles (same conversion as the matmul activation prep); pad rows of a partial tile row are zero
-+            const uint32_t k_tiles = ne0 / 32;
-+            const uint32_t padded  = (block_size + 31) & ~31u;
 +            for (uint32_t r = 0; r < padded; r += 2) {
 +                const bool v0 = r < block_size, v1 = r + 1 < block_size;
 +                const float * row0 = (const float *) ((const uint8_t *) src0_vtcm + r * src0_row_size_aligned);
@@ -15369,10 +16233,18 @@ index ea3d92a..43c21cd 100644
 +                    tbase[c * 16] = hvx_vec_f32_to_f16_shuff(a, b);
 +                }
 +            }
++            }
++        } else if (gate_fused) {
++            float epsilon = 0.f;
++            memcpy(&epsilon, octx->op_params, sizeof(float));
++            rms_norm_mul_gate_hf_fused_128((const uint8_t *) src0_vtcm, (const uint8_t *) w, (const uint8_t *) z_vtcm,
++                                           (uint8_t *) dst_vtcm, block_size, epsilon);
 +        } else {
          compute(src0_vtcm, w, dst_vtcm, block_size, uctx);
 +        }
-+        if (gate && dst_row_size_aligned == (size_t) ne0 * sizeof(float)) {
++        if (gate_fused) {
++            // done above
++        } else if (gate && dst_row_size_aligned == (size_t) ne0 * sizeof(float)) {
 +            // rows packed back to back in VTCM: one pass over the whole block
 +            // in place on the norm output (the _inplace kernels write through the pointer they read u from)
 +            if (gate == 1) {
@@ -15417,7 +16289,7 @@ index ea3d92a..43c21cd 100644
                                                                    block_dst_contig, ne01, div_ne01);
                  const size_t src0_pref_off = src0_contig ? (pref_ir * nb01) :
                      unary_row_offset(pref_ir, ne01, ne02, div_ne01, div_ne02, div_ne012, nb01, nb02, nb03);
-@@ -1379,6 +1484,13 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
+@@ -1379,6 +1586,13 @@ static void unary_thread_rms_norm_mul_f32(unsigned int nth, unsigned int ith, vo
                      dma_make_data(src0_vtcm, data_src + src0_pref_off),
                      src0_row_size_aligned, nb01, src0_data_row_size, pref_block_size);
  
@@ -15431,7 +16303,7 @@ index ea3d92a..43c21cd 100644
                  if (!uctx->broadcast_weight) {
                      const size_t src1_pref_off = src1_contig ? (pref_ir * nb11) :
                          unary_row_offset(pref_ir, ne01, ne02, div_ne01, div_ne02, div_ne012, nb11_bc, nb12_bc,
-@@ -1874,7 +1986,9 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+@@ -1874,7 +2088,9 @@ static int execute_op_unary(struct htp_ops_context * octx) {
      struct htp_unary_context uctx = {
          .octx                  = octx,
          .kparams               = kparams,
@@ -15442,7 +16314,7 @@ index ea3d92a..43c21cd 100644
          .src0_nrows            = nrows,
          .row_start             = row_start,
  
-@@ -2006,7 +2120,31 @@ static int execute_op_unary(struct htp_ops_context * octx) {
+@@ -2006,7 +2222,31 @@ static int execute_op_unary(struct htp_ops_context * octx) {
  
  int op_unary(struct htp_ops_context * octx) {
      switch (octx->src[0]->type) {
@@ -16120,7 +16992,7 @@ index fdbb2c6..7e3fa12 100644
  
      res->t_logits = cur;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8826b27..d1663c0 100644
+index 8826b27..51b583a 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -35,6 +35,7 @@
@@ -16131,7 +17003,64 @@ index 8826b27..d1663c0 100644
  #include <random>
  #include <regex>
  #include <set>
-@@ -4555,6 +4556,259 @@ struct test_ssm_conv : public test_case {
+@@ -51,10 +52,23 @@
+ #   define N_THREADS std::thread::hardware_concurrency()
+ #endif
+ 
++// GGML_TEST_SEED=<n>: init_tensor_uniform and the MUL_MAT_ID ids draw from fixed seeds (one per call, in call order),
++// so two runs of the same test selection see the same inputs; with GGML_TEST_HASH=1 the backend output of each
++// compared node is hashed, which lets two builds or two backend settings be compared bit for bit
++static uint64_t test_fixed_seed() {
++    static std::atomic<uint64_t> calls{0};
++    static const char * s = getenv("GGML_TEST_SEED");
++    if (!s) {
++        return 0;
++    }
++    return (strtoull(s, nullptr, 10) + 1) * 0x9E3779B97F4A7C15ull + calls.fetch_add(1) * 0xBF58476D1CE4E5B9ull;
++}
++
+ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+     if (ggml_is_empty(tensor)) {
+         return;
+     }
++    const uint64_t fixed_seed = test_fixed_seed();
+ 
+     size_t nels = ggml_nelements(tensor);
+     std::vector<float> data(nels);
+@@ -63,6 +77,14 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
+         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
+ 
+         auto init_thread = [&](size_t start, size_t end) {
++            if (fixed_seed) {
++                std::mt19937_64 fgen(fixed_seed ^ (uint64_t) start);
++                std::uniform_real_distribution<float> fdist(min, max);
++                for (size_t i = start; i < end; i++) {
++                    data[i] = fdist(fgen);
++                }
++                return;
++            }
+             thread_local std::default_random_engine gen(std::random_device{}());
+             std::uniform_real_distribution<float> distribution(min, max);
+             for (size_t i = start; i < end; i++) {
+@@ -1512,6 +1534,17 @@ struct test_case {
+             std::vector<float> f1 = tensor_to_float(t1);
+             std::vector<float> f2 = tensor_to_float(t2);
+ 
++            static const bool print_hash = getenv("GGML_TEST_HASH") != nullptr;
++            if (print_hash) {
++                std::vector<uint8_t> raw(ggml_nbytes(t1));
++                ggml_backend_tensor_get(t1, raw.data(), 0, raw.size());
++                uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a
++                for (uint8_t c : raw) {
++                    h = (h ^ c) * 0x100000001b3ull;
++                }
++                printf("[%s hash %016llx] ", t1->name, (unsigned long long) h);
++            }
++
+             for (size_t i = 0; i < f1.size(); i++) {
+                 // check for nans
+                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
+@@ -4555,6 +4588,259 @@ struct test_ssm_conv : public test_case {
  };
  
  // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
@@ -16391,7 +17320,7 @@ index 8826b27..d1663c0 100644
  struct test_ssm_conv_bias_silu : public test_case {
      const ggml_type type;
      const std::array<int64_t, 4> ne_a;
-@@ -4568,6 +4822,11 @@ struct test_ssm_conv_bias_silu : public test_case {
+@@ -4568,6 +4854,11 @@ struct test_ssm_conv_bias_silu : public test_case {
  
      bool run_whole_graph() override { return true; }
  
@@ -16403,7 +17332,17 @@ index 8826b27..d1663c0 100644
      std::string vars() override {
          return VARS_TO_STR4(type, ne_a, ne_b, fuse_bias);
      }
-@@ -5679,6 +5938,86 @@ struct test_mul_mat_id_fusion : public test_case {
+@@ -5424,7 +5715,8 @@ struct test_mul_mat_w4a4 : public test_mul_mat {
+ 
+ static void init_mul_mat_id_ids(ggml_context * ctx, int n_mats) {
+     std::random_device rd;
+-    std::default_random_engine rng(rd());
++    const uint64_t fixed_seed = test_fixed_seed();
++    std::default_random_engine rng(fixed_seed ? (unsigned) (fixed_seed >> 32) : rd());
+     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+         if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+             continue;
+@@ -5679,6 +5971,86 @@ struct test_mul_mat_id_fusion : public test_case {
      }
  };
  
@@ -16490,7 +17429,7 @@ index 8826b27..d1663c0 100644
  struct test_mul_mat_id_shared : public test_case {
      const ggml_type type;
      const int64_t n;
-@@ -7518,6 +7857,304 @@ struct test_moe_reduce : public test_case {
+@@ -7518,6 +7890,304 @@ struct test_moe_reduce : public test_case {
      }
  };
  
@@ -16795,7 +17734,7 @@ index 8826b27..d1663c0 100644
  // mul_mat with src1 in [0, 1]: a zero-mean src1 hides errors in the zero point or the min of a quantized src0
  struct test_mul_mat_pos : public test_mul_mat {
      using test_mul_mat::test_mul_mat;
-@@ -7612,6 +8249,53 @@ struct test_mul_mat_add : public test_case {
+@@ -7612,6 +8282,53 @@ struct test_mul_mat_add : public test_case {
      }
  };
  
@@ -16849,7 +17788,7 @@ index 8826b27..d1663c0 100644
  struct test_mul_mat_vec_fusion : public test_case {
      const ggml_type type;
      const ggml_glu_op glu_op;
-@@ -8538,6 +9222,37 @@ struct test_flash_attn_ext : public test_case {
+@@ -8538,6 +9255,37 @@ struct test_flash_attn_ext : public test_case {
      }
  };
  
@@ -16887,7 +17826,7 @@ index 8826b27..d1663c0 100644
  // large Q values, so the online softmax has to rescale the partial results
  struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
      static constexpr int q_range = 20;
-@@ -9674,6 +10389,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9674,6 +10422,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              }
          }
      }
@@ -16900,7 +17839,7 @@ index 8826b27..d1663c0 100644
  
      // fused relu + sqr (squared ReLU)
      for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
-@@ -9688,6 +10409,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9688,6 +10442,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                  test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, swap));
              }
              test_cases.emplace_back(new test_unary_mul(op, type, { 5, 7, 11, 13 }));
@@ -16908,7 +17847,7 @@ index 8826b27..d1663c0 100644
              test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "pad_unary"));
              // a view only stays out from between the two ops when the unary result is second
              test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, true, "pad_other"));
-@@ -9809,6 +10531,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9809,6 +10564,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
@@ -16920,7 +17859,7 @@ index 8826b27..d1663c0 100644
      for (ggml_type type : all_types) {
          for (int b : {1, 7}) {
              for (bool v : {false, true}) {
-@@ -10550,6 +11277,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10550,6 +11310,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
      }
  
@@ -16934,7 +17873,7 @@ index 8826b27..d1663c0 100644
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
      test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true));
-@@ -10590,6 +11324,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10590,6 +11357,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
          }
      }
@@ -16948,7 +17887,7 @@ index 8826b27..d1663c0 100644
  
      // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
      // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
-@@ -10775,6 +11516,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10775,6 +11549,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8400000, 32, {1, 1}, {2, 1}));
  #endif
  
@@ -17003,7 +17942,7 @@ index 8826b27..d1663c0 100644
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
-@@ -11052,6 +11841,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11052,6 +11874,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
          }
      }
@@ -17020,7 +17959,7 @@ index 8826b27..d1663c0 100644
  
      // gpt-oss issue with Vulkan mmq_id
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
-@@ -11101,6 +11900,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11101,6 +11933,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
      }
  
@@ -17055,7 +17994,7 @@ index 8826b27..d1663c0 100644
      for (ggml_type type_a : base_types) {
          for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
              for (int n_mats : {4, 8}) {
-@@ -11768,6 +12595,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11768,6 +12628,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false));
  
@@ -17073,7 +18012,7 @@ index 8826b27..d1663c0 100644
      // Sparse mask hint: supported decode/prefill layouts and dense fallbacks.
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
      test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 2}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  768));
-@@ -11981,6 +12819,55 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11981,6 +12852,60 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_moe_reduce(63,   12, 33, true,  true, true));
      test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
      test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
@@ -17095,6 +18034,11 @@ index 8826b27..d1663c0 100644
 +        test_cases.emplace_back(new test_moe_down_reduce(ta, 16, 4, 2048, 1, 512, 1));
 +        test_cases.emplace_back(new test_moe_down_reduce(ta, 16, 4, 96, 40, 128, 1));
 +        test_cases.emplace_back(new test_moe_down_reduce(ta, 64, 4, 2048, 512, 1792, 2));  // LFM2 MoE shape
++        // other expert counts (generic reduce loops; 8 = Qwen3 MoE, 6, 1, 3)
++        test_cases.emplace_back(new test_moe_down_reduce(ta, 64, 8, 2048, 200, 768, 2));
++        test_cases.emplace_back(new test_moe_down_reduce(ta, 32, 6, 1024, 77, 256, 1));
++        test_cases.emplace_back(new test_moe_down_reduce(ta, 8, 1, 256, 64, 256, 0));
++        test_cases.emplace_back(new test_moe_down_reduce(ta, 16, 3, 512, 33, 256, 2));
 +        for (int64_t nt : { 2, 3, 8, 16 }) {  // small ubatches: mostly one or two rows per expert
 +            test_cases.emplace_back(new test_moe_down_reduce(ta, 64, 4, 2048, nt, 1792, nt % 2 ? 1 : 2));
 +        }
@@ -17129,7 +18073,7 @@ index 8826b27..d1663c0 100644
  
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
-@@ -12343,6 +13230,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -12343,6 +13268,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
      }
  
