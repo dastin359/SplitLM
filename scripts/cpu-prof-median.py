@@ -2,7 +2,7 @@
 # after every graph). Means over a window of graphs are skewed by the few large graphs that share the node-count range,
 # e.g. the engine's startup calibration prefills on the decode context; medians of the per-graph increments are not.
 #   python cpu-prof-median.py <stderr log> [min_nodes max_nodes] [n_ops]
-import re, sys, statistics as st
+import os, re, sys, statistics as st
 from collections import defaultdict
 path=sys.argv[1]; lo=int(sys.argv[2]) if len(sys.argv)>2 else 800; hi=int(sys.argv[3]) if len(sys.argv)>3 else 2000
 dumps=[]; cur=None
@@ -28,7 +28,7 @@ for d in dumps:
             pv=prev['mm'].get(k,(0,0,0,0)); acc['mm '+k].append(inc(v[1],pv[1])); acc['mmB '+k].append(inc(v[3],pv[3]))
     prev=d
 n=len(acc['work']); md=lambda k: st.median(acc[k]) if acc[k] else 0
-print(f"{path.split('/')[-1]}: {n} graphs, median: nodes {md('nodes'):.0f} work {md('work'):.3f} ms wait {md('wait'):.3f} ms  (mean work {st.mean(acc['work']) if n else 0:.3f})")
+print(f"{os.path.basename(path)}: {n} graphs, median: nodes {md('nodes'):.0f} work {md('work'):.3f} ms wait {md('wait'):.3f} ms  (mean work {st.mean(acc['work']) if n else 0:.3f})")
 for k in sorted([k for k in acc if k.startswith('op ')], key=lambda k:-md(k))[:int(sys.argv[4]) if len(sys.argv)>4 else 6]: print(f"  {k[3:]:18s} {md(k):7.3f} ms")
 for k in sorted([k for k in acc if k.startswith('mm ')], key=lambda k:-md(k)):
     t=md(k); B=md('mmB '+k[3:]); print(f"  mm {k[3:]:26s} {t:7.3f} ms {B:7.2f} MB {B/t if t else 0:6.1f} GB/s")
