@@ -166,12 +166,15 @@ static std::vector<std::string> alias_candidates(const std::string & path, const
 
 // ---- r7-hot: CPU-layout copies of the dense weights that verify batches read slowest from the NPU tiles ----
 // The 2-4-token i8mm kernel must transpose the NPU's 32x32 tiles in registers; the CPU_REPACK layout feeds SMMLA
-// directly. Per-byte verify cost tile/repack on Qwen3.8-27B (4-token verify graph): ffn gate/up 79/67 ms (1.18),
-// attention projections ~1.14, ffn_down 32.8/29.5 (1.11). Copies are taken in that order, whole layers at a time
-// (gate+up together), until the byte budget is spent; everything else stays aliased to the NPU tiles.
-// Measured on Qwen3.8-27B (same session, identical text): a copied gate/up tensor costs 0.269 vs 0.308 ms per
-// 4-token verify; 1-2 GiB of copies (all that fits with >= 3 GB RAM left free) cut the verify call 204 -> 200-201 ms
-// and MTP k3 decode +1.5-2%, near run-to-run noise, so the default stays 0 (all aliased).
+// directly. Copies are taken ffn gate/up first (whole layers, gate+up together), then attention projections, then
+// ffn_down (the smallest tile/repack gap at graph level in round 6: gate/up 79/67 ms = 1.18, attention ~1.14,
+// ffn_down 32.8/29.5 = 1.11), until the byte budget is spent; everything else stays aliased to the NPU tiles.
+// Measured on Qwen3.8-27B (identical text): a copied gate/up tensor costs 0.269 vs 0.308 ms per 4-token verify
+// (GGML_CPU_PROF_G). 1-2 GiB of copies (all that fits with >= 3 GB RAM left free) cut the 4-token verify call by
+// only ~1-2% (204-210 -> 200-205 ms; CPU-only 192-197 ms), and MTP k3 decode t/s did not change measurably: one
+// session gave +1.7% for 1 GiB, an independent rerun gave 10.79 vs 10.82 t/s (budget 0). Default stays 0.
+// Budgets are capped at free RAM after the prefill load minus repack_reserve_mib() (TRILANE_REPACK_FORCE=1 lifts the
+// cap for manual budgets).
 static int repack_rank(const std::string & n) {
     if (n.find(".ffn_gate.") != std::string::npos || n.find(".ffn_up.") != std::string::npos) return 0;
     if (n.find(".attn_") != std::string::npos || n.find(".ssm_out.") != std::string::npos) return 1;
@@ -210,6 +213,11 @@ static std::vector<std::string> pick_repack(std::vector<std::string> & names, co
         return std::find(out.begin(), out.end(), n) != out.end(); }), names.end());
     return out;
 }
+
+// RAM kept back when sizing copies: ~3 GiB the decode side allocates after this point on Qwen3.8-27B (MTP layer,
+// contexts, compute buffers; measured 2.9-3.1 GB), 3 GiB to stay free, and 1 GiB for drift in the free-RAM reading
+// between runs (7.4-8.3 GiB after the prefill load on an otherwise idle machine)
+static double repack_reserve_mib() { return 7168; }
 
 static double avail_mib() {
 #ifdef _WIN32
@@ -527,22 +535,28 @@ int main(int argc, char ** argv) {
         const bool moe = has_experts(mp);
         const bool dense = !moe && (a.alias == "on" || llama_model_size(mp) > (6ull << 30));
         auto names = (moe || dense) ? alias_candidates(a.model, mp, moe) : std::vector<std::string>();
+        std::vector<std::string> rp; // tile-aliasing candidates that load as a CPU_REPACK copy instead
         if (dense && !names.empty() && a.repack_budget_mb != 0) {
             print_mem("prefill model loaded");
-            size_t budget = 0;
-            if (a.repack_budget_mb > 0) budget = (size_t) a.repack_budget_mb << 20;
-            if (a.repack_budget_mb == -1) {
-                // auto: free RAM now (prefill model resident) minus ~3 GiB for the decode side (MTP layer, contexts,
-                // compute buffers; measured 2-3 GiB on Qwen3.8-27B) minus 3 GiB left free, in 512 MiB steps
-                const double av = avail_mib();
-                if (av > 6144) budget = ((size_t) ((av - 6144) / 512)) * (512ull << 20);
+            const double av = avail_mib();
+            // largest budget that keeps the RAM rule (see repack_reserve_mib), in 512 MiB steps
+            const size_t cap = av > repack_reserve_mib() ? ((size_t) ((av - repack_reserve_mib()) / 512)) * (512ull << 20) : 0;
+            size_t budget = a.repack_budget_mb == -1 ? cap : (size_t) std::max(0LL, a.repack_budget_mb) << 20;
+            const char * force = getenv("TRILANE_REPACK_FORCE");
+            if (a.repack_budget_mb > 0 && budget > cap && !(force && atoi(force) != 0) && av >= 0) {
+                fprintf(stderr, "[spec] WARNING: repack budget %lld MiB exceeds free RAM %.0f MiB minus %.0f MiB reserve; "
+                                "capped at %zu MiB (TRILANE_REPACK_FORCE=1 keeps it)\n",
+                        a.repack_budget_mb, av, repack_reserve_mib(), cap >> 20);
+                budget = cap;
             }
             size_t bytes = 0;
-            const auto rp = pick_repack(names, mp, budget, &bytes);
+            rp = pick_repack(names, mp, budget, &bytes);
             fprintf(stderr, "[spec] repack budget %s%zu MiB: %zu tile tensors get a CPU_REPACK copy (%.2f GiB)\n",
                     a.repack_budget_mb == -1 ? "auto " : "", budget >> 20, rp.size(), bytes / 1073741824.0);
         }
-        if (set_resolver && get_buft && !names.empty()) {
+        // rp non-empty with names empty (the budget took every candidate): still load through the override path so
+        // the decode model keeps sharing the prefill model's CPU tensors and mmaps the rest
+        if (set_resolver && get_buft && (!names.empty() || !rp.empty())) {
             set_resolver(resolve_from_model, (void *) mp);
             pats = exact_name_patterns(names);
             const size_t n_tile_pats = pats.size();
@@ -572,6 +586,8 @@ int main(int argc, char ** argv) {
     if (!md) return 1;
     fprintf(stderr, "[spec] decode model on CPU loaded in %.0f ms (%d tensors aliased to NPU memory, mtp=%d)\n", now_ms() - t0, n_alias, (int) dp.load_mtp);
     print_mem("decode model loaded");
+    if (n_alias > 0 && avail_mib() >= 0 && avail_mib() < 3072)
+        fprintf(stderr, "[spec] WARNING: only %.0f MiB RAM free after loading; lower --repack-budget or --alias\n", avail_mib());
     if (!mp) mp = md;
 
     // ---- spec2: a second model in memory (draft), on its own device ----
