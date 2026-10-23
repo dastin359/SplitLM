@@ -4182,7 +4182,7 @@ index 2632ae3..5be2275 100644
 +    moe_traits(down)->moe_down(params, down, weights, out);
 +}
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 605c23c..09b9d4c 100644
+index 605c23c..b32a146 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -3,6 +3,7 @@
@@ -4227,7 +4227,7 @@ index 605c23c..09b9d4c 100644
  static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  static int    opt_ar_select  = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
-@@ -166,7 +183,94 @@ static int opt_opqueue  = 8;   // max number of pending batches
+@@ -166,7 +183,110 @@ static int opt_opqueue  = 8;   // max number of pending batches
  static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
  static int opt_oppoll   = 0;    // polling for batch completions
  static int opt_opfusion  = 1;    // enable/disable op fusion
@@ -4273,6 +4273,22 @@ index 605c23c..09b9d4c 100644
 +                                    // product keeps the GGML_HEXAGON_MMID_SWIGLU math and is rounded once to fp16 on the store.
 +                                    // Not with GGML_HEXAGON_SWIGLU_HF=0. Bisecting the whole MoE+dense SWIGLU change back to
 +                                    // the old graph needs GGML_HEXAGON_MMID_SWIGLU=0 and GGML_HEXAGON_NX_SWIGLU=2.
++static int opt_mmid_xbatch = 1;    // the fp16 (tiled) SWIGLU hand-off (GGML_HEXAGON_MMID_SWIGLU_F16 / MMID_ACT_TILED) also when the
++                                   // down MUL_MAT_ID starts the op batch after its gate/up producer's (LFM2.5: every third
++                                   // layer, the weight buffers split the batches there; 0 = same batch only)
++static int opt_mmid_bag = 1;       // streamed expert kernels with fp16 activation rows: the next expert's rows are DMA'd straight
++                                   // into its HMX tiles while the current expert runs (0 = per-row gather in the expert's first step)
++static int opt_mmid_depth = 2;     // streamed expert kernel pipeline depth: fp16 weight + output buffers, HMX keeps depth - 1
++                                   // jobs queued while HVX runs a step (2 = the double-buffered kernel of rounds 3-9, max 4)
++static int opt_mmid_diag = 0;      // diagnostics of the streamed expert kernel (HTP_OPFLAG_MMID_DIAG_SHIFT bits; 0 = off):
++                                   // 1 = every HMX job runs alone (the caller waits for it before the next HVX step)
++static int opt_mmid_plan = 0;      // diagnostic plan override of the streamed expert kernel: bits 0-7 = M-chunk cap in 32-row
++                                   // tiles, bits 8-15 = N-chunk in 32-column tiles (0 = planner as is)
++static int opt_mmid_plan_v2 = 1;   // streamed expert kernel planner: item cost 4 us for the fused gate/up SWIGLU op, 30 us
++                                   // for the others (LFM2.5-24B pp4096 +0.3-0.4%, same output); 0 = 10 us for both
++static int opt_mmid_map_reuse = 1; // MUL_MAT_ID(_NX) right after another one with the same ids (MoE down after gate/up): reuse
++                                   // its expert row mapping instead of scanning the ids again (same mapping; 0 = scan per op;
++                                   // 2 = check: also rebuild it and fail the op if they differ, see matmul-ops.c)
 +static int opt_idscan_mt = 1;      // MUL_MAT_ID(_NX) expert id scan + row mapping on all HVX threads (same mapping;
 +                                   // 0 = one thread, HTP_OPFLAG_IDSCAN_ST)
 +static int opt_dq4_v2 = 1;         // v2 Q4_0 / IQ4_NL weight dequant kernel on the DSP (bit-identical; 0 = v1, HTP_OPFLAG_DQ4_V1)
@@ -4322,7 +4338,7 @@ index 605c23c..09b9d4c 100644
  
  enum ggml_hexagon_fusion_flags {
      GGML_HEXAGON_FUSE_ALLREDUCE_ADD = (1 << 1), // 2
-@@ -175,6 +279,12 @@ enum ggml_hexagon_fusion_flags {
+@@ -175,6 +295,12 @@ enum ggml_hexagon_fusion_flags {
      GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
      GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
      GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
@@ -4335,7 +4351,7 @@ index 605c23c..09b9d4c 100644
  };
  
  static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
-@@ -315,6 +425,17 @@ enum ggml_hexagon_tensor_flags {
+@@ -315,6 +441,17 @@ enum ggml_hexagon_tensor_flags {
      GGML_HEXAGON_TENSOR_WEIGHT    = (1 << 1),
      GGML_HEXAGON_TENSOR_FENCE     = (1 << 2),
      GGML_HEXAGON_TENSOR_FUSEABLE  = (1 << 3),
@@ -4353,7 +4369,7 @@ index 605c23c..09b9d4c 100644
  };
  
  struct ggml_hexagon_session;
-@@ -441,7 +562,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
+@@ -441,7 +578,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
      const struct ggml_tensor * src0,
      const struct ggml_tensor * act,
      int32_t n_weights,
@@ -4363,7 +4379,7 @@ index 605c23c..09b9d4c 100644
  );
  
  static void ggml_hexagon_precompute_fused_mmidnx_params(
-@@ -483,6 +605,7 @@ struct ggml_hexagon_tensor_extra {
+@@ -483,6 +621,7 @@ struct ggml_hexagon_tensor_extra {
      std::vector<uint8_t> shadow_buf;
      size_t               shadow_size { 0 };
      uint32_t             flags { 0 };
@@ -4371,7 +4387,7 @@ index 605c23c..09b9d4c 100644
  };
  
  static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
-@@ -501,6 +624,10 @@ static inline bool ggml_hexagon_can_rt_repack(const struct ggml_tensor * t) {
+@@ -501,6 +640,10 @@ static inline bool ggml_hexagon_can_rt_repack(const struct ggml_tensor * t) {
      return opt_rt_repack > 1 || ggml_is_quantized(t->type);
  }
  
@@ -4382,7 +4398,7 @@ index 605c23c..09b9d4c 100644
  static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
      const auto * extra = (const ggml_hexagon_tensor_extra *) t->extra;
      if (extra && (extra->flags & GGML_HEXAGON_TENSOR_TILED)) {
-@@ -596,6 +723,7 @@ struct ggml_hexagon_session {
+@@ -596,6 +739,7 @@ struct ggml_hexagon_session {
      std::atomic<uint32_t> last_error{HTP_STATUS_OK};
  
      uint64_t                cached_uid = 0;
@@ -4390,7 +4406,7 @@ index 605c23c..09b9d4c 100644
      std::vector<htp_opnode> cached_nodes;
  
      ggml_hexagon_mdev_group                mdev;
-@@ -618,7 +746,7 @@ struct ggml_hexagon_session {
+@@ -618,7 +762,7 @@ struct ggml_hexagon_session {
      std::unordered_map<uint64_t, volatile uint32_t *> cpy_fence_slots;
  
      void enqueue_mdev_group();
@@ -4399,7 +4415,7 @@ index 605c23c..09b9d4c 100644
      void enqueue_cpy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * sync_tensor = nullptr, uint32_t fence_seq = 0);
      void enqueue_fence(const ggml_tensor * sync_tensor, uint32_t fence_seq = 0, bool wait = true);
      void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors,
-@@ -700,11 +828,13 @@ struct ggml_hexagon_rpcmem_block {
+@@ -700,11 +844,13 @@ struct ggml_hexagon_rpcmem_block {
              throw std::runtime_error("ggml-hex: rpcmem_to_fd failed");
          }
          this->size = size;
@@ -4413,7 +4429,7 @@ index 605c23c..09b9d4c 100644
          }
      }
  };
-@@ -896,6 +1026,119 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
+@@ -896,6 +1042,119 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
      return GGML_STATUS_SUCCESS;
  }
  
@@ -4533,7 +4549,7 @@ index 605c23c..09b9d4c 100644
  static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                     ggml_tensor *         tensor,
                                                     const void *          data,
-@@ -921,7 +1164,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -921,7 +1180,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
      }
  
      if (offset == 0 && size == ggml_nbytes(tensor) && extra->shadow_buf.empty()) {
@@ -4542,7 +4558,7 @@ index 605c23c..09b9d4c 100644
          return;
      }
  
-@@ -932,7 +1175,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -932,7 +1191,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
      extra->shadow_size += size;
  
      if (extra->shadow_size >= ggml_nbytes(tensor)) {
@@ -4551,7 +4567,7 @@ index 605c23c..09b9d4c 100644
          extra->shadow_buf.clear();
          extra->shadow_buf.shrink_to_fit();
          extra->shadow_size = 0;
-@@ -1008,7 +1251,7 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
+@@ -1008,7 +1267,7 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
      extra->shadow_size += n_copies * size;
  
      if (extra->shadow_size >= ggml_nbytes(tensor)) {
@@ -4560,7 +4576,7 @@ index 605c23c..09b9d4c 100644
          extra->shadow_buf.clear();
          extra->shadow_buf.shrink_to_fit();
          extra->shadow_size = 0;
-@@ -1163,6 +1406,9 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
+@@ -1163,6 +1422,9 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
          int64_t ne2 = t->ne[2];
          int64_t ne3 = t->ne[3];
          size_t tiled_size = htp_tiled_row_size(t->type, ne0) * ne1 * ne2 * ne3;
@@ -4570,7 +4586,7 @@ index 605c23c..09b9d4c 100644
          return std::max(tiled_size, ggml_nbytes(t));
      }
      return ggml_nbytes(t);
-@@ -1599,6 +1845,12 @@ struct ggml_hexagon_opbatch {
+@@ -1599,6 +1861,12 @@ struct ggml_hexagon_opbatch {
          if ((extra->flags & GGML_HEXAGON_TENSOR_FENCE) != 0) {
              h.flags |= HTP_TENSOR_FENCE;
          }
@@ -4583,7 +4599,7 @@ index 605c23c..09b9d4c 100644
  
          HEX_VERBOSE("ggml-hex: %s add-tensor #%u %s : bi %d data %p offset %zu size %zu flags 0x%x : %zu:%zu:%zu:%zu\n", sess->c_name(),
                  ti, t->name, h.bi, (void*) t->data, (size_t) t_offset, t_size, h.flags,
-@@ -1607,6 +1859,32 @@ struct ggml_hexagon_opbatch {
+@@ -1607,6 +1875,32 @@ struct ggml_hexagon_opbatch {
          return ti;
      }
  
@@ -4616,16 +4632,21 @@ index 605c23c..09b9d4c 100644
      bool fit_op(const htp_opnode & node) const {
          if (n_ops >= n_ops_max) return false;
  
-@@ -1667,7 +1945,7 @@ struct ggml_hexagon_opbatch {
+@@ -1667,7 +1961,12 @@ struct ggml_hexagon_opbatch {
          memcpy(o.params,        node.node->op_params, sizeof(node.node->op_params));
          memcpy(o.kernel_params, node.kernel_params,   sizeof(o.kernel_params));
          o.opcode = node.opcode;
 -        o.flags  = 0;
-+        o.flags  = (opt_dq4_v2 ? 0 : HTP_OPFLAG_DQ4_V1) | (htp_repack_q4_tl() ? HTP_OPFLAG_Q4_TL : 0) | (opt_idscan_mt ? 0 : HTP_OPFLAG_IDSCAN_ST);
++        o.flags  = (opt_dq4_v2 ? 0 : HTP_OPFLAG_DQ4_V1) | (htp_repack_q4_tl() ? HTP_OPFLAG_Q4_TL : 0) | (opt_idscan_mt ? 0 : HTP_OPFLAG_IDSCAN_ST) |
++                   ((opt_mmid_depth >= 2 && opt_mmid_depth <= 4) ? ((uint32_t) (opt_mmid_depth - 1) << HTP_OPFLAG_MMID_DEPTH_SHIFT) : 0) |
++                   (opt_mmid_bag ? 0 : HTP_OPFLAG_MMID_BAG_OFF) |
++                   ((uint32_t) ((opt_mmid_diag | (opt_mmid_map_reuse == 2 ? 2 : 0)) & 0xf) << HTP_OPFLAG_MMID_DIAG_SHIFT) | (opt_mmid_plan_v2 ? 0 : HTP_OPFLAG_MMID_PLAN_V1) |
++                   (opt_mmid_map_reuse ? 0 : HTP_OPFLAG_MMID_MAP_NOREUSE) |
++                   ((uint32_t) (opt_mmid_plan & 0xff) << 24) | ((uint32_t) ((opt_mmid_plan >> 8) & 0xff) << 8);
  
          ggml_hexagon_dump_op_exec(sess->c_name(), ops[n], o.flags);
  
-@@ -1918,7 +2196,10 @@ struct ggml_hexagon_opbatch {
+@@ -1918,7 +2217,10 @@ struct ggml_hexagon_opbatch {
          if (!ggml_are_same_shape(src0, node.dst())) {
              return false;
          }
@@ -4637,7 +4658,7 @@ index 605c23c..09b9d4c 100644
              return false;
          }
  
-@@ -1998,34 +2279,50 @@ struct ggml_hexagon_opbatch {
+@@ -1998,34 +2300,50 @@ struct ggml_hexagon_opbatch {
          const struct htp_mm_kernel_params * orig_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
          struct htp_mm_kernel_params kparams;
          ggml_hexagon_precompute_fused_matmul_add_params(sess, src0, src1, src2, node.dst(), &kparams);
@@ -4711,7 +4732,7 @@ index 605c23c..09b9d4c 100644
          }
  
          if (!try_fuse_common(src2, node.dst())) {
-@@ -2096,13 +2393,18 @@ struct ggml_hexagon_opbatch {
+@@ -2096,13 +2414,18 @@ struct ggml_hexagon_opbatch {
                  return false;
              }
  
@@ -4732,7 +4753,7 @@ index 605c23c..09b9d4c 100644
              }
              if (!is_supported_mul_mat_nx_kernel(w0, &kparams)) {
                  return false;
-@@ -2161,13 +2463,15 @@ struct ggml_hexagon_opbatch {
+@@ -2161,13 +2484,15 @@ struct ggml_hexagon_opbatch {
                  return false;
              }
  
@@ -4750,7 +4771,7 @@ index 605c23c..09b9d4c 100644
              }
              if (!is_supported_mul_mat_nx_kernel(w0, &kparams)) {
                  return false;
-@@ -2419,14 +2723,675 @@ struct ggml_hexagon_opbatch {
+@@ -2419,14 +2744,685 @@ struct ggml_hexagon_opbatch {
          return true;
      }
  
@@ -5203,34 +5224,44 @@ index 605c23c..09b9d4c 100644
 +    // gathers fp16 rows, which halves that intermediate's DDR traffic and skips one f32 round trip (the consumer
 +    // converts its activations to fp16 anyway).
 +    void try_f16_act(unsigned int n) {
-+        const htp_opnode & node = ops[n];
-+        if (node.opcode != HTP_OP_MUL_MAT_ID || sess->mdev.count > 1) return;
++        const uint8_t bits = pair_f16_act(ops[n], (int) n - 1, (int) n);
++        if (bits) {
++            ((struct htp_mm_kernel_params *) h_ops[n].kernel_params)->pipeline |= bits;
++            ((struct htp_mm_kernel_params *) ops[n].kernel_params)->pipeline |= bits;
++        }
++    }
 +
-+        auto * kp = (struct htp_mm_kernel_params *) h_ops[n].kernel_params;
++    // Producer side of the hand-off above for the consumer `node` (the MUL_MAT_ID at op n of this batch, or not added
++    // yet: GGML_HEXAGON_MMID_XBATCH pairs a consumer that starts the next batch with a producer at the end of this one
++    // before it is flushed). Searches ops[j_from..0], sets the producer's flags and returns the consumer's pipeline
++    // bits (0 = no hand-off).
++    uint8_t pair_f16_act(const htp_opnode & node, int j_from, int n) {
++        if (node.opcode != HTP_OP_MUL_MAT_ID || sess->mdev.count > 1) return 0;
++
++        const auto * kp = (const struct htp_mm_kernel_params *) node.kernel_params;
 +        const uint32_t need = HTP_MMID_STREAM | HTP_MMID_STREAM_DMA_GATHER;
-+        if (kp->n_hmx == 0 || (kp->pipeline & need) != need) return;
++        if (kp->n_hmx == 0 || (kp->pipeline & need) != need) return 0;
 +
 +        const ggml_tensor * x = node.src1();
 +        if (!x || !x->extra || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[0] % 64 != 0 ||
 +            x->nb[1] % 128 != 0 || x->nb[2] % 128 != 0 || x->ne[0] != node.src0()->ne[0]) {
-+            return;
++            return 0;
 +        }
-+        if (!(((const ggml_hexagon_tensor_extra *) x->extra)->flags & GGML_HEXAGON_TENSOR_F16_ACT)) return;
++        if (!(((const ggml_hexagon_tensor_extra *) x->extra)->flags & GGML_HEXAGON_TENSOR_F16_ACT)) return 0;
 +
-+        for (int j = (int) n - 1; j >= 0; --j) {
++        for (int j = j_from; j >= 0; --j) {
 +            htp_opnode & p = ops[j];
 +            if (p.opcode != HTP_OP_MUL_MAT_ID_NX || p.outputs.size() != 2 || p.outputs[0] != x) continue;
 +            auto * pk = (struct htp_mm_kernel_params *) h_ops[j].kernel_params;
-+            if (pk->epilogue != HTP_MM_EPI_SWIGLU_PAIR_HF && pk->epilogue != HTP_MM_EPI_SWIGLU_PAIR_H16) return;
++            if (pk->epilogue != HTP_MM_EPI_SWIGLU_PAIR_HF && pk->epilogue != HTP_MM_EPI_SWIGLU_PAIR_H16) return 0;
 +
 +            // same math as before, rounded once to fp16 on the store
 +            const uint8_t epi = pk->epilogue == HTP_MM_EPI_SWIGLU_PAIR_HF ? HTP_MM_EPI_SWIGLU_PAIR_F16OUT
 +                                                                          : HTP_MM_EPI_SWIGLU_PAIR_H16_F16OUT;
 +            pk->epilogue = epi;
 +            ((struct htp_mm_kernel_params *) p.kernel_params)->epilogue = epi;
-+            kp->pipeline |= HTP_MMID_STREAM_ACT_F16;
-+            ((struct htp_mm_kernel_params *) ops[n].kernel_params)->pipeline |= HTP_MMID_STREAM_ACT_F16;
-+            HEX_VERBOSE("ggml-hex: %s fp16 SWIGLU activations #%d -> #%u\n", sess->c_name(), j, n);
++            uint8_t bits = HTP_MMID_STREAM_ACT_F16;
++            HEX_VERBOSE("ggml-hex: %s fp16 SWIGLU activations #%d -> #%d\n", sess->c_name(), j, n);
 +
 +            // same expert ids on both ends: the expert-sorted tiled layout (the DSP falls back to rows when it does
 +            // not fit and says so in a flag word)
@@ -5241,12 +5272,12 @@ index 605c23c..09b9d4c 100644
 +            if (opt_mmid_act_tiled && same_ids && p.inputs.size() == 4) {
 +                pk->pipeline |= HTP_MMID_STREAM_ACT_TILED;
 +                ((struct htp_mm_kernel_params *) p.kernel_params)->pipeline |= HTP_MMID_STREAM_ACT_TILED;
-+                kp->pipeline |= HTP_MMID_STREAM_ACT_TILED;
-+                ((struct htp_mm_kernel_params *) ops[n].kernel_params)->pipeline |= HTP_MMID_STREAM_ACT_TILED;
-+                HEX_VERBOSE("ggml-hex: %s tiled fp16 SWIGLU activations #%d -> #%u\n", sess->c_name(), j, n);
++                bits |= HTP_MMID_STREAM_ACT_TILED;
++                HEX_VERBOSE("ggml-hex: %s tiled fp16 SWIGLU activations #%d -> #%d\n", sess->c_name(), j, n);
 +            }
-+            return;
++            return bits;
 +        }
++        return 0;
 +    }
 +
 +    // The MOE_REDUCE at op n reads the output of a streamed expert MUL_MAT_ID earlier in this batch, and nothing else
@@ -5426,7 +5457,7 @@ index 605c23c..09b9d4c 100644
          return false;
      }
  };
-@@ -2654,6 +3619,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
+@@ -2654,6 +3650,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
          }
  
          if (err != 0) {
@@ -5440,7 +5471,7 @@ index 605c23c..09b9d4c 100644
              GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
          }
  
-@@ -2693,6 +3665,28 @@ void ggml_hexagon_session::start_batch() {
+@@ -2693,6 +3696,28 @@ void ggml_hexagon_session::start_batch() {
  void ggml_hexagon_session::flush_batch(size_t min_ops) {
      if (op_batch->n_ops < min_ops) { return; }
  
@@ -5469,7 +5500,7 @@ index 605c23c..09b9d4c 100644
      op_batch->sort_buffers();
  
      htp_opbatch_req req {};
-@@ -2737,7 +3731,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+@@ -2737,7 +3762,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
      op_batch->reset();
  }
  
@@ -5478,19 +5509,27 @@ index 605c23c..09b9d4c 100644
      auto clone_tensor_buffer = [this](const ggml_tensor * t) {
          auto sbuf = this->mmap_tensor(t);
          if (!sbuf) return;
-@@ -2762,6 +3756,11 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+@@ -2760,7 +3785,19 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+         return;
+     }
  
++    uint8_t xbatch_bits = 0;  // GGML_HEXAGON_MMID_XBATCH: consumer side of a hand-off whose producer ends the batch
      if (!op_batch->fit_op(node)) {
-         flush_async();
++        if (opt_mmid_swiglu_f16 && opt_mmid_xbatch) {
++            xbatch_bits = op_batch->pair_f16_act(node, (int) op_batch->n_ops - 1, -1);
++        }
++        flush_async();
 +    } else if (opt_fuse_lookahead && next && !op_batch->empty() && node.node && node.fused.empty() &&
 +               ggml_hexagon_tensor_is_fuseable(node.node) && !op_batch->fit_op_pair(node, *next)) {
 +        // the next op could fuse into this one (e.g. RMS_NORM + MUL) but would not fit in this batch: a fusion
 +        // never crosses a batch boundary, so start the new batch here instead of between the two
-+        flush_async();
++        if (opt_mmid_swiglu_f16 && opt_mmid_xbatch) {
++            xbatch_bits = op_batch->pair_f16_act(node, (int) op_batch->n_ops - 1, -1);
++        }
+         flush_async();
      }
  
-     if (op_batch->empty()) {
-@@ -2774,6 +3773,18 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+@@ -2774,6 +3811,21 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
      }
  
      op_batch->add_op(node);
@@ -5500,7 +5539,10 @@ index 605c23c..09b9d4c 100644
 +        op_batch->h_ops[op_batch->n_ops - 1].flags |= HTP_OPFLAG_GRAPH_START;
 +        graph_start_pending = false;
 +    }
-+    if (opt_mmid_swiglu_f16) {
++    if (xbatch_bits) {
++        ((struct htp_mm_kernel_params *) op_batch->h_ops[op_batch->n_ops - 1].kernel_params)->pipeline |= xbatch_bits;
++        ((struct htp_mm_kernel_params *) op_batch->ops[op_batch->n_ops - 1].kernel_params)->pipeline |= xbatch_bits;
++    } else if (opt_mmid_swiglu_f16) {
 +        op_batch->try_f16_act(op_batch->n_ops - 1);
 +    }
 +    if (opt_moe_f16) {
@@ -5509,7 +5551,7 @@ index 605c23c..09b9d4c 100644
  }
  
  void ggml_hexagon_session::enqueue_mdev_group() {
-@@ -3548,7 +4559,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3548,7 +4600,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
      kparams->logit_softcap = logit_softcap;
  
      kparams->head_split = (opt_fa_head_split != 0) ? 1 : 0;
@@ -5520,7 +5562,7 @@ index 605c23c..09b9d4c 100644
      kparams->G = G;
  
      const uint32_t n_head = q->ne[2];
-@@ -3565,7 +4578,12 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3565,7 +4619,12 @@ static bool ggml_hexagon_precompute_flash_attn_params(
          const uint32_t DK_pad = hex_round_up(DK, 64);
          const uint32_t DV_pad = hex_round_up(DV, 64);
          size_t Br = 0, Bc = 0;
@@ -5534,7 +5576,7 @@ index 605c23c..09b9d4c 100644
          if (ret == 0) {
              kparams->kernel_type = HTP_FA_KERNEL_HMX;
              if (logit_softcap == 0.0f) {
-@@ -3582,7 +4600,11 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3582,7 +4641,11 @@ static bool ggml_hexagon_precompute_flash_attn_params(
  
              kparams->u.hmx.g_br = hex_align_up(G * Br, 32);
              kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? 1 : 0;
@@ -5547,7 +5589,7 @@ index 605c23c..09b9d4c 100644
  
              const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
              kparams->u.hmx.row_buf_stride = row_vec_bytes / 128; // HVX vector is 128 bytes
-@@ -3836,10 +4858,11 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3836,10 +4899,11 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
      bool is_batched,
      size_t src2_size,
      size_t vtcm_budget,
@@ -5561,7 +5603,7 @@ index 605c23c..09b9d4c 100644
      const int n_threads = (int)sess->n_threads;
      const int ne10 = act->ne[0];
  
-@@ -3856,6 +4879,15 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3856,6 +4920,15 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
          }
      }
      const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(m_for_solver);
@@ -5577,7 +5619,7 @@ index 605c23c..09b9d4c 100644
  
      const bool is_batched_val = is_matmul_id ? false : is_batched;
      const int group_size = (ne02 > 0 ? ne12 / ne02 : 1);
-@@ -3889,10 +4921,55 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3889,10 +4962,55 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
          if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, m_for_solver_padded, cost_m, n_threads, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
              return false;
          }
@@ -5634,7 +5676,7 @@ index 605c23c..09b9d4c 100644
      kparams->m_chunk = m_chunk;
      kparams->n_chunk = n_chunk;
      kparams->n_threads = n_threads;
-@@ -4504,6 +5581,12 @@ static void ggml_hexagon_precompute_unary_params(
+@@ -4504,6 +5622,12 @@ static void ggml_hexagon_precompute_unary_params(
      kparams->vtcm_dst_size  = L.dst_bytes * n_threads;
  
      kparams->block = col_tile ? 0 : ((L.src0_bytes / 2) / src0_row_size_aligned);
@@ -5647,7 +5689,7 @@ index 605c23c..09b9d4c 100644
  
      const uint32_t tiles_per_row = col_tile > 0 ? (src0->ne[0] + col_tile - 1) / col_tile : 1;
      kparams->div_ne01  = init_fastdiv_values(src0->ne[1]);
-@@ -4559,6 +5642,13 @@ static void ggml_hexagon_precompute_get_rows_params(
+@@ -4559,6 +5683,13 @@ static void ggml_hexagon_precompute_get_rows_params(
      }
  
      kparams->vtcm_size = (total_tasks == 0) ? 0 : vtcm_layout.total_bytes;
@@ -5661,7 +5703,7 @@ index 605c23c..09b9d4c 100644
      kparams->tasks_per_thread = kparams->n_threads > 0 ? (total_tasks + kparams->n_threads - 1) / kparams->n_threads : 0;
      kparams->total_tasks = total_tasks;
  
-@@ -4680,9 +5770,11 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4680,9 +5811,11 @@ static void ggml_hexagon_precompute_rope_params(
      const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, src0_nrows);
      const uint32_t n_freq_factors = src2 ? (uint32_t) src2->ne[0] : 0;
  
@@ -5674,7 +5716,7 @@ index 605c23c..09b9d4c 100644
      kparams->n_threads              = n_threads;
      kparams->src0_nrows             = src0_nrows;
      kparams->src0_nrows_per_thread  = (src0_nrows + n_threads - 1) / n_threads;
-@@ -4692,6 +5784,9 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4692,6 +5825,9 @@ static void ggml_hexagon_precompute_rope_params(
      kparams->src0_row_size_aligned  = (uint32_t) layout.src0_row_size_aligned;
      kparams->freq_factors_offset    = (uint32_t) (layout.bytes_per_thread * n_threads);
      kparams->freq_factors_size      = (uint32_t) layout.freq_factors_size_aligned;
@@ -5684,7 +5726,7 @@ index 605c23c..09b9d4c 100644
  
      if (src0_nrows > 0) {
          kparams->div_ne2_ne1 = init_fastdiv_values(dst->ne[2] * dst->ne[1]);
-@@ -4699,12 +5794,13 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4699,12 +5835,13 @@ static void ggml_hexagon_precompute_rope_params(
      }
  }
  
@@ -5700,7 +5742,7 @@ index 605c23c..09b9d4c 100644
  ) {
      memset(kparams, 0, sizeof(*kparams));
  
-@@ -4714,7 +5810,7 @@ static void ggml_hexagon_precompute_ssm_conv_params(
+@@ -4714,7 +5851,7 @@ static void ggml_hexagon_precompute_ssm_conv_params(
      const uint32_t n_s     = (uint32_t) dst->ne[2];
      const uint32_t ncs     = (uint32_t) src0->ne[0];
  
@@ -5709,7 +5751,7 @@ index 605c23c..09b9d4c 100644
  
      kparams->n_threads = n_threads;
      kparams->d_conv    = d_conv;
-@@ -4783,6 +5879,23 @@ static void ggml_hexagon_precompute_ssm_conv_params(
+@@ -4783,6 +5920,23 @@ static void ggml_hexagon_precompute_ssm_conv_params(
      kparams->vtcm_size      = kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size;
  }
  
@@ -5733,7 +5775,7 @@ index 605c23c..09b9d4c 100644
  static void ggml_hexagon_precompute_gated_delta_net_params(
      const struct ggml_hexagon_session * sess,
      const struct ggml_tensor * op,
-@@ -4820,13 +5933,29 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
+@@ -4820,13 +5974,29 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
  
      if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout, S_v, HTP_GDN_CHUNK_SIZE, total_rows, sess->vtcm_size, n_threads, true, &n_heads_batch)) {
          kparams->kernel_type     = HTP_GDN_KERNEL_HMX_CHUNKED;
@@ -5764,7 +5806,7 @@ index 605c23c..09b9d4c 100644
      } else {
          htp_gdn_vtcm_layout_build(&hvx_layout, S_v, n_threads);
          kparams->kernel_type     = HTP_GDN_KERNEL_HVX_RECURRENT;
-@@ -5256,7 +6385,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
+@@ -5256,7 +6426,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
      const struct ggml_tensor * src0, // W0
      const struct ggml_tensor * act,  // x
      int32_t n_weights,
@@ -5774,7 +5816,7 @@ index 605c23c..09b9d4c 100644
  ) {
      memset(kparams, 0, sizeof(*kparams));
      kparams->n_threads = sess->n_threads;
-@@ -5282,7 +6412,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
+@@ -5282,7 +6453,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
  
      bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2);
      if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, act, nullptr, false, is_batched)) {
@@ -5783,7 +5825,7 @@ index 605c23c..09b9d4c 100644
              kparams->n_weights = n_weights;
              goto finalize;
          }
-@@ -6125,7 +7255,8 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
+@@ -6125,7 +7296,8 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
      const uint32_t n_freq_factors = src2 ? (uint32_t) src2->ne[0] : 0;
  
      struct htp_rope_vtcm_layout layout;
@@ -5793,7 +5835,7 @@ index 605c23c..09b9d4c 100644
      if (layout.total_bytes > sess->vtcm_size) {
          return false;
      }
-@@ -6905,12 +8036,928 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
+@@ -6905,12 +8077,928 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
      return true;
  }
  
@@ -6722,7 +6764,7 @@ index 605c23c..09b9d4c 100644
  
      HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
  
-@@ -6927,9 +8974,113 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6927,9 +9015,113 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              auto * extra = (ggml_hexagon_tensor_extra *) graph->nodes[i]->extra;
              if (!extra) continue;
  
@@ -6787,8 +6829,7 @@ index 605c23c..09b9d4c 100644
 +                    }
 +                }
 +            }
- 
--            if (graph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_can_fuse(graph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
++
 +            if (opt_moe_f16 && graph->nodes[i]->op == GGML_OP_MUL_MAT_ID && graph->nodes[i]->type == GGML_TYPE_F32 &&
 +                !(graph->nodes[i]->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_has_n_uses(graph, i, 1) &&
 +                ggml_hexagon_uses_all_in_split(graph, graph->nodes[i])) {
@@ -6817,7 +6858,8 @@ index 605c23c..09b9d4c 100644
 +                    }
 +                }
 +            }
-+
+ 
+-            if (graph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_can_fuse(graph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
 +            if (opt_norm_rope && graph->nodes[i]->op == GGML_OP_MUL && i > 0 && i + 1 < graph->n_nodes &&
 +                graph->nodes[i - 1]->op == GGML_OP_RMS_NORM && graph->nodes[i + 1]->op == GGML_OP_ROPE &&
 +                graph->nodes[i + 1]->src[0] == graph->nodes[i] && !(graph->nodes[i]->flags & GGML_TENSOR_FLAG_OUTPUT) &&
@@ -6838,7 +6880,7 @@ index 605c23c..09b9d4c 100644
                  extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
              } else if ((graph->nodes[i]->op == GGML_OP_MUL_MAT &&
                          ggml_get_op_params_i32(graph->nodes[i], 1) != GGML_HINT_SRC0_IS_HADAMARD) ||
-@@ -6943,9 +9094,260 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6943,9 +9135,260 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -7100,7 +7142,7 @@ index 605c23c..09b9d4c 100644
                  continue;
              }
  
-@@ -6968,6 +9370,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6968,6 +9411,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                      htp_repack_tensor_tiled(src0, raw.data(), raw.size());
                      auto * extra = (ggml_hexagon_tensor_extra *) src0->extra;
                      extra->flags |= GGML_HEXAGON_TENSOR_TILED;
@@ -7112,7 +7154,7 @@ index 605c23c..09b9d4c 100644
                  }
              }
  
-@@ -6991,8 +9398,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6991,8 +9439,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                  auto inputs = node.get_inputs();
                  const struct ggml_tensor * src0 = inputs[0];
                  const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
@@ -7147,7 +7189,7 @@ index 605c23c..09b9d4c 100644
                      (struct htp_unary_kernel_params *)node.kernel_params
                  );
              } else if (node.opcode == HTP_OP_GET_ROWS) {
-@@ -7031,6 +9463,37 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -7031,6 +9504,37 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                      node.opcode == HTP_OP_TOP_K,
                      (struct htp_sort_kernel_params *) node.kernel_params
                  );
@@ -7185,7 +7227,7 @@ index 605c23c..09b9d4c 100644
              } else if (node.opcode == HTP_OP_POOL_2D || node.opcode == HTP_OP_POOL_1D) {
                  ggml_hexagon_precompute_pool_2d_params(
                      sess, node.node->src[0], node.dst(),
-@@ -7074,8 +9537,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -7074,8 +9578,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
      }
  
      // Queue and execute
@@ -7196,7 +7238,7 @@ index 605c23c..09b9d4c 100644
      }
  
      if (sess->last_error > HTP_STATUS_OK) {
-@@ -7773,6 +10236,19 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
+@@ -7773,6 +10277,19 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
          return false;
      }
  
@@ -7216,7 +7258,7 @@ index 605c23c..09b9d4c 100644
      bool supp = false;
      switch (op->op) {
          case GGML_OP_NONE:
-@@ -8369,7 +10845,62 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8369,7 +10886,62 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
      const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
      const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
@@ -7279,7 +7321,7 @@ index 605c23c..09b9d4c 100644
      const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
      const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
      const char * str_etm      = getenv("GGML_HEXAGON_ETM");
-@@ -8378,6 +10909,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8378,6 +10950,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
      const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
      const char * str_fa_head_split = getenv("GGML_HEXAGON_FA_HEAD_SPLIT");
@@ -7297,7 +7339,7 @@ index 605c23c..09b9d4c 100644
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
-@@ -8385,6 +10927,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8385,6 +10968,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
      const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
      const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
@@ -7305,7 +7347,7 @@ index 605c23c..09b9d4c 100644
      const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
      const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
      const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
-@@ -8427,6 +10970,73 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8427,6 +11011,80 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
      opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
      opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
@@ -7350,6 +7392,13 @@ index 605c23c..09b9d4c 100644
 +    }
 +    opt_dq4_v2      = str_dq4_v2      ? atoi(str_dq4_v2)                  : opt_dq4_v2;
 +    if (const char * e = getenv("GGML_HEXAGON_IDSCAN_MT")) opt_idscan_mt = atoi(e);
++    if (const char * e = getenv("GGML_HEXAGON_MMID_DEPTH")) opt_mmid_depth = atoi(e);
++    if (const char * e = getenv("GGML_HEXAGON_MMID_BAG")) opt_mmid_bag = atoi(e);
++    if (const char * e = getenv("GGML_HEXAGON_MMID_XBATCH")) opt_mmid_xbatch = atoi(e);
++    if (const char * e = getenv("GGML_HEXAGON_MMID_DIAG")) opt_mmid_diag = atoi(e);
++    if (const char * e = getenv("GGML_HEXAGON_MMID_PLAN")) opt_mmid_plan = atoi(e);
++    if (const char * e = getenv("GGML_HEXAGON_MMID_PLAN_V2")) opt_mmid_plan_v2 = atoi(e);
++    if (const char * e = getenv("GGML_HEXAGON_MMID_MAP_REUSE")) opt_mmid_map_reuse = atoi(e);
 +    opt_sort_topk   = str_sort_topk   ? atoi(str_sort_topk)               : opt_sort_topk;
 +    opt_conv_block_silu = str_conv_block_silu ? atoi(str_conv_block_silu) : opt_conv_block_silu;
 +    opt_gdn_fuse        = str_gdn_fuse        ? atoi(str_gdn_fuse)        : opt_gdn_fuse;
@@ -7379,7 +7428,7 @@ index 605c23c..09b9d4c 100644
      opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
      opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
      opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
-@@ -8443,6 +11053,18 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8443,6 +11101,18 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
      opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
      opt_fa_head_split = str_fa_head_split ? atoi(str_fa_head_split)       : opt_fa_head_split;
@@ -7398,7 +7447,7 @@ index 605c23c..09b9d4c 100644
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
      opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
      opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
-@@ -8464,6 +11086,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8464,6 +11134,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
              p = comma + 1;
          }
      }
@@ -14155,7 +14204,7 @@ index 22a05b9..9f2c9a7 100644
  int op_diag(struct htp_ops_context * octx);
  int op_solve_tri(struct htp_ops_context * octx);
 diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
-index 9b4b86d..1a4bf93 100644
+index 9b4b86d..4176308 100644
 --- a/ggml/src/ggml-hexagon/htp/htp-ops.h
 +++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
 @@ -115,6 +115,7 @@ enum htp_op_code {
@@ -14229,7 +14278,7 @@ index 9b4b86d..1a4bf93 100644
  };
  
  enum htp_buf_flags {
-@@ -167,9 +215,18 @@ struct htp_buf_desc {
+@@ -167,9 +215,31 @@ struct htp_buf_desc {
  
  enum htp_op_flags {
      HTP_OPFLAGS_STUB  = (1U << 0),
@@ -14241,8 +14290,21 @@ index 9b4b86d..1a4bf93 100644
 +                                            // second half of the f32 tensor, written by an RMS_NORM+MUL with
 +                                            // HTP_NORM_PARAM_ROWS16 (its first half holds the router's tiles); implies
 +                                            // HTP_MMID_STREAM_ACT_F16 (host GGML_HEXAGON_NORM_ROWS16)
++    HTP_OPFLAG_MMID_PLAN_V1   = (1U << 6),  // streamed MUL_MAT_ID(_NX): planner item cost 10 us for every op (host
++                                            // GGML_HEXAGON_MMID_PLAN_V2=0; default: 4 us fused gate/up, 30 us others)
++    HTP_OPFLAG_MMID_MAP_NOREUSE = (1U << 7), // MUL_MAT_ID(_NX): build the expert row mapping in every op, never reuse the one
++                                            // of the op right before (host GGML_HEXAGON_MMID_MAP_REUSE=0)
++    HTP_OPFLAG_MMID_DIAG_SHIFT = 16,        // bits 16-19: streamed expert kernel diagnostics (host GGML_HEXAGON_MMID_DIAG; 20-22: MMID_DEPTH, MMID_BAG_OFF);
++                                            // bits 8-15, 24-31: its plan override (host GGML_HEXAGON_MMID_PLAN)
  };
  
++// streamed MUL_MAT_ID(_NX) pipeline depth (host GGML_HEXAGON_MMID_DEPTH): 0 = default (2), else depth - 1
++#define HTP_OPFLAG_MMID_DEPTH_SHIFT 20
++#define HTP_OPFLAG_MMID_DEPTH_MASK  3u
++// streamed MUL_MAT_ID(_NX) with fp16 activation rows: per-thread row gather through a VTCM ring in the segment's first
++// step instead of the bulk async gather (host GGML_HEXAGON_MMID_BAG=0)
++#define HTP_OPFLAG_MMID_BAG_OFF     (1u << 22)
++
  // Op descriptor
 +
  struct htp_op_desc {
@@ -15163,7 +15225,7 @@ index b7c2d74..40186b4 100644
 +
  #endif /* HVX_SIGMOID_H */
 diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
-index b72ef2b..6344cb3 100644
+index b72ef2b..0ecbf14 100644
 --- a/ggml/src/ggml-hexagon/htp/main.c
 +++ b/ggml/src/ggml-hexagon/htp/main.c
 @@ -666,7 +666,9 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
@@ -15240,35 +15302,39 @@ index b72ef2b..6344cb3 100644
      octx->op            = op->opcode;
      octx->n_threads     = octx->ctx->n_threads;
      octx->n_threads_div = octx->ctx->n_threads_div;
-@@ -1245,6 +1254,8 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
+@@ -1245,6 +1254,9 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
      return octx->status;
  }
  
 +extern uint32_t htp_fa_mscan_gen;  // flash-attn-ops.c: validity generation of the FA mask-scan result cache
++extern uint32_t htp_op_seq;        // matmul-ops.c: op sequence number (expert row-mapping reuse between consecutive ops)
 +
  static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
      dspqueue_t queue = ctx->dsp_queue;
      int err;
-@@ -1306,6 +1317,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+@@ -1306,6 +1318,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
      octx->ctx           = ctx;
  
      mdev_group_init(ctx, req);
 +    htp_fa_mscan_gen++;  // FA mask-scan results are reused only within this batch
++    htp_op_seq += 2;     // no expert row-mapping reuse across batches
  
      work_queue_wakeup(ctx->work_queue);
      if (ctx->hmx_queue) {
-@@ -1319,6 +1331,9 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+@@ -1319,6 +1333,11 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
  
          profile_start(ctx->profiler, &prof);
  
 +        if (ops[i].flags & HTP_OPFLAG_GRAPH_START) {
 +            htp_fa_mscan_gen++;  // a new graph starts in this batch: its mask may differ at the same address
++            htp_op_seq += 2;
 +        }
++        htp_op_seq++;
          op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
  
          profile_stop(ctx->profiler, &prof);
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index 9af3129..9cff404 100644
+index 9af3129..5b80710 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -125,6 +125,7 @@ struct htp_mm_context {
@@ -17023,7 +17089,7 @@ index 9af3129..9cff404 100644
  
      const size_t weight_area_size = hex_align_up(n_chunk_n_cols * weight_row_stride, HTP_MM_HMX_TILE_SIZE);
      const size_t act_area_size    = hex_align_up(m_chunk_n_rows * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
-@@ -3603,62 +4851,894 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3603,61 +4851,1095 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
      htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
  
      hmx_matmul_job_t job;
@@ -17224,6 +17290,13 @@ index 9af3129..9cff404 100644
 +
 +#define HMX_MMID_TILED_MAX_AS 128
 +
++// streamed expert kernel pipeline depth (HTP_OPFLAG_MMID_DEPTH): fp16 weight / output buffers
++#define HMX_MMID_DEPTH_MAX     4
++#define HMX_MMID_DEPTH_DEFAULT 2
++#define HMX_MMID_BAG_MAX_ROWS  224  // rows in flight per thread (DMA ring of 256 descriptors)
++#define HMX_MMID_BAG_MAX_BLK   (HMX_MMID_BAG_MAX_ROWS / 32)
++#define HMX_MMID_BAG_DELAY     2    // steps between a block's push and its conversion
++
 +// HTP_MMID_STREAM_ACT_TILED layout: first row of every expert (offs[a], a < n_as). Returns false when the layout plus
 +// the flag word does not fit into the tensor (bytes) or the op does not qualify; producer and consumer see the same
 +// counts, so they always agree.
@@ -17246,17 +17319,29 @@ index 9af3129..9cff404 100644
 +// live (the other activation buffer or a pending output), so each activation buffer gets one spare tile row.
 +#define HMX_MMID_ACT_SLACK_ROWS 32
 +
-+static inline size_t hmx_mmid_stream_vtcm_size(size_t mc, size_t nc, size_t w_col_bytes, size_t vec_dot_size, size_t fixed) {
++// nd: fp16 weight / output buffers (pipeline depth: HMX jobs queued while HVX runs a step = nd - 1)
++static inline size_t hmx_mmid_stream_vtcm_size(size_t mc, size_t nc, size_t w_col_bytes, size_t vec_dot_size, size_t fixed,
++                                               size_t nd) {
 +    return fixed + 2 * hex_align_up(nc * w_col_bytes, HTP_MM_HMX_TILE_SIZE) +
-+           2 * hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE) +
++           nd * hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE) +
 +           2 * hex_align_up((mc + HMX_MMID_ACT_SLACK_ROWS) * vec_dot_size, HTP_MM_HMX_TILE_SIZE) +
-+           2 * hex_align_up(mc * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE) + 256;
++           nd * hex_align_up(mc * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE) + 256;
 +}
-+
+ 
+-            // Start weight DMA for the next chunk early
+-            const size_t nc_next = nc + n_chunk_n_cols;
+-            if (nc_next < (size_t) n) {
+-                const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
+-                const uint32_t height_next = is_tiled ? hmx_ceil_div(n_cols_next, 32) * n_weight_tiles : n_cols_next;
+-                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[(i + 1) % 2], weight + nc_next * weight_stride),
+-                               dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
 +// (M-chunk, N-chunk) for the whole op. HVX dequant is the bottleneck, so the estimate counts dequant work
 +// (repeated for every M-chunk of an expert) plus a fixed cost per item (thread dispatch, HMX job).
++static uint32_t g_mmid_plan_ovr = 0;  // diagnostic plan override: bits 0-7 mc tiles, bits 8-15 nc tiles (0 = planner)
++static uint64_t g_mmid_item_ps  = 10000000;  // planner cost per item (ps)
++
 +static int hmx_mmid_stream_plan(size_t budget, const uint32_t * row_counts, uint32_t n_as, int n_w, int k, int n,
-+                                int nc_step, size_t w_col_bytes, size_t vec_dot_size, size_t fixed,
++                                int nc_step, size_t w_col_bytes, size_t vec_dot_size, size_t fixed, size_t nd,
 +                                size_t * mc_out, size_t * nc_out, size_t * used_out) {
 +    int max_m = 0;
 +    for (uint32_t a = 0; a < n_as; ++a) {
@@ -17266,13 +17351,22 @@ index 9af3129..9cff404 100644
 +    max_m = hex_align_up(max_m, 32);
 +
 +    const uint64_t dq_ps_per_elem = 22;        // ~2.2e-5 us per weight element (v73, Q4_0)
-+    const uint64_t item_ps        = 10000000;  // ~10 us per item
++    const uint64_t item_ps        = g_mmid_item_ps;  // ~10 us per item
 +
 +    uint64_t best_cost = UINT64_MAX;
 +    size_t   best_mc = 0, best_nc = 0, best_used = 0;
++    uint32_t memo_mt = 0, memo_m_chunks = 0;
++    const int mc_ovr = (int) (g_mmid_plan_ovr & 0xff) * 32;
++    // N-chunk override: rounded up to a multiple of nc_step and capped at the largest candidate, so it always names a
++    // candidate (an override that matched none would make the op fall back to the per-expert kernel)
++    int nc_ovr = (int) ((g_mmid_plan_ovr >> 8) & 0xff) * 32;
++    if (nc_ovr) {
++        nc_ovr = (int) hex_smin((size_t) ((nc_ovr + nc_step - 1) / nc_step * nc_step), (size_t) (n - n % nc_step));
++    }
 +    for (int nc = n - n % nc_step; nc >= nc_step; nc -= nc_step) {
-+        size_t mc = hex_align_down((size_t) max_m, 32);
-+        while (mc >= 32 && hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size, fixed) > budget) {
++        if (nc_ovr && nc != nc_ovr) continue;
++        size_t mc = hex_align_down((size_t) (mc_ovr && mc_ovr < max_m ? mc_ovr : max_m), 32);
++        while (mc >= 32 && hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size, fixed, nd) > budget) {
 +            mc -= 32;
 +        }
 +        if (mc < 32) continue;
@@ -17280,19 +17374,24 @@ index 9af3129..9cff404 100644
 +        // M-chunks over all experts in 32-row tiles (32-bit divisions only; the per-item factor is the same
 +        // for every expert)
 +        const uint32_t mt = (uint32_t) (mc / 32);
-+        uint32_t m_chunks = 0;
++        if (mt != memo_mt) {  // most N-chunk candidates share an M-chunk size: count its M-chunks once
++            uint32_t m_chunks = 0;
 +#pragma clang loop vectorize(disable) unroll(disable)
-+        for (uint32_t a = 0; a < n_as; ++a) {
-+            const uint32_t t = (row_counts[a] + 31) / 32;
-+            m_chunks += (t + mt - 1) / mt;
++            for (uint32_t a = 0; a < n_as; ++a) {
++                const uint32_t t = (row_counts[a] + 31) / 32;
++                m_chunks += (t + mt - 1) / mt;
+             }
++            memo_mt       = mt;
++            memo_m_chunks = m_chunks;
 +        }
++        const uint32_t m_chunks = memo_m_chunks;
 +        const uint32_t n_chunks = (uint32_t) (n + nc - 1) / (uint32_t) nc;
 +        const uint64_t cost = (uint64_t) m_chunks * (uint64_t) n_w * ((uint64_t) n * k * dq_ps_per_elem + (uint64_t) n_chunks * item_ps);
 +        if (cost < best_cost || (cost == best_cost && mc * nc > best_mc * best_nc)) {
 +            best_cost = cost;
 +            best_mc   = mc;
 +            best_nc   = nc;
-+            best_used = hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size, fixed);
++            best_used = hmx_mmid_stream_vtcm_size(mc, nc, w_col_bytes, vec_dot_size, fixed, nd);
 +        }
 +    }
 +    if (best_mc == 0) return -1;
@@ -17301,7 +17400,11 @@ index 9af3129..9cff404 100644
 +    *used_out = best_used;
 +    return 0;
 +}
-+
+ 
+-            // C: HMX Compute (Queue-based)
+-            hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, (__fp16 *) vtcm_weight_bufs[i % 2], vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
+-            hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
+-            hmx_queue_pop(ctx->hmx_queue);
 +// HVX work of one pipeline step of the streamed expert kernel as one shared task list (one fork-join per item):
 +// scatter of an older item, gather of a new expert / M-chunk and dequant of the next item. Tasks are taken
 +// dynamically and interleaved by type, so memory-bound (gather, scatter) and VTCM-bound (dequant) tasks run
@@ -17313,21 +17416,18 @@ index 9af3129..9cff404 100644
 +#define HMX_MMID_MAX_G     24  // gather tasks: multiples of 32 rows (the tile padding stays inside the task)
 +#define HMX_MMID_MAX_S     32  // scatter tasks: multiples of 16 rows
 +#define HMX_MMID_MAX_D     32  // dequant tasks
-+
+ 
+-            // D: Output Store
+-            transfer_output_chunk_scattered_threaded(
+-                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
+-                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
 +typedef struct {
 +    struct htp_thread_trace       * traces;
 +    atomic_uint                     next;
 +    uint32_t                        n_tasks;
 +    uint8_t                         type[HMX_MMID_MAX_TASKS];
 +    uint8_t                         idx[HMX_MMID_MAX_TASKS];
- 
--            // Start weight DMA for the next chunk early
--            const size_t nc_next = nc + n_chunk_n_cols;
--            if (nc_next < (size_t) n) {
--                const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
--                const uint32_t height_next = is_tiled ? hmx_ceil_div(n_cols_next, 32) * n_weight_tiles : n_cols_next;
--                dma_queue_push(weight_dma, dma_make_data(vtcm_raw_bufs[(i + 1) % 2], weight + nc_next * weight_stride),
--                               dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
++
 +    // gather tasks of the DMA threads (1..n-1): own counter; thread 0 keeps its DMA queue for the weights
 +    struct htp_context            * ctx;
 +    atomic_uint                     g_next;
@@ -17365,6 +17465,19 @@ index 9af3129..9cff404 100644
 +    void                          * ab_push_dst;
 +    const void                    * ab_push_src;
 +    uint32_t                        ab_sync_bytes, ab_push_bytes;
++
++    // HTP_OPFLAG_MMID_BAG: bulk async gather of segment (bag_a, bag_mr, bag_rows) into bag_dst on threads 1..n-1 (own
++    // DMA queues), in 32-row blocks b = i - 1, i - 1 + bag_nw, ...: bag_np[i] blocks pushed, bag_nc[i] converted
++    uint32_t                        bag_nw;
++    bool                            bag_fin;    // first step of the segment: push, wait for and convert all the rest
++    bool                            bag_inc;    // a step of the segment before (after the tasks): push all blocks in
++                                                // the first one, then convert one block per step, HMX_MMID_BAG_DELAY
++                                                // steps after its push
++    uint32_t                        bag_step;
++    __fp16                        * bag_dst;
++    uint32_t                        bag_a, bag_mr, bag_rows;
++    uint8_t                         bag_np[HTP_MAX_NTHREADS], bag_nc[HTP_MAX_NTHREADS];
++    uint32_t                        bag_ps[HTP_MAX_NTHREADS][HMX_MMID_BAG_MAX_BLK];
 +
 +    // dequant
 +    tiled_dequantize_state_t        dq;
@@ -17423,18 +17536,14 @@ index 9af3129..9cff404 100644
 +                const HVX_VectorPair vp = Q6_W_vshuff_VVR(v1, v0, -2);
 +                tile_row[(c / HTP_MM_HMX_TILE_N_COLS) * tv + r1 / 2]       = Q6_V_lo_W(vp);
 +                tile_row[(c / HTP_MM_HMX_TILE_N_COLS + 1) * tv + r1 / 2]   = Q6_V_hi_W(vp);
-             }
++            }
 +            if (pushed < n_pairs) {  // into the slot just converted
 +                HMX_MMID_PUSH_PAIR(pushed);
 +                ++pushed;
 +            }
 +            continue;
 +        }
- 
--            // C: HMX Compute (Queue-based)
--            hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, (__fp16 *) vtcm_weight_bufs[i % 2], vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
--            hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
--            hmx_queue_pop(ctx->hmx_queue);
++
 +        uint32_t c = 0;
 +        for (; c + 32 <= k_valid; c += 32) {
 +            HVX_Vector v0 = *(const HVX_Vector *) (row0 + c);
@@ -17456,10 +17565,62 @@ index 9af3129..9cff404 100644
 +        if (pushed < n_pairs) {  // into the slot just converted
 +            HMX_MMID_PUSH_PAIR(pushed);
 +            ++pushed;
-+        }
-+    }
+         }
+     }
 +#undef HMX_MMID_PUSH_PAIR
 +#undef HMX_MMID_ROW_SRC
++}
++
++// HTP_OPFLAG_MMID_BAG (bulk async gather of fp16 activation rows): each row is one 2D DMA that drops its 128-byte
++// column chunks straight into their tile pair (chunk j of row 2v + e -> vector v of tile 2j + e of its 32-row tile
++// row), so the rows of a whole segment can be in flight at once, long before they are needed. hmx_mmid_bag_cvt_blk then
++// interleaves each vector pair in place into the HMX layout (the vectors hmx_mmid_gather_dma writes from the same
++// row pair). Rows [0, rows) of the segment, 32-row blocks b = i - 1, i - 1 + nw, ... on thread i.
++static void hmx_mmid_bag_push_blk(dma_queue * q, __fp16 * vtcm_dst, const __fp16 * src, uint32_t start_row,
++                                  uint32_t b, uint32_t rows, uint32_t k,
++                                  const struct mmid_row_mapping * matrix_rows, uint32_t cur_a, uint32_t mapping_stride,
++                                  uint32_t ne11, const struct fastdiv_values * ne11_div, size_t nb11, size_t nb12) {
++    const struct mmid_row_mapping * map = matrix_rows + (size_t) cur_a * mapping_stride + start_row;
++    const uint32_t tsz   = HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16);
++    const uint32_t r_end = hex_smin(rows, (b + 1) * HTP_MM_HMX_TILE_N_ROWS);
++    for (uint32_t r = b * HTP_MM_HMX_TILE_N_ROWS; r < r_end; ++r) {
++        const dma_addr_t s = (dma_addr_t) ((const uint8_t *) src +
++            (ne11 > 1 ? fastmodulo(map[r].i1, ne11, ne11_div) : 0) * nb11 + (size_t) map[r].i2 * nb12);
++        // 128-byte chunk j (columns 64j..64j+63) of row 2v + e -> vector v of tile 2j + e
++        const uint32_t rr = r % HTP_MM_HMX_TILE_N_ROWS;
++        __fp16 * d = vtcm_dst + (size_t) b * HTP_MM_HMX_TILE_N_ROWS * k + (size_t) (rr & 1) * HTP_MM_HMX_TILE_N_ELMS +
++                     (size_t) (rr / 2) * (VLEN / sizeof(__fp16));
++        if (__builtin_expect(!dma_queue_push(q, dma_make_data(d, s), 2 * tsz, VLEN, VLEN, k / 64), 0)) {
++            // ring full (the planner keeps a thread's rows in flight below its capacity, so only if something else
++            // shares this queue): wait for the oldest descriptor and retry. Pops are FIFO, so hmx_mmid_bag_cvt_blk's
++            // per-row pops then only wait for later rows (a pop on an empty ring returns at once): never a lost row.
++            FARF(HIGH, "hmx-mmid-bag: DMA ring full (depth %u), row %u", (unsigned) dma_queue_depth(q), (unsigned) r);
++            dma_queue_pop(q);
++            const bool ok = dma_queue_push(q, dma_make_data(d, s), 2 * tsz, VLEN, VLEN, k / 64);
++            assert(ok);
++            (void) ok;
++        }
++    }
++}
++
++// waits for block b's row DMAs (the oldest on this queue) and interleaves its row pairs in place
++static void hmx_mmid_bag_cvt_blk(dma_queue * q, __fp16 * vtcm_dst, uint32_t b, uint32_t rows, uint32_t k) {
++    const size_t   tv    = HTP_MM_HMX_TILE_N_ELMS * sizeof(__fp16) / VLEN;  // vectors per tile
++    const uint32_t nb    = hex_smin(rows - b * HTP_MM_HMX_TILE_N_ROWS, HTP_MM_HMX_TILE_N_ROWS);  // rows in block
++    for (uint32_t r = 0; r < nb; ++r) dma_queue_pop(q);
++    const uint32_t pairs = (nb + 1) / 2;
++    HVX_Vector *   blk   = (HVX_Vector *) (vtcm_dst + (size_t) b * HTP_MM_HMX_TILE_N_ROWS * k);
++    for (uint32_t c = 0; c < k / 32; c += 2) {
++        HVX_Vector * t0 = blk + c * tv;        // row 2v, columns 32c..32c+63
++        HVX_Vector * t1 = t0 + tv;             // row 2v + 1, same columns
++        for (uint32_t v = 0; v < pairs; ++v) {
++            const HVX_Vector     x  = t0[v];
++            const HVX_Vector     y  = (2 * v + 1 < nb) ? t1[v] : Q6_V_vzero();
++            const HVX_VectorPair vp = Q6_W_vshuff_VVR(y, x, -2);
++            t0[v] = Q6_V_lo_W(vp);
++            t1[v] = Q6_V_hi_W(vp);
++        }
++    }
 +}
 +
 +// contiguous DDR -> VTCM block (sizes multiples of 4 KB) as one 2D descriptor
@@ -17472,11 +17633,24 @@ index 9af3129..9cff404 100644
 +    (void) n;
 +    hmx_mmid_hvx_step_t * st = (hmx_mmid_hvx_step_t *) data;
 +    struct htp_thread_trace * tr = &st->traces[i];
- 
--            // D: Output Store
--            transfer_output_chunk_scattered_threaded(
--                ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
--                matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
++
++#define HMX_MMID_BAG_BLK(j) ((i - 1) + (j) * st->bag_nw)
++#define HMX_MMID_BAG_PUSH(j) hmx_mmid_bag_push_blk(st->ctx->dma[i], st->bag_dst, (const __fp16 *) st->g_src, st->bag_mr, \
++        HMX_MMID_BAG_BLK(j), st->bag_rows, st->k, st->matrix_rows, st->bag_a, st->mapping_stride, st->ne11, &st->ne11_div, \
++        st->nb11, st->nb12)
++    const uint32_t bag_nb = (i > 0 && (st->bag_fin || st->bag_inc)) ?
++        hmx_ceil_div(st->bag_rows, HTP_MM_HMX_TILE_N_ROWS) : 0;           // blocks of the segment
++    const uint32_t bag_nbi = bag_nb > i - 1 ? (bag_nb - (i - 1) + st->bag_nw - 1) / st->bag_nw : 0;  // ... of this thread
++    if (i > 0 && st->bag_fin) {
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, 4000);
++        for (; st->bag_np[i] < bag_nbi; ++st->bag_np[i]) HMX_MMID_BAG_PUSH(st->bag_np[i]);
++        for (; st->bag_nc[i] < st->bag_np[i]; ++st->bag_nc[i]) {
++            hmx_mmid_bag_cvt_blk(st->ctx->dma[i], st->bag_dst, HMX_MMID_BAG_BLK(st->bag_nc[i]), st->bag_rows, st->k);
++        }
++        st->bag_np[i] = st->bag_nc[i] = 0;
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, 4000);
++    }
++
 +    if (i == 1 && (st->ab_pop || st->ab_sync || st->ab_push)) {
 +        dma_queue * q = st->ctx->dma[1];
 +        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, 0);
@@ -17486,7 +17660,7 @@ index 9af3129..9cff404 100644
 +        if (st->ab_sync) {
 +            hmx_mmid_block_dma_push(q, st->ab_sync_dst, st->ab_sync_src, st->ab_sync_bytes);
 +            dma_queue_pop(q);
-         }
++        }
 +        if (st->ab_push) {
 +            hmx_mmid_block_dma_push(q, st->ab_push_dst, st->ab_push_src, st->ab_push_bytes);
 +        }
@@ -17577,6 +17751,24 @@ index 9af3129..9cff404 100644
 +            }
 +        }
 +    }
++
++    if (i > 0 && st->bag_inc) {
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, 4001);
++        const uint32_t c = st->bag_nc[i];
++        if (c < st->bag_np[i] && st->bag_ps[i][c] + HMX_MMID_BAG_DELAY <= st->bag_step) {
++            hmx_mmid_bag_cvt_blk(st->ctx->dma[i], st->bag_dst, HMX_MMID_BAG_BLK(c), st->bag_rows, st->k);
++            st->bag_nc[i] = (uint8_t) (c + 1);
++        }
++        // all blocks in the first step (the DMAs overlap many HMX jobs); conversions one per step
++        for (uint32_t p = st->bag_np[i]; p < bag_nbi; ++p) {
++            HMX_MMID_BAG_PUSH(p);
++            st->bag_ps[i][p] = st->bag_step;
++            st->bag_np[i]    = (uint8_t) (p + 1);
++        }
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, 4001);
++    }
++#undef HMX_MMID_BAG_PUSH
++#undef HMX_MMID_BAG_BLK
 +}
 +
 +// task list: memory-bound tasks first and spread out, dequant tasks in between
@@ -17625,7 +17817,16 @@ index 9af3129..9cff404 100644
 +                                const uint32_t * tiled_offs) { // HTP_MMID_STREAM_ACT_TILED layout in use (hmx_mmid_tiled_layout,
 +                                                   // NULL = none): swiglu >= 4 stores dsts[0] tiled, act_f16 loads tiled
 +    struct htp_thread_trace * tr = &ctx->trace[0];
++    const uint32_t diag = (ctx->op_flags >> HTP_OPFLAG_MMID_DIAG_SHIFT) & 0xf;  // host GGML_HEXAGON_MMID_DIAG
 +
++    g_mmid_plan_ovr = ((ctx->op_flags >> 24) & 0xff) | (((ctx->op_flags >> 8) & 0xff) << 8);
++    // planner cost per item: the fused gate/up SWIGLU op is HVX-bound, cheaper items let it take fewer, taller M-chunks
++    // (less repeated dequant); the single-weight (down) op is HMX-bound and prefers fewer, larger items. LFM2.5-24B
++    // pp4096: -7 ms gate/up, -4 ms down per graph (+0.3-0.4%). Same output either way (the plan only regroups rows
++    // and columns into HMX jobs). HTP_OPFLAG_MMID_PLAN_V1 (host GGML_HEXAGON_MMID_PLAN_V2=0): 10 us for both.
++    // The cheap cost goes to every two-weight gate/up op (fused SWIGLU or not: both dequant two weights per item and
++    // are HVX-bound), the dear one to the single-weight (down) ops.
++    g_mmid_item_ps = (ctx->op_flags & HTP_OPFLAG_MMID_PLAN_V1) ? 10000000ull : ((swiglu || n_w >= 2) ? 4000000ull : 30000000ull);
 +    if (flags & HTP_MMID_STREAM_TEST_PER_EXPERT) return 1;
 +    if ((flags & HTP_MMID_STREAM_TEST_TILED_FALLBACK) && tiled_offs != NULL && swiglu == 0) return 1;
 +    if (n_w <= 0) return 1;
@@ -17653,8 +17854,8 @@ index 9af3129..9cff404 100644
 +                    act_nb1 % VLEN != 0 || act_nb2 % VLEN != 0)) {
 +        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 +        return 1;
-     }
- 
++    }
++
 +    const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
 +    const uint32_t n_weight_tiles = k / htp_tensor_get_tile_k(weight_type);
 +    const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
@@ -17675,18 +17876,38 @@ index 9af3129..9cff404 100644
 +        return 1;
 +    }
 +    const bool   dma_gather      = (n_threads > 1) && (flags & HTP_MMID_STREAM_DMA_GATHER) && !tiled_in;
++    // bulk async gather of fp16 rows (no ring): every thread's rows of a segment must fit in its DMA ring
++    // (planned without the ring first; with it when the M-chunk puts more rows on a thread than its DMA ring holds)
++    bool bag = dma_gather && act_f16 && !(ctx->op_flags & HTP_OPFLAG_MMID_BAG_OFF);
 +    const size_t dma_ring_floats = (size_t) 2 * HMX_MMID_DMA_PAIRS * k;
-+    const size_t dma_ring_size   = dma_gather ? hex_align_up((size_t) (n_threads - 1) * dma_ring_floats * sizeof(float), HTP_MM_HMX_TILE_SIZE) : 0;
++    size_t dma_ring_size = 0;
++bag_replan:
++    dma_ring_size = (dma_gather && !bag) ? hex_align_up((size_t) (n_threads - 1) * dma_ring_floats * sizeof(float), HTP_MM_HMX_TILE_SIZE) : 0;
 +
 +    // SWIGLU pairing: one item = the same columns of both weights (gate then up) in one raw/fp16 weight buffer
 +    // and one HMX job of 2 x hc columns, so the scatter combines the two halves in VTCM and writes only the
 +    // SWIGLU output. Items then run over a single virtual weight of 2n columns, in chunks of 2 x 32 columns.
 +    const int n_wi = swiglu ? 1 : n_w;  // weights in the item stream
++    // pipeline depth (HTP_OPFLAG_MMID_DEPTH): fp16 weight / output buffers; HMX keeps nd - 1 jobs queued while HVX
++    // runs a step (2 = the double-buffered kernel). Falls back to a shallower pipeline when VTCM does not fit.
++    uint32_t nd = (ctx->op_flags >> HTP_OPFLAG_MMID_DEPTH_SHIFT) & HTP_OPFLAG_MMID_DEPTH_MASK;
++    nd = nd ? nd + 1 : HMX_MMID_DEPTH_DEFAULT;
 +    size_t mc = 0, nc = 0, vtcm_used = 0;
-+    if (hmx_mmid_stream_plan(ctx->vtcm_size, row_counts, n_as, n_wi, k, swiglu ? 2 * n : n, swiglu ? 64 : 32,
-+                             w_col_bytes, vec_dot_size, dma_ring_size, &mc, &nc, &vtcm_used)) {
-+        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
-+        return 1;
++    for (;; --nd) {
++        if (hmx_mmid_stream_plan(ctx->vtcm_size, row_counts, n_as, n_wi, k, swiglu ? 2 * n : n, swiglu ? 64 : 32,
++                                 w_col_bytes, vec_dot_size, dma_ring_size, nd, &mc, &nc, &vtcm_used) == 0) {
++            break;
++        }
++        if (nd <= 2) {
++            htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
++            return 1;
++        }
++    }
++    // (each row is one descriptor; a ring of capacity c holds c - 1 in flight)
++    if (bag && ((uint32_t) hmx_ceil_div(mc / 32, (size_t) n_threads - 1)) * 32 >
++                   hex_smin((uint32_t) HMX_MMID_BAG_MAX_ROWS, dma_queue_capacity(ctx->dma[1]) - 1)) {
++        bag = false;
++        goto bag_replan;
 +    }
 +
 +    const size_t raw_size = hex_align_up(nc * w_col_bytes, HTP_MM_HMX_TILE_SIZE);
@@ -17696,15 +17917,15 @@ index 9af3129..9cff404 100644
 +
 +    uint8_t * vtcm_ptr = (uint8_t *) ctx->vtcm_base;
 +    void *   raw_bufs[2];
-+    __fp16 * wf_bufs[2];
++    __fp16 * wf_bufs[HMX_MMID_DEPTH_MAX];
 +    __fp16 * act_bufs[2];
-+    __fp16 * out_bufs[2];
++    __fp16 * out_bufs[HMX_MMID_DEPTH_MAX];
 +    for (int b = 0; b < 2; ++b) raw_bufs[b] = vtcm_seq_alloc(&vtcm_ptr, raw_size);
-+    for (int b = 0; b < 2; ++b) wf_bufs[b]  = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, wf_size);
++    for (uint32_t b = 0; b < nd; ++b) wf_bufs[b]  = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, wf_size);
 +    for (int b = 0; b < 2; ++b) act_bufs[b] = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, act_size);
-+    for (int b = 0; b < 2; ++b) out_bufs[b] = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, out_size);
++    for (uint32_t b = 0; b < nd; ++b) out_bufs[b] = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, out_size);
 +    __fp16 * vtcm_scales = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
-+    float *  dma_ring    = dma_gather ? (float *) vtcm_seq_alloc(&vtcm_ptr, dma_ring_size) : NULL;
++    float *  dma_ring    = (dma_gather && !bag) ? (float *) vtcm_seq_alloc(&vtcm_ptr, dma_ring_size) : NULL;
 +
 +    if ((size_t) (vtcm_ptr - (uint8_t *) ctx->vtcm_base) > ctx->vtcm_size) {
 +        htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
@@ -17716,7 +17937,7 @@ index 9af3129..9cff404 100644
 +    const size_t nc_w = swiglu ? nc / 2 : nc;  // columns of each weight per item
 +    const int n_chunk_cnt = (n + (int) nc_w - 1) / (int) nc_w;
 +
-+    FARF(HIGH, "hmx-mm-id-stream: n_w %d k %d n %d mc %zu nc %zu vtcm %zu/%zu", n_w, k, n, mc, nc, vtcm_used, ctx->vtcm_size);
++    FARF(HIGH, "hmx-mm-id-stream: n_w %d k %d n %d mc %zu nc %zu depth %u vtcm %zu/%zu", n_w, k, n, mc, nc, nd, vtcm_used, ctx->vtcm_size);
 +
 +    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 +
@@ -17764,6 +17985,12 @@ index 9af3129..9cff404 100644
 +    step.s_col_tile0    = 0;
 +    step.s_k_tiles      = (uint32_t) n / 32;
 +    step.ab_pop = step.ab_sync = step.ab_push = false;
++    step.bag_nw  = (uint32_t) n_threads - 1;
++    step.bag_fin = step.bag_inc = false;
++    memset(step.bag_np, 0, sizeof(step.bag_np));
++    memset(step.bag_nc, 0, sizeof(step.bag_nc));
++    struct hmx_mmid_pos bag_next;  // segment after the current one (valid: its rows go to the other act buffer)
++    bag_next.valid = false;
 +
 +    tiled_dequantize_state_t * dq = &step.dq;
 +    memset(dq, 0, sizeof(*dq));
@@ -17779,16 +18006,19 @@ index 9af3129..9cff404 100644
 +    dq->tile_size         = htp_tensor_get_tile_size(weight_type);
 +    dq->aligned_tile_size = htp_tensor_get_tile_padded_size(weight_type);
 +
-+    // pending items for the scatter: [0] = item - 2, [1] = item - 1
++    // pending items for the scatter (HMX pushed, output not yet stored): item - n_pend .. item - 1, oldest at
++    // pend[pend_head]; HMX jobs are popped in order, items < hmx_popped are done
 +    struct hmx_mmid_out {
 +        float * dst;
 +        size_t  nb1, nb2;
 +        int     a, cne1, mr, n_rows, n_cols, col0;
-+    } pend[2];
-+    int      n_pend = 0;
++    } pend[HMX_MMID_DEPTH_MAX];
++    uint32_t n_pend = 0, pend_head = 0;
 +    uint32_t item = 0;
 +    uint32_t seg  = 0;
-+    hmx_matmul_job_t job_slots[2];
++    uint32_t hmx_popped = 0;
++    hmx_matmul_job_t job_slots[HMX_MMID_DEPTH_MAX];
++#define HMX_MMID_POP_UNTIL(it) do { while ((int64_t) hmx_popped <= (int64_t) (it)) { hmx_queue_pop(ctx->hmx_queue); ++hmx_popped; } } while (0)
 +
 +    // tiled_in: the block of segment s goes to act_bufs[s % 2] with one DMA on thread 1's queue, pushed as soon as
 +    // that buffer is free (HMX done with segment s - 2) and waited for at the first item of segment s
@@ -17814,15 +18044,16 @@ index 9af3129..9cff404 100644
 +        void * curr_raw = (void *) dma_queue_pop(weight_dma).dst;
 +        if (swiglu) dma_queue_pop(weight_dma);
 +
-+        const bool do_scatter = (n_pend == 2);
++        const bool do_scatter = (n_pend == nd);
 +        if (do_scatter) {
-+            hmx_queue_pop(ctx->hmx_queue);  // HMX(item - 2): frees wf/out[item % 2] and the act buffer of segment - 2
++            HMX_MMID_POP_UNTIL(item - nd);  // HMX(item - nd): frees wf/out[item % nd]
 +        }
 +
 +        uint32_t n_g = 0, n_s = 0;
 +        step.ab_pop = step.ab_sync = step.ab_push = false;
 +        if (tiled_in) {
 +            if (new_seg) {
++                HMX_MMID_POP_UNTIL(act_last_item[seg % 2]);  // the block of segment - 2 is no longer read
 +                if (ab_inflight == (int64_t) seg) {
 +                    step.ab_pop = true;
 +                } else if (n_threads > 1) {
@@ -17837,14 +18068,26 @@ index 9af3129..9cff404 100644
 +                nseg = cur;
 +                hmx_mmid_pos_next_seg(&nseg, (int) mc);
 +            }
-+            if (n_threads > 1 && nseg.valid && ab_inflight < 0 && (int64_t) item >= act_last_item[(seg + 1) % 2] + 2) {
++            if (n_threads > 1 && nseg.valid && ab_inflight < 0 && (int64_t) hmx_popped > act_last_item[(seg + 1) % 2]) {
 +                step.ab_push       = true;
 +                step.ab_push_dst   = act_bufs[(seg + 1) % 2];
 +                step.ab_push_src   = HMX_MMID_ACT_BLOCK_SRC(nseg);
 +                step.ab_push_bytes = HMX_MMID_ACT_BLOCK_BYTES(nseg);
 +                ab_inflight        = (int64_t) seg + 1;
 +            }
++        } else if (new_seg && bag) {
++            HMX_MMID_POP_UNTIL(act_last_item[seg % 2]);  // the rows overwrite the act buffer of segment - 2
++            // finish this segment's rows (blocks pushed / converted in the steps before keep their counts: the
++            // segment before always targets this one)
++            step.bag_fin  = true;
++            step.bag_dst  = act_bufs[seg % 2];
++            step.bag_a    = (uint32_t) cur.a;
++            step.bag_mr   = (uint32_t) cur.mr;
++            step.bag_rows = (uint32_t) hex_smin((size_t) (cur.cne1 - cur.mr), mc);
++            bag_next      = cur;
++            hmx_mmid_pos_next_seg(&bag_next, (int) mc);
 +        } else if (new_seg) {
++            HMX_MMID_POP_UNTIL(act_last_item[seg % 2]);  // the gather overwrites the act buffer of segment - 2
 +            step.g_dst  = act_bufs[seg % 2];
 +            step.g_a    = (uint32_t) cur.a;
 +            step.g_cne1 = (uint32_t) cur.cne1;
@@ -17854,9 +18097,9 @@ index 9af3129..9cff404 100644
 +            n_g = hmx_ceil_div((uint32_t) n_rows, step.g_task_rows);
 +        }
 +        if (do_scatter) {
-+            const struct hmx_mmid_out * o = &pend[0];
++            const struct hmx_mmid_out * o = &pend[pend_head];
 +            step.s_dst    = o->dst;
-+            step.s_src    = out_bufs[item % 2];
++            step.s_src    = out_bufs[item % nd];
 +            step.s_a      = (uint32_t) o->a;
 +            step.s_cne1   = (uint32_t) o->cne1;
 +            step.s_mr     = (uint32_t) o->mr;
@@ -17873,13 +18116,22 @@ index 9af3129..9cff404 100644
 +        }
 +        {
 +            const uint32_t n_tot_tiles = (uint32_t) hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS) * n_weight_tiles;
-+            dq->dst              = wf_bufs[item % 2];
++            dq->dst              = wf_bufs[item % nd];
 +            dq->src              = (const uint8_t *) curr_raw;
 +            dq->n_cols           = (uint32_t) n_cols;
 +            dq->n_tot_tiles      = n_tot_tiles;
 +            dq->n_tiles_per_task = hmx_ceil_div(n_tot_tiles, 2 * (uint32_t) n_threads);
 +            dq->n_tasks          = hmx_ceil_div(n_tot_tiles, dq->n_tiles_per_task);
 +        }
++        // bulk async gather: push the next segment's rows once HMX is done with the buffer they go to
++        if (bag && !new_seg && bag_next.valid && (int64_t) hmx_popped > act_last_item[(seg + 1) % 2]) {
++            step.bag_inc  = true;
++            step.bag_dst  = act_bufs[(seg + 1) % 2];
++            step.bag_a    = (uint32_t) bag_next.a;
++            step.bag_mr   = (uint32_t) bag_next.mr;
++            step.bag_rows = (uint32_t) hex_smin((size_t) (bag_next.cne1 - bag_next.mr), mc);
++        }
++        step.bag_step = item;
 +        hmx_mmid_hvx_step_build(&step, n_g, n_s, dq->n_tasks, dma_gather);
 +        if (n_threads > 1) {
 +            worker_pool_run_func(ctx->worker_pool, hmx_mmid_hvx_step_worker, &step, n_threads);
@@ -17887,9 +18139,10 @@ index 9af3129..9cff404 100644
 +            hmx_mmid_hvx_step_worker(1, 0, &step);
 +        }
 +
++        step.bag_fin = step.bag_inc = false;
 +        if (do_scatter) {
-+            pend[0] = pend[1];
-+            n_pend  = 1;
++            pend_head = (pend_head + 1) % nd;
++            --n_pend;
 +        }
 +
 +        // the raw buffer is free again: weight chunk of item + 2
@@ -17898,13 +18151,27 @@ index 9af3129..9cff404 100644
 +            hmx_mmid_pos_advance(&ahead, n_wi, n_chunk_cnt, (int) mc);
 +        }
 +
-+        hmx_matmul_job_init(&job_slots[item % 2], out_bufs[item % 2], act_bufs[seg % 2], wf_bufs[item % 2], vtcm_scales,
++        hmx_matmul_job_init(&job_slots[item % nd], out_bufs[item % nd], act_bufs[seg % 2], wf_bufs[item % nd], vtcm_scales,
 +                            hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS), hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS),
 +                            k / HTP_MM_HMX_TILE_N_ROWS);
-+        hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job_slots[item % 2]));
++        // trace-only item shape (BUFF events, zero length): valid rows, then 0x4000 | col tiles; the op's first
++        // item also carries 0x2000 | k tiles. Paired with the HMX_COMP jobs in order by the trace tools.
++        if (item == 0) {
++            htp_trace_event_start(tr, HTP_TRACE_EVT_BUFF, (uint16_t) (0x2000 | (k / 32)));
++            htp_trace_event_stop(tr, HTP_TRACE_EVT_BUFF, (uint16_t) (0x2000 | (k / 32)));
++        }
++        {
++            const uint32_t vr = (uint32_t) hex_smin((size_t) (cur.cne1 - cur.mr), n_rows);
++            htp_trace_event_start(tr, HTP_TRACE_EVT_BUFF, (uint16_t) vr);
++            htp_trace_event_stop(tr, HTP_TRACE_EVT_BUFF, (uint16_t) (0x4000 | hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS)));
++        }
++        hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job_slots[item % nd]));
++        if (diag & 1) {  // diagnostic: HMX job alone (no HVX work while it runs)
++            while (hmx_queue_depth(ctx->hmx_queue)) hex_pause();
++        }
 +        act_last_item[seg % 2] = (int64_t) item;
 +
-+        struct hmx_mmid_out * o = &pend[n_pend++];
++        struct hmx_mmid_out * o = &pend[(pend_head + n_pend++) % nd];
 +        o->dst    = (swiglu >= 4 || out_f16) ? (float *) ((__fp16 *) dsts[cur.w] + nc_cur) : dsts[cur.w] + nc_cur;
 +        o->nb1    = dst_nb1s[cur.w];
 +        o->nb2    = dst_nb2s[cur.w];
@@ -17920,13 +18187,13 @@ index 9af3129..9cff404 100644
 +    }
 +
 +    // epilogue: the last one or two items, oldest first
-+    for (int p = 0; p < n_pend; ++p) {
-+        hmx_queue_pop(ctx->hmx_queue);
-+        const struct hmx_mmid_out * o = &pend[p];
-+        const uint32_t it = item - (uint32_t) n_pend + (uint32_t) p;
++    for (uint32_t p = 0; p < n_pend; ++p) {
++        const uint32_t it = item - n_pend + p;
++        HMX_MMID_POP_UNTIL(it);
++        const struct hmx_mmid_out * o = &pend[(pend_head + p) % nd];
 +        if (tiled_out) {
 +            step.s_dst    = o->dst;
-+            step.s_src    = out_bufs[it % 2];
++            step.s_src    = out_bufs[it % nd];
 +            step.s_a      = (uint32_t) o->a;
 +            step.s_cne1   = (uint32_t) o->cne1;
 +            step.s_mr     = (uint32_t) o->mr;
@@ -17942,7 +18209,7 @@ index 9af3129..9cff404 100644
 +            continue;
 +        }
 +        transfer_output_chunk_scattered_threaded(
-+            ctx, o->dst, out_bufs[it % 2], o->mr, o->n_rows, o->n_cols,
++            ctx, o->dst, out_bufs[it % nd], o->mr, o->n_rows, o->n_cols,
 +            matrix_rows, o->a, mapping_stride, o->nb1, o->nb2, o->cne1, n_threads, aligned_out, scat_mode);
 +    }
 +
@@ -17950,11 +18217,11 @@ index 9af3129..9cff404 100644
 +#undef HMX_MMID_DMA_HEIGHT
 +#undef HMX_MMID_ACT_BLOCK_SRC
 +#undef HMX_MMID_ACT_BLOCK_BYTES
-+
++#undef HMX_MMID_POP_UNTIL
+ 
      return 0;
  }
- 
-@@ -3749,12 +5829,40 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
+@@ -3749,12 +6031,40 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
          };
          ret = hmx_mm_batched(octx->ctx, &batch_params,
                               kparams->m_chunk, kparams->n_chunk,
@@ -17996,7 +18263,7 @@ index 9af3129..9cff404 100644
          ret = hmx_mm_2d_f32(
              octx->ctx, octx->ctx->dma[0], dst_ptr, src2_addr, src2_bytes,
              act_addr, src0->data,
-@@ -3764,8 +5872,12 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
+@@ -3764,8 +6074,12 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
              kparams->n_act_threads,
              &kparams->div_n_act_threads,
              &kparams->div_ne00_padded,
@@ -18010,7 +18277,7 @@ index 9af3129..9cff404 100644
      }
  
      if (ret != 0) {
-@@ -3834,6 +5946,44 @@ int op_matmul(struct htp_ops_context * octx) {
+@@ -3834,6 +6148,44 @@ int op_matmul(struct htp_ops_context * octx) {
      return op_matmul_impl(octx);
  }
  
@@ -18055,7 +18322,7 @@ index 9af3129..9cff404 100644
  static int hmx_mm_op_matmul_id(
      struct htp_ops_context * octx,
      struct htp_mm_context * mmctx
-@@ -3857,42 +6007,119 @@ static int hmx_mm_op_matmul_id(
+@@ -3857,42 +6209,119 @@ static int hmx_mm_op_matmul_id(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -18207,7 +18474,7 @@ index 9af3129..9cff404 100644
      }
  
      return HTP_STATUS_OK;
-@@ -3988,6 +6215,37 @@ static int hvx_mm_matmul_id(
+@@ -3988,6 +6417,37 @@ static int hvx_mm_matmul_id(
      return HTP_STATUS_OK;
  }
  
@@ -18245,7 +18512,7 @@ index 9af3129..9cff404 100644
  static int hmx_mm_op_matmul_id_nx(
      struct htp_ops_context * octx,
      struct htp_mm_context * mmctx
-@@ -4016,48 +6274,197 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -4016,48 +6476,197 @@ static int hmx_mm_op_matmul_id_nx(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -18423,9 +18690,9 @@ index 9af3129..9cff404 100644
 +                const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition((uint32_t) m_padded, can_split ? 1 : 0, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
 +                m_start = (int) range.start;
 +                m_end   = (int) (range.start + range.count);
-+            }
+             }
 +            if (m_start >= m_end) continue;
-+        }
+         }
 +
 +        if (have_prev) {
 +            const int n_groups = uniform ? 1 : n_w;
@@ -18458,8 +18725,8 @@ index 9af3129..9cff404 100644
 +                    FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %d, error %d\n", prev_a, g, ret);
 +                    return HTP_STATUS_NO_SUPPORT;
 +                }
-             }
-         }
++            }
++        }
 +
 +        have_prev    = true;
 +        prev_a       = (int32_t) cur_a;
@@ -18478,7 +18745,7 @@ index 9af3129..9cff404 100644
      }
  
      return HTP_STATUS_OK;
-@@ -4218,6 +6625,128 @@ static inline void scan_expert_ids(
+@@ -4218,6 +6827,200 @@ static inline void scan_expert_ids(
      }
  }
  
@@ -18530,6 +18797,29 @@ index 9af3129..9cff404 100644
 +    }
 +}
 +
++// Expert row-mapping reuse (HTP_OPFLAG_MMID_MAP_NOREUSE restores a scan per op): the gate/up and down expert ops of a
++// MoE layer read the same ids, one right after the other. When the op directly before this one (htp_op_seq, bumped
++// per op and by 2 at every batch / graph start) built its mapping in ddr_spad from the same ids tensor (address,
++// shape, strides), that mapping is still there and is used as is: no op ran in between that could have changed the
++// ids or ddr_spad, and the scan is deterministic. Same counts, stride and entries.
++// INVARIANTS this rests on (re-check them when merging anything that touches them):
++//  1. mmid_build_mapping is the only writer of ctx->ddr_spad (grep ddr_spad in htp/) and nothing edits a mapping in
++//     place. A new ddr_spad user must set g_mmid_map.valid = false after writing it (session close frees ddr_spad;
++//     the next batch bumps the sequence, so a reallocation at the same address is covered).
++//  2. Nothing writes the ids buffer between two DSP ops that are consecutive in htp_op_seq (host CPU ops run between
++//     batches, and a batch start bumps the sequence by 2; the ids tensor stays allocated until its last consumer).
++//  3. htp_op_seq is bumped before every op and by 2 at every batch and GRAPH_START (main.c process_opbatch).
++// GGML_HEXAGON_MMID_MAP_REUSE=2 (HTP_OPFLAG_MMID_DIAG_SHIFT bit 1) checks them: a reuse hit rebuilds the mapping as
++// well and fails the op (HTP_STATUS_INTERNAL_ERR) if the two differ. Run it with MUL_MAT_ID(_SWIGLU) test-backend-ops
++// and a MoE perplexity after such a merge.
++uint32_t htp_op_seq = 0;
++static struct {
++    bool     valid;
++    uint32_t seq;
++    uint64_t data;
++    uint32_t ne0, ne1, nb0, nb1, n_ids, n_as, stride;
++} g_mmid_map;
++
 +// Builds counts + row mapping like the two scan_expert_ids passes of op_matmul_id(_nx). *mapping_buf may be replaced
 +// by a malloc'ed buffer (caller frees it when it differs from ctx->ddr_spad_base). Returns HTP_STATUS_*.
 +static int mmid_build_mapping(struct htp_ops_context * octx, const struct htp_tensor * ids, uint32_t n_ids, uint32_t n_as,
@@ -18537,6 +18827,30 @@ index 9af3129..9cff404 100644
 +                              uint32_t * mapping_stride) {
 +    const size_t matrix_row_counts_size = n_as * sizeof(uint32_t);
 +    assert(octx->ctx->ddr_spad_size >= matrix_row_counts_size);
++
++    const bool reuse_ok = !(octx->ctx->op_flags & HTP_OPFLAG_MMID_MAP_NOREUSE) && *mapping_buf == octx->ctx->ddr_spad_base;
++    const bool verify = (octx->ctx->op_flags >> HTP_OPFLAG_MMID_DIAG_SHIFT) & 2;  // host GGML_HEXAGON_MMID_MAP_REUSE=2
++    uint8_t *  vcopy  = NULL;  // verify mode: the mapping that would have been reused
++    uint32_t   vstride = 0;
++    if (reuse_ok && g_mmid_map.valid && g_mmid_map.seq + 1 == htp_op_seq && g_mmid_map.data == ids->data &&
++        g_mmid_map.ne0 == ids->ne[0] && g_mmid_map.ne1 == ids->ne[1] && g_mmid_map.nb0 == ids->nb[0] &&
++        g_mmid_map.nb1 == ids->nb[1] && g_mmid_map.n_ids == n_ids && g_mmid_map.n_as == n_as) {
++        if (!verify) {
++            g_mmid_map.seq     = htp_op_seq;
++            *matrix_row_counts = (uint32_t *) *mapping_buf;
++            *matrix_rows       = (struct mmid_row_mapping *) (*mapping_buf + matrix_row_counts_size);
++            *mapping_stride    = g_mmid_map.stride;
++            return HTP_STATUS_OK;
++        }
++        vstride = g_mmid_map.stride;
++        const size_t vsize = matrix_row_counts_size + (size_t) n_as * vstride * sizeof(struct mmid_row_mapping);
++        vcopy = memalign(128, vsize);
++        if (!vcopy) {
++            return HTP_STATUS_INTERNAL_ERR;
++        }
++        memcpy(vcopy, *mapping_buf, vsize);
++    }
++    g_mmid_map.valid = false;
 +
 +    const uint32_t n_thr = octx->n_threads;
 +    const bool mt = !(octx->ctx->op_flags & HTP_OPFLAG_IDSCAN_ST) && n_thr > 1 && n_thr <= MMID_SCAN_MAX_THR &&
@@ -18601,13 +18915,38 @@ index 9af3129..9cff404 100644
 +        memset(*matrix_row_counts, 0, n_as * sizeof(uint32_t));
 +        scan_expert_ids(ids, n_ids, n_as, *matrix_row_counts, *matrix_rows, stride);
 +    }
++    if (reuse_ok && *mapping_buf == octx->ctx->ddr_spad_base) {
++        g_mmid_map.valid  = true;
++        g_mmid_map.seq    = htp_op_seq;
++        g_mmid_map.data   = ids->data;
++        g_mmid_map.ne0    = ids->ne[0];
++        g_mmid_map.ne1    = ids->ne[1];
++        g_mmid_map.nb0    = ids->nb[0];
++        g_mmid_map.nb1    = ids->nb[1];
++        g_mmid_map.n_ids  = n_ids;
++        g_mmid_map.n_as   = n_as;
++        g_mmid_map.stride = stride;
++    }
++    if (vcopy) {  // verify mode: the reused mapping must equal the rebuilt one (counts, stride, every valid entry)
++        bool same = (vstride == stride) && memcmp(vcopy, *matrix_row_counts, matrix_row_counts_size) == 0;
++        const struct mmid_row_mapping * vrows = (const struct mmid_row_mapping *) (vcopy + matrix_row_counts_size);
++        for (uint32_t a = 0; same && a < n_as; ++a) {
++            same = memcmp(vrows + (size_t) a * stride, *matrix_rows + (size_t) a * stride,
++                          (*matrix_row_counts)[a] * sizeof(struct mmid_row_mapping)) == 0;
++        }
++        free(vcopy);
++        if (!same) {
++            FARF(ERROR, "mmid: reused expert row mapping differs from the rebuilt one (seq %u)", (unsigned) htp_op_seq);
++            return HTP_STATUS_INTERNAL_ERR;
++        }
++    }
 +    return HTP_STATUS_OK;
 +}
 +
  int op_matmul_id(struct htp_ops_context * octx) {
      htp_matmul_tensors_preamble;
  
-@@ -4259,32 +6788,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
+@@ -4259,32 +7062,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
      struct mmid_row_mapping * matrix_rows = NULL;
  
      if (act_nrows > 1) {
@@ -18644,7 +18983,7 @@ index 9af3129..9cff404 100644
      }
  
      mmctx->matrix_row_counts    = matrix_row_counts;
-@@ -4382,32 +6890,11 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
+@@ -4382,32 +7164,11 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
      struct mmid_row_mapping * matrix_rows = NULL;
  
      if (act_nrows > 1) {
@@ -18681,7 +19020,7 @@ index 9af3129..9cff404 100644
      }
  
      mmctx->matrix_row_counts    = matrix_row_counts;
-@@ -4424,6 +6911,9 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
+@@ -4424,6 +7185,9 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
      int s;
      if (kparams->n_hmx) {
          s = hmx_mm_op_matmul_id_nx(octx, mmctx);
@@ -18691,7 +19030,7 @@ index 9af3129..9cff404 100644
      } else {
          if (hvx_mm_init_tiled_vec_dot(mmctx, src0->type) == 0) {
              s = hvx_mm_matmul_id_nx(octx, mmctx, act_nrows > 1 ? hvx_mm_id_nx_tiled : hvx_mv_id_nx_tiled);
-@@ -4435,6 +6925,9 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
+@@ -4435,6 +7199,9 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
      if (mapping_buf != octx->ctx->ddr_spad_base) {
          free(mapping_buf);
      }
