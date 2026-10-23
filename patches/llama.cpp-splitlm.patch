@@ -115,7 +115,7 @@ index d347757..4faa145 100644
          ggml-cpu/hbm.h
          ggml-cpu/quants.c
 diff --git a/ggml/src/ggml-cpu/arch/arm/repack.cpp b/ggml/src/ggml-cpu/arch/arm/repack.cpp
-index ad0e5cc..1eaf9e1 100644
+index ad0e5cc..9c6853b 100644
 --- a/ggml/src/ggml-cpu/arch/arm/repack.cpp
 +++ b/ggml/src/ggml-cpu/arch/arm/repack.cpp
 @@ -288,6 +288,9 @@ void ggml_gemv_q4_0_4x4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
@@ -138,6 +138,158 @@ index ad0e5cc..1eaf9e1 100644
              int8x16_t b0 = vld1q_s8((const int8_t *) b_ptr->qs);
              int8x16_t b1 = vld1q_s8((const int8_t *) b_ptr->qs + 16);
              int8x16_t b2 = vld1q_s8((const int8_t *) b_ptr->qs + 32);
+@@ -1513,6 +1519,93 @@ void ggml_gemv_q6_K_8x4_q8_K(int                        n,
+     ggml_gemv_q6_K_8x4_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+ }
+ 
++// trilane r9-dec: Q6_K 8x8 GEMV v2 (GGML_GEMV_Q6K_V2, default 1; 0 = upstream kernel). Same arithmetic, fewer
++// instructions: the 16-element sub-block scales multiply whole int32x4 sdot results (lanes 0-1 = even column, 2-3 = odd)
++// and the column pairs are reduced once per super-block, instead of a pairwise add + scalar scale gather + 2-lane
++// multiply per sub-block; the scales are widened in registers instead of a stack round trip. The integer sums are
++// exact (mod 2^32) and the float ops unchanged, so the output is bit-identical.
++static const int g_gemv_q6k_v2 = getenv("GGML_GEMV_Q6K_V2") ? atoi(getenv("GGML_GEMV_Q6K_V2")) : 1;
++#if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++static void ggml_gemv_q6_K_8x8_q8_K_v2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nc) {
++    const int nb = n / QK_K;
++    const uint8x16_t m4b = vdupq_n_u8(0x0f), mask_lo = vdupq_n_u8(0x03), mask_hi = vdupq_n_u8(0x30);
++    const block_q8_K * GGML_RESTRICT q8_ptr = (const block_q8_K *) vy;
++    for (int x = 0; x < nc / 8; x++) {
++        const block_q6_Kx8 * q6_ptr = (const block_q6_Kx8 *) vx + (x * nb);
++        float32x4_t acc_f32_0 = vdupq_n_f32(0), acc_f32_1 = vdupq_n_f32(0);
++        for (int b = 0; b < nb; b++) {
++            const block_q6_Kx8 * blk = q6_ptr + b;
++            const float32x4_t q8_d = vdupq_n_f32(q8_ptr[b].d);
++            const float32x4_t sb_scale_0 = vmulq_f32(vcvt_f32_f16(vld1_f16((const __fp16 *) blk->d)), q8_d);
++            const float32x4_t sb_scale_1 = vmulq_f32(vcvt_f32_f16(vld1_f16((const __fp16 *) blk->d + 4)), q8_d);
++            int32x4_t bias_lo = vdupq_n_s32(0), bias_hi = vdupq_n_s32(0);
++            for (int i = 0; i < 16; i += 4) {
++                const int16x4_t bs = vld1_s16(q8_ptr[b].bsums + i);
++                const int16x8_t s0 = vmovl_s8(vld1_s8(blk->scales + (i + 0) * 8));
++                const int16x8_t s1 = vmovl_s8(vld1_s8(blk->scales + (i + 1) * 8));
++                const int16x8_t s2 = vmovl_s8(vld1_s8(blk->scales + (i + 2) * 8));
++                const int16x8_t s3 = vmovl_s8(vld1_s8(blk->scales + (i + 3) * 8));
++                bias_lo = vmlal_lane_s16(bias_lo, vget_low_s16(s0), bs, 0); bias_hi = vmlal_lane_s16(bias_hi, vget_high_s16(s0), bs, 0);
++                bias_lo = vmlal_lane_s16(bias_lo, vget_low_s16(s1), bs, 1); bias_hi = vmlal_lane_s16(bias_hi, vget_high_s16(s1), bs, 1);
++                bias_lo = vmlal_lane_s16(bias_lo, vget_low_s16(s2), bs, 2); bias_hi = vmlal_lane_s16(bias_hi, vget_high_s16(s2), bs, 2);
++                bias_lo = vmlal_lane_s16(bias_lo, vget_low_s16(s3), bs, 3); bias_hi = vmlal_lane_s16(bias_hi, vget_high_s16(s3), bs, 3);
++            }
++            bias_lo = vshlq_n_s32(bias_lo, 5); bias_hi = vshlq_n_s32(bias_hi, 5);
++            int32x4_t acc4[4] = { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) };
++            for (int half = 0; half < 2; half++) {
++                const uint8_t * ql_base = blk->ql + half * 512;
++                const uint8_t * qh_base = blk->qh + half * 256;
++                for (int sb = 0; sb < 4; sb++) {
++                    const int8_t * q8l = q8_ptr[b].qs + half * 128 + sb * 16;
++                    const int8x16_t q8_l0 = (int8x16_t) vld1q_dup_s64((const int64_t *) q8l);
++                    const int8x16_t q8_l1 = (int8x16_t) vld1q_dup_s64((const int64_t *) (q8l + 8));
++                    const int8x16_t q8_h0 = (int8x16_t) vld1q_dup_s64((const int64_t *) (q8l + 64));
++                    const int8x16_t q8_h1 = (int8x16_t) vld1q_dup_s64((const int64_t *) (q8l + 72));
++                    const int ql_off = sb * 128, qh_off = ql_off & 255;
++                    const uint8x16x4_t ql0 = vld1q_u8_x4(ql_base + ql_off);
++                    const uint8x16x4_t ql1 = vld1q_u8_x4(ql_base + ql_off + 64);
++                    uint8x16x4_t qh0 = vld1q_u8_x4(qh_base + qh_off);
++                    uint8x16x4_t qh1 = vld1q_u8_x4(qh_base + qh_off + 64);
++                    if (sb > 1) {
++                        for (int i = 0; i < 4; i++) { qh0.val[i] = vshrq_n_u8(qh0.val[i], 2); qh1.val[i] = vshrq_n_u8(qh1.val[i], 2); }
++                    }
++                    const int16x8_t scl = vmovl_s8(vld1_s8(blk->scales + (half * 8 + sb) * 8));
++                    const int16x8_t sch = vmovl_s8(vld1_s8(blk->scales + (half * 8 + sb + 4) * 8));
++                    const int16x8_t zl0 = vzip1q_s16(scl, scl), zl1 = vzip2q_s16(scl, scl);
++                    const int16x8_t zh0 = vzip1q_s16(sch, sch), zh1 = vzip2q_s16(sch, sch);
++                    const int32x4_t sl[4] = { vmovl_s16(vget_low_s16(zl0)), vmovl_high_s16(zl0), vmovl_s16(vget_low_s16(zl1)), vmovl_high_s16(zl1) };
++                    const int32x4_t sh[4] = { vmovl_s16(vget_low_s16(zh0)), vmovl_high_s16(zh0), vmovl_s16(vget_low_s16(zh1)), vmovl_high_s16(zh1) };
++                    for (int cp = 0; cp < 4; cp++) {
++                        const uint8x16_t l0 = ql0.val[cp], l1 = ql1.val[cp], h0 = qh0.val[cp], h1 = qh1.val[cp];
++                        const int8x16_t q6_l0 = vreinterpretq_s8_u8(vsliq_n_u8(vandq_u8(l0, m4b), vandq_u8(h0, mask_lo), 4));
++                        const int8x16_t q6_l1 = vreinterpretq_s8_u8(vsliq_n_u8(vandq_u8(l1, m4b), vandq_u8(h1, mask_lo), 4));
++                        const int8x16_t q6_h0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(l0, 4), vandq_u8(h0, mask_hi)));
++                        const int8x16_t q6_h1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(l1, 4), vandq_u8(h1, mask_hi)));
++                        int32x4_t al = vdotq_s32(vdupq_n_s32(0), q6_l0, q8_l0); al = vdotq_s32(al, q6_l1, q8_l1);
++                        int32x4_t ah = vdotq_s32(vdupq_n_s32(0), q6_h0, q8_h0); ah = vdotq_s32(ah, q6_h1, q8_h1);
++                        acc4[cp] = vmlaq_s32(acc4[cp], al, sl[cp]);
++                        acc4[cp] = vmlaq_s32(acc4[cp], ah, sh[cp]);
++                    }
++                }
++            }
++            int32x2_t a0 = vpadd_s32(vget_low_s32(acc4[0]), vget_high_s32(acc4[0]));
++            int32x2_t a1 = vpadd_s32(vget_low_s32(acc4[1]), vget_high_s32(acc4[1]));
++            int32x2_t a2 = vpadd_s32(vget_low_s32(acc4[2]), vget_high_s32(acc4[2]));
++            int32x2_t a3 = vpadd_s32(vget_low_s32(acc4[3]), vget_high_s32(acc4[3]));
++            a0 = vsub_s32(a0, vget_low_s32(bias_lo)); a1 = vsub_s32(a1, vget_high_s32(bias_lo));
++            a2 = vsub_s32(a2, vget_low_s32(bias_hi)); a3 = vsub_s32(a3, vget_high_s32(bias_hi));
++            const float32x2_t w_01 = vmul_f32(vcvt_f32_s32(a0), vget_low_f32(sb_scale_0));
++            const float32x2_t w_23 = vmul_f32(vcvt_f32_s32(a1), vget_high_f32(sb_scale_0));
++            const float32x2_t w_45 = vmul_f32(vcvt_f32_s32(a2), vget_low_f32(sb_scale_1));
++            const float32x2_t w_67 = vmul_f32(vcvt_f32_s32(a3), vget_high_f32(sb_scale_1));
++            acc_f32_0 = vaddq_f32(acc_f32_0, vcombine_f32(w_01, w_23));
++            acc_f32_1 = vaddq_f32(acc_f32_1, vcombine_f32(w_45, w_67));
++        }
++        vst1q_f32(s + x * 8, acc_f32_0); vst1q_f32(s + x * 8 + 4, acc_f32_1);
++    }
++}
++#endif
++
+ void ggml_gemv_q6_K_8x8_q8_K(int                        n,
+                              float * GGML_RESTRICT      s,
+                              size_t                     bs,
+@@ -1534,6 +1627,10 @@ void ggml_gemv_q6_K_8x8_q8_K(int                        n,
+     UNUSED(blocklen);
+ 
+ #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
++    if (g_gemv_q6k_v2) {
++        ggml_gemv_q6_K_8x8_q8_K_v2(n, s, vx, vy, nc);
++        return;
++    }
+     constexpr int    col_pairs = ncols_interleaved / 2;
+     const uint8x16_t m4b       = vdupq_n_u8(0x0f);
+     const uint8x16_t mask_lo   = vdupq_n_u8(0x03);
+@@ -4973,6 +5070,20 @@ void ggml_gemm_q6_K_8x8_q8_K(int                        n,
+                             }
+                         }
+ 
++                        // trilane r9-dec: sub-block scales as vectors [even, even, odd, odd] per column pair
++                        // (vzip of the widened scale row) instead of four scalar loads + inserts per column pair
++                        int32x4_t sl_v[4], sh_v[4];
++                        {
++                            const int16x8_t scl = vld1q_s16(q6_scales + (half * 8 + sb) * 8);
++                            const int16x8_t sch = vld1q_s16(q6_scales + (half * 8 + sb + 4) * 8);
++                            const int16x8_t zl0 = vzip1q_s16(scl, scl), zl1 = vzip2q_s16(scl, scl);
++                            const int16x8_t zh0 = vzip1q_s16(sch, sch), zh1 = vzip2q_s16(sch, sch);
++                            sl_v[0] = vmovl_s16(vget_low_s16(zl0)); sl_v[1] = vmovl_high_s16(zl0);
++                            sl_v[2] = vmovl_s16(vget_low_s16(zl1)); sl_v[3] = vmovl_high_s16(zl1);
++                            sh_v[0] = vmovl_s16(vget_low_s16(zh0)); sh_v[1] = vmovl_high_s16(zh0);
++                            sh_v[2] = vmovl_s16(vget_low_s16(zh1)); sh_v[3] = vmovl_high_s16(zh1);
++                        }
++
+                         // Process column pairs (0-1, 2-3, 4-5, 6-7)
+                         for (int cp = 0; cp < ncols_interleaved / 2; cp++) {
+                             const uint8x16_t q6_qs_cp_0_l = q6_ql_0[cp];
+@@ -5012,19 +5123,12 @@ void ggml_gemm_q6_K_8x8_q8_K(int                        n,
+ 
+                             const int scale_idx_l = half * 8 + sb;
+                             const int scale_idx_h = half * 8 + sb + 4;
+-
+-                            const int32x4_t scale_vec_l = {
+-                                q6_scales[scale_idx_l * 8 + cp * 2 + 0],
+-                                q6_scales[scale_idx_l * 8 + cp * 2 + 0],
+-                                q6_scales[scale_idx_l * 8 + cp * 2 + 1],
+-                                q6_scales[scale_idx_l * 8 + cp * 2 + 1],
+-                            };
+-                            const int32x4_t scale_vec_h = {
+-                                q6_scales[scale_idx_h * 8 + cp * 2 + 0],
+-                                q6_scales[scale_idx_h * 8 + cp * 2 + 0],
+-                                q6_scales[scale_idx_h * 8 + cp * 2 + 1],
+-                                q6_scales[scale_idx_h * 8 + cp * 2 + 1],
+-                            };
++                            const int32x4_t scale_vec_l = g_gemv_q6k_v2 ? sl_v[cp] : (int32x4_t) {
++                                q6_scales[scale_idx_l * 8 + cp * 2 + 0], q6_scales[scale_idx_l * 8 + cp * 2 + 0],
++                                q6_scales[scale_idx_l * 8 + cp * 2 + 1], q6_scales[scale_idx_l * 8 + cp * 2 + 1] };
++                            const int32x4_t scale_vec_h = g_gemv_q6k_v2 ? sh_v[cp] : (int32x4_t) {
++                                q6_scales[scale_idx_h * 8 + cp * 2 + 0], q6_scales[scale_idx_h * 8 + cp * 2 + 0],
++                                q6_scales[scale_idx_h * 8 + cp * 2 + 1], q6_scales[scale_idx_h * 8 + cp * 2 + 1] };
+ 
+                             acc[cp]     = vmlaq_s32(acc[cp], sb_acc_0l, scale_vec_l);
+                             acc[cp]     = vmlaq_s32(acc[cp], sb_acc_0h, scale_vec_h);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu-impl.h b/ggml/src/ggml-cpu/ggml-cpu-impl.h
 index 0d48c9a..7e7c303 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu-impl.h
@@ -196,7 +348,7 @@ index 0d48c9a..7e7c303 100644
  }
  #endif
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index ab82e3d..b8814a8 100644
+index ab82e3d..7ae22bc 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -490,6 +490,11 @@ struct ggml_threadpool {
@@ -366,11 +518,12 @@ index ab82e3d..b8814a8 100644
      return cplan;
  }
  
-@@ -3063,6 +3166,280 @@ struct ggml_cplan ggml_graph_plan(
+@@ -3063,6 +3166,311 @@ struct ggml_cplan ggml_graph_plan(
  // Try to fuse the current node with subsequent nodes for better performance.
  // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
  static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 +static bool ggml_cpu_gdn_cpy_fusion = true;   // trilane: GGML_CPU_GDN_CPY_FUSION=0 disables
++static bool ggml_cpu_gdn_snap_fusion = true;  // trilane r9: GGML_CPU_GDN_SNAP_FUSION=0 keeps the K>1 snapshot CPY separate
 +static int  ggml_cpu_moe_fuse = 1;           // trilane: GGML_CPU_MOE_FUSE=0 disables the fused single-token MoE paths
 +
 +static int32_t cpu_tensor_use_count(const struct ggml_cgraph * cgraph, const struct ggml_tensor * t) {
@@ -393,7 +546,8 @@ index ab82e3d..b8814a8 100644
 +// returns the offset (from node_n) of the state CPY that can be fused into the GATED_DELTA_NET at node_n, or 0
 +static int ggml_cpu_gdn_cpy_fusable(const struct ggml_cgraph * cgraph, int node_n) {
 +    const struct ggml_tensor * gdn = cgraph->nodes[node_n];
-+    if (gdn->type != GGML_TYPE_F32 || ggml_get_op_params_i32(gdn, 0) != 1 || !ggml_is_contiguous(gdn) ||
++    const int K = ggml_get_op_params_i32(gdn, 0);
++    if (gdn->type != GGML_TYPE_F32 || K < 1 || (K > 1 && !ggml_cpu_gdn_snap_fusion) || !ggml_is_contiguous(gdn) ||
 +        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || gdn->view_src != NULL) {
 +        return 0;
 +    }
@@ -405,7 +559,7 @@ index ab82e3d..b8814a8 100644
 +    const struct ggml_tensor * st = gdn->src[5];
 +    const size_t attn_bytes  = (size_t) v->ne[0] * v->ne[1] * v->ne[2] * v->ne[3] * sizeof(float);
 +    const size_t state_bytes = (size_t) v->ne[0] * v->ne[0] * v->ne[1] * v->ne[3] * sizeof(float);
-+    if (ggml_nbytes(gdn) != attn_bytes + state_bytes) {
++    if (ggml_nbytes(gdn) != attn_bytes + (size_t) K * state_bytes) {
 +        return 0;
 +    }
 +
@@ -418,6 +572,23 @@ index ab82e3d..b8814a8 100644
 +    }
 +    const struct ggml_tensor * cpy = cgraph->nodes[nx];
 +    const struct ggml_tensor * sv  = cpy->src[0];
++    if (K > 1) {
++        // trilane r9 (GGML_CPU_GDN_SNAP_FUSION, default 1): K rollback snapshots (build_recurrent_attn keep path).
++        // sv = [D, n_seqs, n_written] contiguous right after the attention part; cpy = the same shape over the cache
++        // planes (rows of D contiguous floats, nb[1] = row stride, nb[2] = plane stride). The kernel writes each
++        // snapshot where the CPY would have put it.
++        const int64_t D  = v->ne[0] * v->ne[0] * v->ne[1];
++        const int64_t nw = v->ne[2] < K ? v->ne[2] : K;
++        if (cpy->op != GGML_OP_CPY || sv == NULL || sv->view_src != gdn || sv->view_offs != attn_bytes ||
++            sv->type != GGML_TYPE_F32 || cpy->type != GGML_TYPE_F32 || !ggml_is_contiguous(sv) ||
++            sv->ne[0] != D || sv->ne[1] != v->ne[3] || sv->ne[2] != nw || sv->ne[3] != 1 ||
++            cpy->ne[0] != D || cpy->ne[1] != v->ne[3] || cpy->ne[2] != nw || cpy->ne[3] != 1 ||
++            cpy->nb[0] != sizeof(float) || cpy->nb[1] < (size_t) D * sizeof(float) || cpy->nb[1] % sizeof(float) ||
++            cpy->nb[2] % sizeof(float) || (nw > 1 && cpy->nb[2] < cpy->nb[1] * (size_t) v->ne[3]) ||
++            cpu_tensor_use_count(cgraph, sv) != 1 || (sv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++            return 0;
++        }
++    } else
 +    if (cpy->op != GGML_OP_CPY || sv == NULL || sv->view_src != gdn || sv->view_offs != attn_bytes ||
 +        sv->type != GGML_TYPE_F32 || cpy->type != GGML_TYPE_F32 || !ggml_is_contiguous(sv) || !ggml_is_contiguous(cpy) ||
 +        ggml_nbytes(sv) != state_bytes || ggml_nbytes(cpy) != state_bytes || cpu_tensor_use_count(cgraph, sv) != 1 ||
@@ -445,9 +616,21 @@ index ab82e3d..b8814a8 100644
 +        return 0;
 +    }
 +    // the state may be updated in place (CPY destination == input state) or go to a disjoint buffer
-+    const bool alias = cpy->data == st->data && ggml_is_contiguous(st) && ggml_nbytes(st) == state_bytes;
-+    if (!alias) {
-+        for (int s = 0; s < GGML_MAX_SRC; s++) {
++    // (K > 1: the input state may be snapshot slot 0 itself, read into the kernel's scratch before slot 0 is written)
++    // (K > 1: or the same cells in snapshot plane q, viewed in place after a rollback; each (seq, head) state is
++    //  read into scratch before any snapshot of that (seq, head) is written, and planes hold the same layout)
++    bool alias = cpy->data == st->data && ggml_is_contiguous(st) && ggml_nbytes(st) == state_bytes &&
++        (K == 1 || v->ne[3] == 1 || cpy->nb[1] == (size_t) v->ne[0] * v->ne[0] * v->ne[1] * sizeof(float));
++    if (!alias && K > 1 && ggml_is_contiguous(st) && ggml_nbytes(st) == state_bytes && st->data > cpy->data &&
++        (v->ne[3] == 1 || cpy->nb[1] == (size_t) v->ne[0] * v->ne[0] * v->ne[1] * sizeof(float))) {
++        const size_t d = (size_t) ((const char *) st->data - (const char *) cpy->data);
++        alias = d % cpy->nb[2] == 0;
++    }
++    for (int s = 0; s < GGML_MAX_SRC; s++) {
++        if (alias && s == 5) {
++            continue;
++        }
++        {
 +            if (gdn->src[s] && cpu_ranges_overlap(cpy, gdn->src[s])) {
 +                return 0;
 +            }
@@ -647,7 +830,7 @@ index ab82e3d..b8814a8 100644
  
  static int ggml_cpu_try_fuse_ops(
          const struct ggml_cgraph * cgraph,
-@@ -3076,6 +3453,13 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3076,6 +3484,13 @@ static int ggml_cpu_try_fuse_ops(
  
      struct ggml_tensor * node = cgraph->nodes[node_n];
  
@@ -661,7 +844,7 @@ index ab82e3d..b8814a8 100644
      if (node->op == GGML_OP_RMS_NORM) {
          // RMS_NORM + MUL fusion
          const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
-@@ -3095,9 +3479,302 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3095,9 +3510,302 @@ static int ggml_cpu_try_fuse_ops(
          }
      }
  
@@ -964,7 +1147,7 @@ index ab82e3d..b8814a8 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3118,6 +3795,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3118,6 +3826,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          /*.wdata      =*/ cplan->work_data,
          /*.threadpool =*/ tp,
          /*.use_ref    =*/ cplan->use_ref,
@@ -972,7 +1155,7 @@ index ab82e3d..b8814a8 100644
      };
  
  #ifdef GGML_USE_OPENMP
-@@ -3126,6 +3804,55 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3126,6 +3835,55 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -1028,7 +1211,7 @@ index ab82e3d..b8814a8 100644
      for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
          struct ggml_tensor * node = cgraph->nodes[node_n];
  
-@@ -3138,11 +3865,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3138,11 +3896,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
@@ -1060,7 +1243,7 @@ index ab82e3d..b8814a8 100644
          } else {
              ggml_compute_forward(&params, node);
          }
-@@ -3153,8 +3900,69 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3153,8 +3931,69 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              tp->ec    = GGML_STATUS_ABORTED;
          }
  
@@ -1131,7 +1314,7 @@ index ab82e3d..b8814a8 100644
          }
      }
  
-@@ -3164,8 +3972,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3164,8 +4003,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -1167,7 +1350,7 @@ index ab82e3d..b8814a8 100644
  #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
      ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
  #endif
-@@ -3324,6 +4159,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3324,6 +4190,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
          threadpool->n_graph          = 0;
          threadpool->n_barrier        = 0;
          threadpool->n_barrier_passed = 0;
@@ -1177,7 +1360,7 @@ index ab82e3d..b8814a8 100644
          threadpool->current_chunk    = 0;
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
-@@ -3389,6 +4227,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
+@@ -3389,6 +4258,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
  }
  
  enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
@@ -1185,7 +1368,7 @@ index ab82e3d..b8814a8 100644
      ggml_cpu_init();
  
      GGML_ASSERT(cplan);
-@@ -3415,6 +4254,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3415,6 +4285,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
          threadpool->abort            = -1;
          threadpool->ec               = GGML_STATUS_SUCCESS;
      }
@@ -1195,7 +1378,7 @@ index ab82e3d..b8814a8 100644
  
  #ifdef GGML_USE_OPENMP
      if (n_threads > 1) {
-@@ -3462,6 +4304,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3462,6 +4335,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
          ggml_threadpool_free(threadpool);
      }
  
@@ -1209,12 +1392,14 @@ index ab82e3d..b8814a8 100644
      return ret;
  }
  
-@@ -3933,6 +4782,34 @@ void ggml_cpu_init(void) {
+@@ -3933,6 +4813,36 @@ void ggml_cpu_init(void) {
          {
              const char * env = getenv("GGML_CPU_DISABLE_FUSION");
              ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
 +            env = getenv("GGML_CPU_GDN_CPY_FUSION");
 +            ggml_cpu_gdn_cpy_fusion = (env == NULL || atoi(env) != 0);
++            env = getenv("GGML_CPU_GDN_SNAP_FUSION");
++            ggml_cpu_gdn_snap_fusion = (env == NULL || atoi(env) != 0);
 +            env = getenv("GGML_CPU_MOE_FUSE");
 +            ggml_cpu_moe_fuse = env ? atoi(env) : 1;
 +            env = getenv("GGML_CPU_ELIDE2");
@@ -2580,7 +2765,7 @@ index 0000000..ef8543c
 +}
 +#endif
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 7a73e13..c6bfabc 100644
+index 7a73e13..4e04965 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -2055,25 +2055,62 @@ static void ggml_compute_forward_concat_f32(
@@ -3364,17 +3549,44 @@ index 7a73e13..c6bfabc 100644
              for (int64_t q_head = 0; q_head < neq2; q_head++) {
                  ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                      params, dst, q_head, q_head + 1, ic_start, ic_end,
-@@ -11202,7 +11928,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11197,12 +11923,35 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
+     }
+ }
+ 
++// trilane r9: the K>1 rollback snapshots (4 x 151 MB per step on Qwen3.8-27B) are written once and not read
++// again until the next step, so they bypass the cache with non-temporal pair stores (STNP): no read-for-ownership
++// of the destination lines, measured 2x the write rate of memcpy (wt/r9-dec-tools/zvabench.cpp). Same bytes.
++// GGML_CPU_GDN_SNAP_NT=0 restores memcpy.
++static void gdn_snapshot_copy(float * dst, const float * src, int64_t n) {
++#if defined(__aarch64__) && defined(__ARM_NEON) && (defined(__clang__) || defined(__GNUC__))
++    static const bool nt = [] { const char * e = getenv("GGML_CPU_GDN_SNAP_NT"); return !(e && atoi(e) == 0); }();
++    if (nt && n % 16 == 0 && ((uintptr_t) dst % 16) == 0) {
++        for (int64_t i = 0; i < n; i += 16) {
++            const float32x4_t a = vld1q_f32(src + i),     b = vld1q_f32(src + i + 4);
++            const float32x4_t c = vld1q_f32(src + i + 8), d = vld1q_f32(src + i + 12);
++            __asm__ __volatile__("stnp %q0, %q1, [%2]" :: "w"(a), "w"(b), "r"(dst + i) : "memory");
++            __asm__ __volatile__("stnp %q0, %q1, [%2]" :: "w"(c), "w"(d), "r"(dst + i + 8) : "memory");
++        }
++        return;
++    }
++#endif
++    memcpy(dst, src, n * sizeof(float));
++}
++
+ // ggml_compute_forward_gated_delta_net
+ static void ggml_compute_forward_gated_delta_net_one_chunk(
      const ggml_compute_params * params,
      ggml_tensor * dst,
      int64_t ir0,
 -    int64_t ir1) {
 +    int64_t ir1,
-+    float * state_dst) {
++    float * state_dst,
++    int64_t snap_stride_dst,
++    int64_t seq_stride_dst) {
  
      ggml_tensor * src_q     = dst->src[0];
      ggml_tensor * src_k     = dst->src[1];
-@@ -11282,18 +12009,64 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11282,18 +12031,64 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
  
          // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
          // For K>1, work in scratch and copy out per-token when the slot is in range.
@@ -3441,26 +3653,43 @@ index 7a73e13..c6bfabc 100644
          for (int64_t t = 0; t < n_tokens; t++) {
              const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
              const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
-@@ -11354,7 +12127,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11342,9 +12137,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+             if (K > 1) {
+                 const int64_t target_slot = n_tokens - 1 - t;
+                 if (target_slot >= 0 && target_slot < K) {
+-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
+-                                     (iv3 * H + iv1) * S_v * S_v;
+-                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
++                    // trilane r9: with state_dst (K>1 GDN + snapshot CPY fused) the snapshots go straight to the cache planes
++                    float * curr_state_o = state_dst
++                        ? state_dst + target_slot * snap_stride_dst + iv3 * seq_stride_dst + iv1 * S_v * S_v
++                        : state_out_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
++                    gdn_snapshot_copy(curr_state_o, s_out, S_v * S_v);
+                 }
+             }
+         }
+@@ -11354,7 +12151,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
  
  static void ggml_compute_forward_gated_delta_net_f32(
          const ggml_compute_params * params,
 -        ggml_tensor * dst) {
 +        ggml_tensor * dst,
-+        float * state_dst = nullptr) {
++        float * state_dst = nullptr,
++        int64_t snap_stride_dst = 0,
++        int64_t seq_stride_dst = 0) {
  
      ggml_tensor * V = dst->src[2];
      int64_t nr = V->ne[1] * V->ne[3];
-@@ -11388,7 +12162,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -11388,7 +12188,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
          const int64_t ir0 = dr * current_chunk;
          const int64_t ir1 = MIN(ir0 + dr, nr);
  
 -        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1);
-+        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1, state_dst);
++        ggml_compute_forward_gated_delta_net_one_chunk(params, dst, ir0, ir1, state_dst, snap_stride_dst, seq_stride_dst);
          current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
      }
  }
-@@ -11410,6 +12184,17 @@ void ggml_compute_forward_gated_delta_net(
+@@ -11410,6 +12210,19 @@ void ggml_compute_forward_gated_delta_net(
      }
  }
  
@@ -3472,7 +3701,9 @@ index 7a73e13..c6bfabc 100644
 +        ggml_tensor * dst,
 +        ggml_tensor * cpy) {
 +    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
-+    ggml_compute_forward_gated_delta_net_f32(params, dst, (float *) cpy->data);
++    // K>1 (speculative rollback snapshots): cpy is [D, n_seqs, n_written] over the cache planes (nb[2] = plane stride)
++    ggml_compute_forward_gated_delta_net_f32(params, dst, (float *) cpy->data,
++        (int64_t) (cpy->nb[2] / sizeof(float)), (int64_t) (cpy->nb[1] / sizeof(float)));
 +}
 +
  
@@ -19063,7 +19294,7 @@ index f4eb181..87c9fce 100644
      float rope_freq_scale;
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 2bc3a29..dfa8e90 100644
+index 2bc3a29..7037c0f 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -401,7 +401,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
@@ -19076,36 +19307,62 @@ index 2bc3a29..dfa8e90 100644
          GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
          int32_t * data = (int32_t *) s_copy->data;
  
-@@ -412,6 +413,20 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+@@ -409,9 +410,46 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->s_copy(i);
+         }
++    } else {
++        // trilane r9: states viewed in place (possibly in a rollback plane): still consume the rollback index
++        for (uint32_t i = 0; i < n_rs; ++i) {
++            (void) mctx->s_copy(i);
++        }
      }
  }
  
-+static bool llm_graph_rs_is_identity(const llama_memory_recurrent_context * mctx) {
-+    if (getenv("LLAMA_RS_NO_IDENT")) {
-+        return false;
++// returns the state plane the ubatch states are viewed in (0 = the cache cells themselves), or -1 if they must be gathered.
++// trilane r9: after a speculative rollback every state of a single-sequence step comes from the same snapshot plane
++// (s_copy = plane * size + head + i); build_rs then views that plane instead of gathering a copy (one 151 MB copy
++// per rolled-back step on Qwen3.8-27B). LLAMA_RS_NO_PLANE=1 restores the gather for planes > 0.
++static int32_t llm_graph_rs_ident_plane(const llama_memory_recurrent_context * mctx) {
++    static const bool no_ident = getenv("LLAMA_RS_NO_IDENT") != nullptr;
++    static const bool no_plane = getenv("LLAMA_RS_NO_PLANE") != nullptr;
++    if (no_ident) {
++        return -1;
 +    }
 +    const uint32_t head = mctx->get_head();
-+    for (uint32_t i = 0; i < mctx->get_n_rs(); ++i) {
++    const uint32_t n_rs = mctx->get_n_rs();
++    const int64_t  size = mctx->get_size();
++    int64_t plane = -1;
++    for (uint32_t i = 0; i < n_rs; ++i) {
 +        // peek: s_copy() would consume a pending rollback index before set_input reads it
-+        if (mctx->s_copy_peek(i) != (int32_t) (head + i)) {
-+            return false;
++        const int64_t c = mctx->s_copy_peek(i) - (int64_t) (head + i);
++        if (c < 0 || c % size != 0 || (plane >= 0 && c / size != plane)) {
++            return -1;
 +        }
++        plane = c / size;
 +    }
-+    return true;
++    if (plane < 0) {
++        return -1;
++    }
++    // a rollback plane holds the ubatch states only; extra states (n_rs > 1) and a cell to clear need the gather
++    if (plane > 0 && (no_plane || n_rs != 1 || mctx->get_rs_z() >= 0)) {
++        return -1;
++    }
++    return (int32_t) plane;
 +}
 +
  bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
      const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
  
-@@ -425,6 +440,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+@@ -425,6 +463,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
  
      res &= head == mctx->get_head();
      res &= rs_z == mctx->get_rs_z();
-+    res &= ident == llm_graph_rs_is_identity(mctx);
++    res &= ident_plane == llm_graph_rs_ident_plane(mctx);
  
      return res;
  }
-@@ -1176,7 +1192,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -1176,7 +1215,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -19114,15 +19371,27 @@ index 2bc3a29..dfa8e90 100644
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
  
-@@ -1205,6 +1221,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+@@ -1184,6 +1223,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++    } else {
++        // trilane r9: states viewed in place (possibly in a rollback plane): still consume the rollback index
++        for (uint32_t i = 0; i < n_rs; ++i) {
++            (void) mctx->get_recr()->s_copy(i);
++        }
+     }
+ }
+ 
+@@ -1205,6 +1249,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
  
      res &= inp_rs->head == mctx->get_recr()->get_head();
      res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
-+    res &= inp_rs->ident == llm_graph_rs_is_identity(mctx->get_recr());
++    res &= inp_rs->ident_plane == llm_graph_rs_ident_plane(mctx->get_recr());
  
      return res;
  }
-@@ -1219,7 +1236,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+@@ -1219,7 +1264,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
  
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
@@ -19131,23 +19400,56 @@ index 2bc3a29..dfa8e90 100644
          GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
          int32_t * data = (int32_t *) inp_rs->s_copy->data;
  
-@@ -1247,6 +1264,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
+@@ -1227,6 +1272,11 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++    } else {
++        // trilane r9: states viewed in place (possibly in a rollback plane): still consume the rollback index
++        for (uint32_t i = 0; i < n_rs; ++i) {
++            (void) mctx->get_recr()->s_copy(i);
++        }
+     }
+ }
+ 
+@@ -1247,6 +1297,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
  
      res &= inp_rs->head == mctx->get_recr()->get_head();
      res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
-+    res &= inp_rs->ident == llm_graph_rs_is_identity(mctx->get_recr());
++    res &= inp_rs->ident_plane == llm_graph_rs_ident_plane(mctx->get_recr());
  
      return res;
  }
-@@ -1334,6 +1352,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
+@@ -1292,7 +1343,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+-    if (inp_rs->s_copy) {
++    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+         int32_t * data = (int32_t *) inp_rs->s_copy->data;
+ 
+@@ -1300,6 +1351,11 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++    } else {
++        // trilane r9: states viewed in place (possibly in a rollback plane): still consume the rollback index
++        for (uint32_t i = 0; i < n_rs; ++i) {
++            (void) mctx->get_recr()->s_copy(i);
++        }
+     }
+ }
+ 
+@@ -1334,6 +1390,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
  
      res &= inp_rs->head == mctx->get_recr()->get_head();
      res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
-+    res &= inp_rs->ident == llm_graph_rs_is_identity(mctx->get_recr());
++    res &= inp_rs->ident_plane == llm_graph_rs_ident_plane(mctx->get_recr());
  
      return res;
  }
-@@ -1666,6 +1685,66 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+@@ -1666,6 +1723,66 @@ ggml_tensor * llm_graph_context::build_lora_mm(
      return res;
  }
  
@@ -19214,7 +19516,7 @@ index 2bc3a29..dfa8e90 100644
  ggml_tensor * llm_graph_context::build_lora_mm_id(
            ggml_tensor * w,   // ggml_tensor * as
            ggml_tensor * cur, // ggml_tensor * b
-@@ -3861,8 +3940,9 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+@@ -3861,8 +3978,10 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
      inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
      inp->s_copy_tail = ggml_view_1d(ctx0, inp->s_copy, n_rs - 1, inp->s_copy->nb[0]);
  
@@ -19222,11 +19524,12 @@ index 2bc3a29..dfa8e90 100644
 -    inp->rs_z = mctx_cur->get_rs_z();
 +    inp->head  = mctx_cur->get_head();
 +    inp->rs_z  = mctx_cur->get_rs_z();
-+    inp->ident = llm_graph_rs_is_identity(mctx_cur);
++    inp->ident_plane = llm_graph_rs_ident_plane(mctx_cur);
++    inp->ident = inp->ident_plane >= 0;
  
      return inp;
  }
-@@ -3883,6 +3963,15 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -3883,6 +4002,24 @@ ggml_tensor * llm_graph_context::build_rs(
          const llm_graph_get_rows_fn & get_state_rows) const {
      const auto * kv_state = inp->mctx;
  
@@ -19236,17 +19539,26 @@ index 2bc3a29..dfa8e90 100644
 +        const int32_t rs_zero = kv_state->get_rs_z();
 +        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
 +        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
-+        return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], kv_state->get_head()*states->nb[1]);
++        // trilane r9: with ident_plane > 0 (rollback, LLAMA_RS_NO_PLANE unset) the returned view aliases snapshot
++        // plane `ident_plane` of the cache, which this same graph overwrites with the new step's snapshots
++        // (snapshot CPYs into planes 0..K-1). That is correct only while every such CPY reads a tensor computed from
++        // the state (GDN/SSM output, the conv concat), never the state view itself, so the data dependencies order it
++        // after all readers of the state; a CPU GDN+CPY fusion may write a plane it reads because it copies each
++        // (seq, head) state to scratch first. Any new reader of the state view that is not upstream of those CPYs,
++        // or a fusion that drops the concat and copies from the state view, must disable the plane view (return -1
++        // from llm_graph_rs_ident_plane) or it races with the snapshot writes.
++        const size_t row0 = (size_t) inp->ident_plane*kv_state->get_size() + kv_state->get_head();
++        return ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], row0*states->nb[1]);
 +    }
 +
      // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
      // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
      ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index f66bedb..aadc4c1 100644
+index f66bedb..5b1377b 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -298,6 +298,10 @@ public:
+@@ -298,6 +298,11 @@ public:
      // used in view offsets, need to match for valid graph reuse
      uint32_t head;
      int32_t rs_z;
@@ -19254,10 +19566,11 @@ index f66bedb..aadc4c1 100644
 +    // trilane: every state is read from its own cell (the usual decode step), so build_rs can view the
 +    // states in place instead of gathering a copy; part of the graph topology, so it must match for reuse
 +    bool ident = false;
++    int32_t ident_plane = -1; // trilane r9: snapshot plane the states are viewed in (> 0 after a rollback)
  };
  
  class llm_graph_input_cross_embd : public llm_graph_input_i {
-@@ -891,6 +895,10 @@ struct llm_graph_params {
+@@ -891,6 +896,10 @@ struct llm_graph_params {
              }
          }
  
@@ -19268,7 +19581,7 @@ index f66bedb..aadc4c1 100644
          // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
          if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
              return false;
-@@ -1106,6 +1114,12 @@ struct llm_graph_context {
+@@ -1106,6 +1115,12 @@ struct llm_graph_context {
                ggml_tensor * cur,
                ggml_tensor * w_s = nullptr) const;
  
@@ -19428,11 +19741,45 @@ index 803a832..b59d220 100644
  const char * llama_model_chat_template(const llama_model * model, const char * name) {
      const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
          : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index 2e15777..e8975e0 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -514,6 +514,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+                         conv_states_all->nb[1],
+                         (s_slot * mem_size + kv_head) * row_size);
+ 
++            // trilane r9: after a rollback the input state may be a view of the snapshot plane this CPY writes
++            // (llm_graph_rs_ident_plane). Safe only because the source is computed from the state, so the CPY runs
++            // after every reader of it; never copy from the state view itself here (see build_rs).
+             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+         }
+     }
+@@ -585,6 +588,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+ 
+     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
++    // trilane r9: after a rollback the input state may be a view of the snapshot plane this CPY writes
++    // (llm_graph_rs_ident_plane). Safe only because the source is computed from the state, so the CPY runs
++    // after every reader of it; never copy from the state view itself here (see build_rs).
+     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
+         D, n_seqs, n_written,
+         ggml_row_size(gdn_out->type, D),
 diff --git a/src/models/lfm2.cpp b/src/models/lfm2.cpp
-index 942d8de..de57a0c 100644
+index 942d8de..d2d05c9 100644
 --- a/src/models/lfm2.cpp
 +++ b/src/models/lfm2.cpp
-@@ -336,7 +336,7 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
+@@ -264,6 +264,9 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
+         for (int64_t slot = 0; slot < n_written; ++slot) {
+             auto * conv_snap = ggml_view_3d(ctx0, bx, d_conv, bx->ne[1], bx->ne[2], bx->nb[1], bx->nb[2],
+                                             (bx->ne[0] - d_conv - slot) * ggml_element_size(bx));
++            // trilane r9: after a rollback the input state may be a view of the snapshot plane this CPY writes
++            // (llm_graph_rs_ident_plane). Safe only because the source is computed from the state, so the CPY runs
++            // after every reader of it; never copy from the state view itself here (see build_rs).
+             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_snap,
+                                                    ggml_view_2d(ctx0, conv_state, (int64_t) d_conv * n_embd, n_seqs,
+                                                                 conv_state->nb[1],
+@@ -336,7 +339,7 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
      res->t_embd = cur;
  
      if (!cparams.embeddings) {
@@ -19441,6 +19788,20 @@ index 942d8de..de57a0c 100644
          cb(cur, "result_output", -1);
  
          res->t_logits = cur;
+diff --git a/src/models/mamba-base.cpp b/src/models/mamba-base.cpp
+index 370de0f..7df93e3 100644
+--- a/src/models/mamba-base.cpp
++++ b/src/models/mamba-base.cpp
+@@ -214,6 +214,9 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
+             ggml_tensor * last_conv = ggml_view_3d(ctx0, conv_x, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs,
+                                                    conv_x->nb[1], conv_x->nb[2], (n_seq_tokens - slot) * conv_x->nb[0]);
+ 
++            // trilane r9: after a rollback the input state may be a view of the snapshot plane this CPY writes
++            // (llm_graph_rs_ident_plane). Safe only because the source is computed from the state, so the CPY runs
++            // after every reader of it; never copy from the state view itself here (see build_rs).
+             ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv,
+                                                    ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs,
+                                                                 conv_states_all->nb[1],
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
 index 802f2e2..c5d8d6e 100644
 --- a/src/models/qwen35.cpp
