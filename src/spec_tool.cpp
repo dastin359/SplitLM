@@ -59,6 +59,9 @@ struct args {
     std::string draft_model;        // --draft-model: separate draft GGUF (small model, mtp-*.gguf, dflash-*.gguf)
     std::string draft_dev = "CPU";  // --draft-dev: device of the draft context
     int draft_threads = 0;          // --draft-threads: CPU threads of the draft context (0 = -t)
+    int threads_batch = 0;          // -tb: CPU threads for multi-token batches (verification, MTP catch-up) of the decode
+                                    // and MTP contexts (0 = -t); the 2-4-token verify GEMMs are compute-bound
+
     int draft_head_n = -1, draft_head_tail = 256; // --draft-head N[:T]; -1 = auto (see apply_draft_head)
     bool spec_async = false;        // --spec-async
     bool adaptive = false;          // --adaptive
@@ -70,7 +73,7 @@ struct args {
 
 static void usage() {
     fprintf(stderr, "usage: trilane-spec -m model.gguf -f prompt.txt [--mode spec|batchcost] [--prefill-dev HTP0|CPU] [--nmax K (0 = no spec)]\n"
-                    "       [-n n_gen] [-c n_ctx] [-t threads] [-ub ubatch] [--alias auto|on|off] [--no-share] [--batches 1,2,4,8] [--check] [-v]\n"
+                    "       [-n n_gen] [-c n_ctx] [-t threads] [-tb threads_batch] [-ub ubatch] [--alias auto|on|off] [--no-share] [--batches 1,2,4,8] [--check] [-v]\n"
                     "       [--spec-type draft-mtp|draft-model|draft-simple|draft-dflash|draft-eagle3|ngram-simple|...] [--draft-model F.gguf]\n"
                     "       [--draft-dev CPU|HTP0|GPUOpenCL] [--draft-threads N] [--draft-head N[:T]] [--spec-async] [--adaptive] [--no-draft-overlap]\n"
                     "       [--repack-budget MiB|auto] (env TRILANE_REPACK_BUDGET)\n");
@@ -463,6 +466,7 @@ int main(int argc, char ** argv) {
         else if (k == "-n") a.n_gen = atoi(next());
         else if (k == "-c") a.n_ctx = atoi(next());
         else if (k == "-t") a.threads = atoi(next());
+        else if (k == "-tb") a.threads_batch = atoi(next());
         else if (k == "-ub") a.ubatch = atoi(next());
         else if (k == "--batches") { a.batches.clear(); std::stringstream ss(next()); for (std::string s; std::getline(ss, s, ',');) a.batches.push_back(atoi(s.c_str())); }
         else if (k == "--check") a.check = true;
@@ -484,6 +488,7 @@ int main(int argc, char ** argv) {
         a.repack_budget_mb = !e ? 0 : strcmp(e, "auto") == 0 ? -1 : atoll(e);
     }
     if (a.draft_threads <= 0) a.draft_threads = a.threads;
+    if (a.threads_batch <= 0) a.threads_batch = a.threads;
     if (a.spec_type == "draft-model" && a.draft_model.empty()) { fprintf(stderr, "--spec-type draft-model needs --draft-model\n"); return 1; }
     if (a.spec_async && a.spec_type != "draft-model") { fprintf(stderr, "--spec-async is implemented for --spec-type draft-model only\n"); return 1; }
 
@@ -627,6 +632,7 @@ int main(int argc, char ** argv) {
     llama_context_params cpp = ctx_params(4);
     cpp.op_offload = true;
     llama_context_params cpd = ctx_params(a.threads);
+    cpd.n_threads_batch = a.threads_batch;
     cpd.op_offload = false;
     cpd.n_outputs_max_per_seq = 0;                       // verify batches need k+1 outputs per sequence
     cpd.n_rs_seq = a.mode == "spec" ? (uint32_t) std::max(a.nmax, 0) : 0; // bounded recurrent rollback, as common does
@@ -721,6 +727,7 @@ int main(int argc, char ** argv) {
             }
         } else if (a.spec_type == "draft-mtp") {
             llama_context_params cpm = ctx_params(a.threads);
+            cpm.n_threads_batch = a.threads_batch;
             cpm.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
             cpm.n_rs_seq = 0;
             cpm.ctx_other = cd;
