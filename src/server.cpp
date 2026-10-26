@@ -6,6 +6,7 @@
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,12 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 using json = nlohmann::ordered_json;
 
@@ -31,6 +38,7 @@ static json stats_json(const trilane::gen_stats & s) {
         { "handoff_ms", s.handoff_ms }, { "handoff_mb", s.handoff_mb }, { "ttft_ms", s.ttft_ms },
         { "decode_ms", s.decode_ms }, { "n_gen", s.n_gen }, { "npu_decode_ms", s.npu_decode_ms }, { "n_gen_npu", s.n_gen_npu },
         { "decode_tps", s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0 },
+        { "n_drafted", s.n_drafted }, { "n_accepted", s.n_accepted }, { "n_steps", s.n_steps },
         { "stop", s.stop_reason },
     };
 }
@@ -60,6 +68,14 @@ static void usage() {
         "       [-t decode_threads] [-c n_ctx] [-b n_batch] [-ub n_ubatch] [--keepwarm-ms 20] [--cpu-prefill-max 24] [--no-alias]\n"
         "       [--cache-mb 2048] [--slots 4] [--npu-decode-slots 0|1] [--ui path/to/index.html] [-v]\n"
         "       [--prio 0-3] [--no-threadpool] [--bench-routes split,cpu,...]\n"
+        "       [--spec auto|on|off] [--spec-k 3,1,0] [--spec-nmax 3] [--draft-head N] [-tb verify_threads]\n"
+        "  --spec: speculative decoding with the model's MTP head; auto (default) = on when the GGUF has one\n"
+        "          (env TRILANE_SPEC=0 turns it off, =1 on). --spec-k: drafted tokens per slot when 1, 2, ... slots\n"
+        "          decode (the last entry holds for more slots; default N,1,0 with N = --spec-nmax), or auto: chosen\n"
+        "          online from measured step times and acceptance\n"
+        "          -tb: CPU threads of verification batches (default: -t + 2)\n"
+        "  env TRILANE_BATCH_INVARIANT=0: MTP models keep the faster mixed-rounding CPU matmul kernels (greedy text may\n"
+        "          then depend on how many tokens share a decode call)\n"
         "  --prio: decode thread priority 0 normal, 1 medium, 2 high (default), 3 realtime; 0 = old default\n"
         "  env TRILANE_WORKER0_PRIO=0: decode thread (graph worker 0) keeps normal priority and throttling (old behaviour)\n");
     exit(1);
@@ -70,6 +86,10 @@ int main(int argc, char ** argv) {
     std::string host = "127.0.0.1", ui_path;
     int bench_words = 0, bench_gen = 64, bench_conc = 0, bench_words_conc = 200;
     std::string bench_routes; // --bench-routes: explicit route sequence (e.g. split,cpu,split,cpu), no follow-up turn
+    std::string bench_prompts;          // --bench-prompts f1,f2,...: user messages of --bench-concurrent (default: synthetic notes)
+    std::string bench_mode = "both";    // --bench-mode seq|conc|both: which --bench-concurrent passes to run
+    std::string bench_route;            // --bench-route split|cpu|...: fixed route for --bench-concurrent (default auto)
+    float bench_temp = 0.0f;            // --bench-temp: sampling temperature of --bench-concurrent (default greedy)
     int port = 8080;
     for (int i = 1; i < argc; i++) {
         std::string k = argv[i];
@@ -97,6 +117,15 @@ int main(int argc, char ** argv) {
         else if (k == "--npu-decode-slots") ep.npu_decode_slots = atoi(next());
         else if (k == "--prio")            ep.prio = atoi(next());
         else if (k == "--no-threadpool")   ep.threadpool = false;
+        else if (k == "--spec")            { std::string v = next(); ep.spec = v == "on" || v == "1" ? 1 : v == "off" || v == "0" ? 0 : -1; }
+        else if (k == "--spec-nmax")       ep.spec_nmax = atoi(next());
+        else if (k == "--spec-k")          { ep.spec_k.clear(); std::string v = next(); if (v == "auto") ep.spec_k = { -1 }; else { std::stringstream ss(v); for (std::string x; std::getline(ss, x, ',');) ep.spec_k.push_back(atoi(x.c_str())); } }
+        else if (k == "--draft-head")      ep.spec_draft_head = atoi(next());
+        else if (k == "-tb")               ep.threads_batch = atoi(next());
+        else if (k == "--bench-prompts")   bench_prompts = next();
+        else if (k == "--bench-mode")      bench_mode = next();
+        else if (k == "--bench-route")     bench_route = next();
+        else if (k == "--bench-temp")      bench_temp = (float) atof(next());
         else if (k == "--bench-routes")    bench_routes = next();
         else if (k == "-v")                g_verbose = true;
         else usage();
@@ -159,7 +188,19 @@ int main(int argc, char ** argv) {
     // --bench-concurrent N: N different prompts, first one after another, then all at once
     if (bench_conc > 0) {
         const char * words[] = { "the", "npu", "runs", "prompt", "prefill", "while", "cpu", "cores", "stream", "tokens", "from", "shared", "memory" };
+        // --bench-prompts f1,f2,...: request k sends the contents of file k mod n as its user message
+        std::vector<std::string> files;
+        {
+            std::stringstream ss(bench_prompts);
+            for (std::string f; std::getline(ss, f, ',');) {
+                if (f.empty()) continue;
+                std::ifstream in(f, std::ios::binary);
+                if (!in) { fprintf(stderr, "cannot read %s\n", f.c_str()); return 1; }
+                std::stringstream c; c << in.rdbuf(); files.push_back(c.str());
+            }
+        }
         auto prompt = [&](int k) {
+            if (!files.empty()) return files[k % files.size()];
             std::string doc = "Request " + std::to_string(k) + ": summarize these notes in three bullet points.\n\n";
             const int nw = bench_words_conc + 37 * k; // different lengths
             for (int i = 0; i < nw; i++) doc += std::string(words[(i * 7 + k * 3 + i / 13) % 13]) + ((i % 17 == 16) ? ".\n" : " ");
@@ -170,7 +211,7 @@ int main(int argc, char ** argv) {
             std::vector<std::string> txt(bench_conc);
             const double t0 = eng.now_ms();
             auto one = [&](int k) {
-                trilane::gen_params gp; gp.max_tokens = bench_gen; gp.temperature = 0;
+                trilane::gen_params gp; gp.max_tokens = bench_gen; gp.temperature = bench_temp; if (!bench_route.empty()) gp.route = bench_route; gp.seed = 1234 + k;
                 st[k] = eng.chat({ { "user", prompt(k) } }, gp, [&, k](const std::string & p) { txt[k] += p; return true; });
             };
             if (together) {
@@ -181,23 +222,40 @@ int main(int argc, char ** argv) {
                 for (int k = 0; k < bench_conc; k++) one(k);
             }
             const double wall = eng.now_ms() - t0;
-            int gen = 0, pre = 0;
+            int gen = 0, pre = 0, drafted = 0, accepted = 0;
+            double t_first = 1e30, t_last = 0; // decode window: first decode step to last finish (all requests)
             for (int k = 0; k < bench_conc; k++) {
                 auto & s = st[k];
-                gen += s.n_gen; pre += s.n_prefill;
-                printf("  #%-3lld prompt %5d on %-5s queue %7.0f ms | TTFT %7.0f ms | decode %5.1f t/s on %-8s (batch up to %d, slot %d) | %d tok (%d on NPU)\n",
+                gen += s.n_gen; pre += s.n_prefill; drafted += s.n_drafted; accepted += s.n_accepted;
+                t_first = std::min(t_first, s.t_decode_start_ms);
+                t_last  = std::max(t_last, s.t_decode_start_ms + s.decode_ms);
+                uint64_t hsh = 1469598103934665603ull; // FNV-1a of the full reply, for text identity checks
+                for (unsigned char ch : txt[k]) { hsh ^= ch; hsh *= 1099511628211ull; }
+                printf("  #%-3lld prompt %5d on %-5s queue %7.0f ms | TTFT %7.0f ms | decode %5.1f t/s on %-8s (batch up to %d, slot %d) | %d tok (%d on NPU) | drafted %d accepted %d (%.1f%%) in %d steps | text %016llx\n",
                        (long long) s.id, s.n_prompt, s.route.c_str(), s.queue_ms, s.ttft_ms,
-                       s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0, s.decode_dev.c_str(), s.batch_peak, s.slot, s.n_gen, s.n_gen_npu);
+                       s.decode_ms > 0 ? s.n_gen / (s.decode_ms / 1000.0) : 0.0, s.decode_dev.c_str(), s.batch_peak, s.slot, s.n_gen, s.n_gen_npu,
+                       s.n_drafted, s.n_accepted, s.n_drafted ? 100.0 * s.n_accepted / s.n_drafted : 0.0, s.n_steps, (unsigned long long) hsh);
                 std::string head = txt[k].substr(0, 70);
                 for (auto & ch : head) if (ch == '\n') ch = ' ';
                 printf("        text[%d] %s\n", k, head.c_str());
             }
-            printf("  => %s: wall %.1f s, %d prompt + %d generated tokens, aggregate %.1f generated t/s\n\n",
-                   together ? "concurrent" : "sequential", wall / 1000.0, pre, gen, gen / (wall / 1000.0));
+            printf("  => %s: wall %.1f s, %d prompt + %d generated tokens, aggregate %.1f generated t/s, decode window %.1f t/s, accepted %d of %d drafted (%.1f%%)\n\n",
+                   together ? "concurrent" : "sequential", wall / 1000.0, pre, gen, gen / (wall / 1000.0),
+                   t_last > t_first ? gen / ((t_last - t_first) / 1000.0) : 0.0, accepted, drafted, drafted ? 100.0 * accepted / drafted : 0.0);
             fflush(stdout);
         };
-        printf("=== %d requests, one after another\n", bench_conc); run(false);
-        printf("=== %d requests at once\n", bench_conc); run(true);
+        if (bench_mode != "conc") { printf("=== %d requests, one after another\n", bench_conc); run(false); }
+        if (bench_mode != "seq")  { printf("=== %d requests at once\n", bench_conc); run(true); }
+#ifdef _WIN32
+        {
+            PROCESS_MEMORY_COUNTERS pc = {}; pc.cb = sizeof(pc);
+            MEMORYSTATUSEX ms = {}; ms.dwLength = sizeof(ms);
+            GetProcessMemoryInfo(GetCurrentProcess(), &pc, sizeof(pc)); GlobalMemoryStatusEx(&ms);
+            printf("memory: peak working set %.2f GB, working set %.2f GB, free RAM now %.2f GB\n", pc.PeakWorkingSetSize / 1073741824.0,
+                   pc.WorkingSetSize / 1073741824.0, ms.ullAvailPhys / 1073741824.0);
+            fflush(stdout);
+        }
+#endif
         return 0;
     }
 
@@ -231,7 +289,7 @@ int main(int argc, char ** argv) {
             { "model", eng.model_name() }, { "split", eng.split() }, { "aliased", eng.aliased() },
             { "prefill_dev", eng.prefill_dev() }, { "phase", eng.live_phase() }, { "now_ms", eng.now_ms() },
             { "max_seqs", eng.max_seqs() }, { "npu_decode_slots", eng.npu_decode_slots() }, { "active", eng.active_slots() }, { "npu_queue", eng.npu_queue_len() },
-            { "keepwarm_pings", eng.keepwarm_pings() },
+            { "keepwarm_pings", eng.keepwarm_pings() }, { "spec_nmax", eng.spec_nmax() },
             { "router", { { "cpu_prefill_max", eng.cpu_prefill_max() }, { "cpu_fixed_ms", cost.cpu_fixed_ms }, { "cpu_tps", cost.cpu_tps }, { "npu_fixed_ms", cost.npu_fixed_ms }, { "npu_tps", cost.npu_tps }, { "cpu_corr", cost.cpu_corr }, { "npu_corr", cost.npu_corr } } },
             { "cache", { { "entries", eng.cache_entries() }, { "mb", eng.cache_bytes() / 1048576.0 } } },
             { "history", hist }, { "live", live },
