@@ -39,6 +39,16 @@ struct engine_params {
     bool   calibrate        = true;    // measure both lanes at startup and derive the routing threshold
     bool   threadpool       = true;    // persistent decode threads (else ggml spawns a thread pool for every decode step)
     int    prio             = 2;       // decode thread priority: 0 normal, 1 medium, 2 high (default), 3 realtime
+    int    threads_batch    = 0;       // CPU threads of multi-token decode batches (draft verification, MTP prompt
+                                       // catch-up); 0 = threads_decode + 2 with speculative decoding, else
+                                       // threads_decode. Single-token steps keep threads_decode.
+    // speculative decoding with the model's own MTP head (Qwen3.5 / Qwen3.8 GGUFs with nextn layers)
+    int    spec             = -1;      // -1 auto: on when the model has an MTP head; 0 off; 1 on (env TRILANE_SPEC=0|1 overrides)
+    int    spec_nmax        = 3;       // drafted tokens per step and slot with one slot decoding (the rollback depth)
+    std::vector<int> spec_k;           // drafted tokens per slot by number of decoding slots ({k1, k2, ...}, the last
+                                       // entry holds for more slots); empty = default table (see engine.cpp)
+    int    spec_draft_head  = -1;      // draft LM head over the first N token ids (+256 special); -1 auto (65536 for
+                                       // vocabularies >= 128K), 0 = full head
 };
 
 // prefill cost model per lane: t(n) = fixed_ms + n / tps * 1000
@@ -86,6 +96,9 @@ struct gen_stats {
     int         n_gen       = 0;
     double      npu_decode_ms = 0;     // part of decode_ms spent in an NPU decode slot
     int         n_gen_npu   = 0;       // tokens generated there
+    int         n_drafted   = 0;       // speculative decoding: tokens drafted by the MTP head for this request
+    int         n_accepted  = 0;       // drafted tokens the target model accepted
+    int         n_steps     = 0;       // CPU decode steps (target model passes) this request took part in
     std::string stop_reason;
 };
 
@@ -124,11 +137,46 @@ struct request {
     double               t_decode0 = 0;
     bool                 decoding  = false; // first token out; pos and timing carry over when the sequence changes lanes
 
+    // speculative decoding (CPU lane). The MTP context holds this slot's committed positions < mtp_pos0; the
+    // tokens from mtp_pos0 up to pos - 1 wait in mtp_tok, each paired with the target's hidden state of the
+    // position before it (mtp_h, one row per token); mtp_hlast is the hidden state of position pos - 1, which
+    // pairs with cur when the next draft starts.
+    std::vector<float>       h_prompt;      // target hidden states of the prefilled prompt tokens (n_prefill rows)
+    bool                     mtp_ok   = false;
+    int                      mtp_pos0 = 0;
+    std::vector<llama_token> mtp_tok;
+    std::vector<float>       mtp_h;
+    std::vector<float>       mtp_hlast;
+    std::vector<llama_token> draft;         // drafted continuation of cur for the next verification
+    bool                     mtp_fed  = false; // this step fed cur (at pos) into the MTP context as the draft start
+
     ~request();
     void push(std::string s);
     void finish(const std::string & reason);
 };
 using request_ptr = std::shared_ptr<request>;
+
+// Online choice of the draft length per number of decoding slots (speculative decoding, --spec-k auto). With
+// batch-invariant kernels the draft length does not change any token, so it can follow measured speed freely.
+// Expected tokens per slot and step for k drafts: 1 + sum_i prod_{m<=i} p_m, with p_m the acceptance rate of draft
+// position m given the earlier ones were accepted (all slots, all steps); step time per (slots, k) is an EWMA of the
+// measured wall time of whole steps (drafting + verification + sampling). Hill climb per slot count: the current
+// length and its two neighbours are measured (3 steps each), the fastest becomes current; every 128th step at a slot
+// count probes a neighbour again. A slot's first step (prompt catch-up) and stalls > 3x the estimate are not counted.
+struct spec_tuner {
+    int K = 0, S = 0;
+    std::vector<double> t_ms;    // [(a) * (K + 1) + k], -1 = unknown
+    std::vector<int>    n_obs;
+    std::vector<double> acc, tried; // per draft position 1..K (decayed counts)
+    std::vector<int>    steps, cur; // per slot count
+
+    void init(int k_max, int slots, const std::vector<int> & guess);
+    double expected(int k) const;
+    int  pick(int a);
+    void observe(int a, int k, double ms);
+    void observe_slot(int n_drafted, int n_accepted);
+    void dump() const;
+};
 
 class engine {
   public:
@@ -162,6 +210,8 @@ class engine {
     int64_t                keepwarm_pings() const { return pings_.load(); }
     lane_cost              cost() const { std::lock_guard<std::mutex> lk(cost_mtx_); return cost_; }
     int                    cpu_prefill_max() const { return params_.cpu_prefill_max; }
+    bool                   spec() const { return spec_; }
+    int                    spec_nmax() const { return spec_ ? params_.spec_nmax : 0; }
 
   private:
     struct cache_entry {
@@ -171,7 +221,10 @@ class engine {
 
     std::string apply_template(const std::vector<chat_msg> & msgs) const;
     std::vector<llama_token> tokenize(const std::string & text) const;
-    bool prefill(llama_context * c, const std::vector<llama_token> & toks, int from, llama_seq_id seq);
+    bool prefill(llama_context * c, const std::vector<llama_token> & toks, int from, llama_seq_id seq, std::vector<float> * h_out = nullptr);
+    void mtp_trim(const request_ptr & r, int slot);
+    void mtp_setup(const request_ptr & r, int slot);
+    bool mtp_draft(std::vector<request_ptr> & slots, const std::vector<int> & in_batch, const std::vector<int> & k_slot);
     int  cache_lookup(const std::vector<llama_token> & toks, std::vector<uint8_t> & state_out);
     void cache_insert(const std::vector<llama_token> & toks, const std::vector<uint8_t> & state);
     void learn(bool on_npu, int n, double ms);
@@ -196,7 +249,15 @@ class engine {
     llama_model *   md_ = nullptr;  // decode model (CPU)
     llama_context * cp_ = nullptr;  // owned by the NPU worker after load
     llama_context * cd_ = nullptr;  // owned by the CPU worker after load
-    ggml_threadpool_t tp_decode_ = nullptr; // persistent threads of cd_
+    ggml_threadpool_t tp_decode_ = nullptr; // persistent threads of cd_ (and cm_)
+    llama_context * cm_ = nullptr;  // MTP draft context (CPU worker), speculative decoding only
+    bool        spec_   = false;
+    bool        spec_auto_ = false;  // draft length chosen online (spec_tuner) instead of the spec_k table
+    spec_tuner  tuner_;
+    bool        batch_invariant_ = false; // GGML_CPU_BATCH_INVARIANT set for this process (MTP models)
+    int         n_embd_ = 0;        // width of the target hidden state rows the MTP head takes
+    int         n_vocab_ = 0;
+    int         draft_head_ = 0;    // draft logits cover ids [0, draft_head_) and the last 256 ids (0 = all)
     const llama_vocab * vocab_ = nullptr;
     bool        aliased_ = false;
     bool        dense_aliased_ = false;

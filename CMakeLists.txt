@@ -20,7 +20,7 @@ target_compile_options(trilane-httplib PRIVATE -w)
 target_link_libraries(trilane-httplib PUBLIC ws2_32)
 
 add_executable(trilane-server src/server.cpp src/engine.cpp)
-target_include_directories(trilane-server PRIVATE ${LLAMA_VENDOR})
+target_include_directories(trilane-server PRIVATE ${LLAMA_VENDOR} ${LLAMA_SRC}/src)
 target_link_libraries(trilane-server PRIVATE llama trilane-httplib)
 
 # E1: CPU read bandwidth of HTP0 rpcmem vs heap
@@ -35,3 +35,7 @@ find_library(LLAMA_COMMON_LIB NAMES llama-common PATHS ${CMAKE_PREFIX_PATH} PATH
 add_executable(trilane-spec src/spec_tool.cpp)
 target_include_directories(trilane-spec PRIVATE ${LLAMA_SRC}/common ${LLAMA_VENDOR})
 target_link_libraries(trilane-spec PRIVATE llama ${LLAMA_COMMON_LIB})
+
+# diagnostics: bit-identity of multi-token decode calls vs one token per call
+add_executable(trilane-bitcheck src/bitcheck.cpp)
+target_link_libraries(trilane-bitcheck PRIVATE llama)

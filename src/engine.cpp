@@ -1,6 +1,7 @@
 #include "engine.h"
 
 #include "ggml-alloc.h"
+#include "llama-ext.h"   // fork staging API: target hidden states for the MTP head (llama_set/get_embeddings_nextn)
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
@@ -96,6 +97,22 @@ static std::vector<std::string> exact_name_patterns(const std::vector<std::strin
     return pats;
 }
 
+// number of MTP (nextn) layers in a GGUF, 0 if none or unreadable
+static int gguf_nextn_layers(const std::string & path) {
+    gguf_init_params gp = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    if (!g) return 0;
+    int n = 0;
+    const int64_t ka = gguf_find_key(g, "general.architecture");
+    if (ka >= 0) {
+        const std::string key = std::string(gguf_get_val_str(g, ka)) + ".nextn_predict_layers";
+        const int64_t kn = gguf_find_key(g, key.c_str());
+        if (kn >= 0) n = (int) gguf_get_val_u32(g, kn);
+    }
+    gguf_free(g);
+    return n;
+}
+
 static bool has_experts(const llama_model * m) {
     char name[64];
     for (int i = 0; i < llama_model_n_layer(m); i++) {
@@ -159,6 +176,7 @@ engine::~engine() {
     if (cpu_thread_.joinable()) cpu_thread_.join();
     keepwarm_stop();
     // the aliased decode model points into the NPU model's buffers, so it must go first
+    if (cm_) llama_free(cm_);
     if (cd_ && cd_ != cp_) llama_free(cd_);
     if (md_ && md_ != mp_) llama_model_free(md_);
     if (cp_) llama_free(cp_);
@@ -206,6 +224,33 @@ bool engine::load(const engine_params & p) {
     llama_model_params dp = base_mparams();
     dp.devices = no_devs.data();
     dp.n_gpu_layers = 0;
+
+    // speculative decoding: on by default for models with an MTP head; models without one take the old path exactly
+    {
+        int spec = p.spec;
+        if (const char * e = getenv("TRILANE_SPEC")) spec = strcmp(e, "auto") == 0 ? -1 : atoi(e) != 0 ? 1 : 0;
+        const int nextn = gguf_nextn_layers(p.model);
+        // draft length per number of decoding slots; the rollback depth is the longest one
+        // default table {nmax, 1, 0}: measured best on Qwen3.5-2B and Qwen3.8-27B (drafting loses from 3-4 decoding
+        // slots on); spec_k = {-1} (--spec-k auto) lets the online tuner choose, seeded with the default table
+        spec_auto_ = params_.spec_k.size() == 1 && params_.spec_k[0] < 0;
+        if (params_.spec_k.empty() || spec_auto_) params_.spec_k = { p.spec_nmax, std::min(p.spec_nmax, 1), 0 };
+        params_.spec_nmax = 0;
+        for (int k : params_.spec_k) params_.spec_nmax = std::max(params_.spec_nmax, k);
+        spec_ = spec != 0 && nextn > 0 && params_.spec_nmax > 0;
+        // Batch-invariant CPU matmuls for MTP models (drafting on or off): the K-quant gemv and gemm kernels round
+        // differently, so without this a token's greedy choice could depend on how many rows its decode call carried
+        // (k + 1 when verifying drafts, one per slot when slots share a step). TRILANE_BATCH_INVARIANT=0 keeps the
+        // faster mixed kernels; models without an MTP head are not touched.
+        // On by default only while drafting is on: with --spec off / TRILANE_SPEC=0 the old kernels and the shared KV
+        // pool run exactly as before (TRILANE_BATCH_INVARIANT=1 forces the invariant kernels without drafting, the
+        // reference for text identity; =0 turns them off with drafting).
+        const char * bi = getenv("TRILANE_BATCH_INVARIANT");
+        batch_invariant_ = nextn > 0 && (bi ? atoi(bi) != 0 : spec_);
+        if (batch_invariant_ && !getenv("GGML_CPU_BATCH_INVARIANT")) _putenv_s("GGML_CPU_BATCH_INVARIANT", "1");
+        if (spec == 1 && nextn <= 0) fprintf(stderr, "[trilane] speculative decoding requested, but %s has no MTP head: off\n", p.model.c_str());
+        dp.load_mtp = spec_;
+    }
     static std::vector<std::string> alias_pats;
     static std::vector<llama_model_tensor_buft_override> alias_ovr;
     // a separate prefill file has its own tensor types, so the decode model cannot alias its weights
@@ -256,23 +301,81 @@ bool engine::load(const engine_params & p) {
 
     // prefill_only: the context only ever asks for one output per sequence (the last prompt token, or one NPU
     // decode step), so cap n_outputs_max instead of reserving an n_batch x n_vocab logits buffer (2 GB at 2048)
-    auto make_ctx = [&](llama_model * m, int threads, bool host_only, int n_seq, bool prefill_only) {
+    // verification batches (k + 1 tokens per slot) are compute-bound: two threads more than single-token steps measured
+    // +9% (2B) and +7% (27B split route) with one slot, +5% / +9% with two (3 interleaved rounds each)
+    const int tb = params_.threads_batch > 0 ? params_.threads_batch
+                 : spec_ ? std::min(params_.threads_decode + 2, std::max(params_.threads_decode, (int) std::thread::hardware_concurrency()))
+                         : params_.threads_decode;
+    params_.threads_batch = tb;
+    auto make_ctx = [&](llama_model * m, int threads, bool host_only, int n_seq, bool prefill_only, bool spec_tgt) {
         llama_context_params cp = llama_context_default_params();
+        if (spec_tgt) {
+            cp.n_rs_seq              = (uint32_t) params_.spec_nmax; // bounded recurrent-state rollback per slot
+            cp.n_outputs_max_per_seq = 0;                            // verification needs k+1 outputs per slot
+        }
         if (prefill_only) cp.n_outputs_max = (uint32_t) std::max(1, n_seq);
         cp.n_ctx           = params_.n_ctx * n_seq;
         cp.n_batch         = params_.n_batch;
         cp.n_ubatch        = params_.n_ubatch;
+        if (spec_tgt && dense_aliased_) {
+            // the CPU lane of an aliased dense model never prefills (cpu_prefill_max = 0), it only sees decode and
+            // verification steps: a small compute buffer leaves room for the MTP context (~1 GB less on 27B at 4096)
+            cp.n_batch = cp.n_ubatch = std::max(64, n_seq * (1 + params_.spec_nmax));
+        }
         cp.n_seq_max       = n_seq;
         cp.kv_unified      = true;   // slots share one cell pool
+        // batch-invariant decoding (MTP models): one KV stream per slot. In a shared pool a slot's cells can sit out
+        // of position order (cells freed by rolled-back drafts are reused first), and attention sums cells in cache
+        // order with f16 accumulation, so a token's logits depended on the other slots; a stream per slot keeps
+        // every slot's cells in position order, as when it decodes alone (TRILANE_SPEC_KVU=1: shared pool)
+        if (host_only && n_seq > 1 && batch_invariant_ && !getenv("TRILANE_SPEC_KVU")) cp.kv_unified = false;
         cp.n_threads       = threads;
         cp.n_threads_batch = threads;
         cp.no_perf         = true;
         cp.op_offload      = !host_only;
         return llama_init_from_model(m, cp);
     };
-    cd_ = make_ctx(md_, params_.threads_decode, true, params_.max_seqs, false);
-    cp_ = mp_ != md_ ? make_ctx(mp_, params_.threads_prefill, false, 1, true) : cd_;
+    cd_ = make_ctx(md_, params_.threads_decode, true, params_.max_seqs, false, spec_);
+    cp_ = mp_ != md_ ? make_ctx(mp_, params_.threads_prefill, false, 1, true, false) : cd_;
     if (!cd_ || !cp_) return false;
+
+    if (spec_) {
+        // MTP draft context on the decode model: one sequence per slot, plain attention cache (no recurrent state)
+        llama_context_params cp = llama_context_default_params();
+        cp.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+        cp.n_ctx           = params_.n_ctx * params_.max_seqs;
+        cp.n_batch         = params_.n_batch;
+        cp.n_ubatch        = std::min(512, params_.n_batch);
+        cp.n_seq_max       = params_.max_seqs;
+        cp.kv_unified      = true;
+        cp.n_threads       = params_.threads_decode;
+        cp.n_threads_batch = tb;
+        cp.no_perf         = true;
+        cp.op_offload      = false;
+        cm_ = llama_init_from_model(md_, cp);
+        if (!cm_) {
+            fprintf(stderr, "[trilane] cannot create the MTP draft context: speculative decoding off\n");
+            spec_ = false;
+        } else {
+            n_embd_  = llama_model_n_embd_out(md_);
+            n_vocab_ = llama_vocab_n_tokens(llama_model_get_vocab(md_));
+            int dh = params_.spec_draft_head < 0 ? (n_vocab_ >= 131072 ? 65536 : 0) : params_.spec_draft_head;
+            if (dh + 256 >= n_vocab_) dh = 0;
+            draft_head_ = dh;
+            if (dh > 0) llama_set_draft_head(cm_, dh, 256);
+            llama_set_embeddings_nextn(cd_, true, /*masked*/ false); // hidden rows of every verified token
+            llama_set_embeddings_nextn(cm_, true, /*masked*/ true);  // the MTP head chains its own hidden state
+            if (cp_ != cd_) llama_set_embeddings_nextn(cp_, true, /*masked*/ false); // prompt rows of the NPU prefill
+            std::string ks;
+            for (size_t i = 0; i < params_.spec_k.size(); i++) ks += (i ? "," : "") + std::to_string(params_.spec_k[i]);
+            fprintf(stderr, "[trilane] speculative decoding: MTP head, drafted tokens per slot by decoding slots %s (last holds for more), draft head %s, verification threads %d\n",
+                    ks.c_str(), dh > 0 ? (std::to_string(dh) + ":256").c_str() : "full", tb);
+        }
+    } else {
+        fprintf(stderr, "[trilane] speculative decoding: off\n");
+    }
+    if (spec_ && spec_auto_) tuner_.init(params_.spec_nmax, params_.max_seqs, params_.spec_k);
+    if (batch_invariant_) fprintf(stderr, "[trilane] batch-invariant CPU matmuls on (TRILANE_BATCH_INVARIANT=0 turns them off)\n");
 
     // Without an attached thread pool, ggml creates and joins a new pool of worker threads for every graph,
     // i.e. for every decode step. A persistent pool keeps them (polling between steps, like llama-bench).
@@ -280,7 +383,9 @@ bool engine::load(const engine_params & p) {
         ggml_backend_reg_t cpu = ggml_backend_reg_by_name("CPU");
         auto tp_new = cpu ? (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(cpu, "ggml_threadpool_new") : nullptr;
         if (tp_new) {
-            ggml_threadpool_params tpp = ggml_threadpool_params_default(params_.threads_decode);
+            // with speculative decoding, verification batches may use more threads (threads_batch): one pool of the
+            // larger size, every graph runs on its own thread count and the spare threads sleep
+            ggml_threadpool_params tpp = ggml_threadpool_params_default(spec_ ? std::max(params_.threads_decode, tb) : params_.threads_decode);
             tpp.prio = (enum ggml_sched_priority) params_.prio;
 #ifdef _WIN32
             // ggml_threadpool_new also applies the pool priority to the calling thread (this one, which later runs
@@ -293,6 +398,7 @@ bool engine::load(const engine_params & p) {
 #endif
         }
         if (tp_decode_) llama_attach_threadpool(cd_, tp_decode_, nullptr);
+        if (tp_decode_ && cm_) llama_attach_threadpool(cm_, tp_decode_, nullptr);
         fprintf(stderr, "[trilane] decode thread pool: %s (%d threads, prio %d)\n", tp_decode_ ? "persistent" : "FAILED, per-step", params_.threads_decode, params_.prio);
     }
 
@@ -377,12 +483,27 @@ std::vector<llama_token> engine::tokenize(const std::string & text) const {
     return toks;
 }
 
+// The MTP head catches up on the most recent TRILANE_MTP_WINDOW (default 1024) positions only. A slot that does not
+// draft for a long time (3+ decoding slots with the default table) or a long prompt would otherwise keep one hidden
+// row per token and replay all of them through the MTP layer in one step, stalling every slot. Older positions are
+// left out of the MTP cache: that only changes the drafts, never the text.
+static size_t mtp_window() {
+    static const size_t w = [] { const char * e = getenv("TRILANE_MTP_WINDOW"); return e ? (size_t) std::max(16, atoi(e)) : (size_t) 1024; }();
+    return w;
+}
+
 // prefill toks[from..] at positions from.. into sequence seq, logits for the last token only; false on a failed decode
-bool engine::prefill(llama_context * c, const std::vector<llama_token> & toks, int from, llama_seq_id seq) {
-    const int nb = params_.n_batch;
+bool engine::prefill(llama_context * c, const std::vector<llama_token> & toks, int from, llama_seq_id seq, std::vector<float> * h_out) {
+    // the context's own batch limit: a dense-aliased decode context with drafting has a small n_batch
+    const int nb = std::min(params_.n_batch, (int) llama_n_batch(c));
     llama_batch b = llama_batch_init(nb, 0, 1);
+    // the MTP head only catches up on the last mtp_window() prompt tokens (each paired with the hidden row before it):
+    // h_out keeps the rows of the chunks that reach them. (Switching the hidden-row output off for the other chunks
+    // cost ~180 ms of first-token time on the NPU context: its graph is rebuilt.)
+    const int need_from = h_out ? std::max(from, (int) toks.size() - (int) mtp_window() - 1) : (int) toks.size();
     for (int i0 = from; i0 < (int) toks.size(); i0 += nb) {
         const int n = std::min(nb, (int) toks.size() - i0);
+        const bool need = h_out && i0 + n > need_from;
         b.n_tokens = n;
         for (int j = 0; j < n; j++) {
             b.token[j] = toks[i0 + j]; b.pos[j] = i0 + j; b.n_seq_id[j] = 1; b.seq_id[j][0] = seq;
@@ -392,6 +513,12 @@ bool engine::prefill(llama_context * c, const std::vector<llama_token> & toks, i
             fprintf(stderr, "[trilane] prefill decode failed at token %d\n", i0);
             llama_batch_free(b);
             return false;
+        }
+        if (need) {
+            // target hidden states of this chunk, for the MTP head's prompt catch-up on the CPU lane
+            llama_synchronize(c);
+            const float * h = llama_get_embeddings_nextn(c);
+            if (h) h_out->insert(h_out->end(), h, h + (size_t) n * n_embd_);
         }
     }
     llama_synchronize(c);
@@ -636,6 +763,8 @@ void engine::npu_overflow(const request_ptr & r) {
         r->st.handoff_ms += now_ms() - t0;
         r->blob.clear();
         r->blob.shrink_to_fit();
+        r->h_prompt.clear();          // decoded on the NPU: the CPU lane's MTP head cannot catch up with it
+        r->h_prompt.shrink_to_fit();
         npu_decode(r, true);
     }
     keepwarm_pause(false);
@@ -674,7 +803,7 @@ void engine::npu_worker() {
         r->st.queue_ms   = r->st.t_start_ms - r->st.t_submit_ms;
         llama_memory_clear(llama_get_memory(cp_), true);
         const bool restored = r->restore.empty() || llama_state_seq_set_data(cp_, r->restore.data(), r->restore.size(), 0) > 0;
-        if (!restored || !prefill(cp_, r->toks, restored ? r->st.n_cached : 0, 0)) {
+        if (!restored || !prefill(cp_, r->toks, r->st.n_cached, 0,spec_ && r->st.route != "npu" ? &r->h_prompt : nullptr)) {
             llama_memory_clear(llama_get_memory(cp_), true);
             keepwarm_pause(false);
             npu_busy_ = false;
@@ -714,20 +843,233 @@ void engine::npu_worker() {
     }
 }
 
+// --- speculative decoding with the MTP head (CPU lane) ---
+//
+// Per step, every decoding slot drafts k tokens with the model's MTP head (all slots batched in each MTP pass), then
+// the target model verifies cur + k drafts of every slot in ONE decode call (all slots have the same k + 1 tokens, so
+// the hybrid memory keeps them in one ubatch; a slot that does not draft pads with copies of cur). Each slot keeps the
+// longest drafted prefix that matches what its own sampler draws from the target logits at those positions
+// (llama.cpp common's sample-and-match rule; greedy: identical text, sampled: the same distribution), and rolls its
+// recurrent state back over the rest (n_rs_seq snapshots per slot, pending rollback index per sequence).
+
+void engine::mtp_trim(const request_ptr & r, int slot) {
+    if (r->mtp_tok.size() <= mtp_window()) return;
+    const size_t drop = r->mtp_tok.size() - mtp_window();
+    llama_memory_seq_rm(llama_get_memory(cm_), slot, r->mtp_pos0, -1);  // drafted cells of an earlier step
+    r->mtp_tok.erase(r->mtp_tok.begin(), r->mtp_tok.begin() + drop);
+    r->mtp_h.erase(r->mtp_h.begin(), r->mtp_h.begin() + drop * n_embd_);
+    r->mtp_pos0 += (int) drop;
+}
+
+// the prompt hidden states of a freshly admitted request become its first MTP catch-up
+void engine::mtp_setup(const request_ptr & r, int slot) {
+    llama_memory_seq_rm(llama_get_memory(cm_), slot, -1, -1);
+    r->mtp_ok = false;
+    r->draft.clear();
+    r->mtp_tok.clear();
+    r->mtp_h.clear();
+    const int n = (int) r->toks.size(), c = r->st.n_cached;
+    const size_t rows = (size_t) (n - c);
+    // h_prompt holds the hidden rows of the last `have` prefilled tokens (prefill skips chunks outside the MTP window)
+    const size_t have = r->h_prompt.size() / n_embd_;
+    // a sequence that already decoded on the NPU has positions the MTP head never saw: it does not draft
+    if (!r->decoding && have > 0 && have <= rows && r->h_prompt.size() == have * n_embd_) {
+        r->mtp_pos0 = n - (int) have;
+        r->mtp_tok.assign(r->toks.end() - have, r->toks.end());
+        r->mtp_h.assign(n_embd_, 0.0f);    // the token at mtp_pos0 pairs with the hidden state before it: unknown here
+        r->mtp_h.insert(r->mtp_h.end(), r->h_prompt.begin(), r->h_prompt.end() - n_embd_);
+        r->mtp_hlast.assign(r->h_prompt.end() - n_embd_, r->h_prompt.end());
+        r->mtp_ok = true;
+        mtp_trim(r, slot);
+    }
+    r->h_prompt.clear();
+    r->h_prompt.shrink_to_fit();
+}
+
+static int argmax_draft(const float * lg, int n_vocab, int n_head) {
+    int best = 0;
+    float bv = lg[0];
+    const int n0 = n_head > 0 ? n_head : n_vocab;
+    for (int i = 1; i < n0; i++) if (lg[i] > bv) { bv = lg[i]; best = i; }
+    if (n_head > 0) for (int i = std::max(n0, n_vocab - 256); i < n_vocab; i++) if (lg[i] > bv) { bv = lg[i]; best = i; }
+    return best;
+}
+
+// Feeds every drafting slot's pending tokens into the MTP context, then drafts k_slot[s] tokens per slot: the first
+// MTP pass carries the catch-up plus each slot's draft start (cur at pos, paired with the target hidden state of pos - 1),
+// every further pass one token per slot. Fills r->draft; false if an MTP decode failed (no drafts this step).
+bool engine::mtp_draft(std::vector<request_ptr> & slots, const std::vector<int> & in_batch, const std::vector<int> & k_slot) {
+    struct ent { llama_token tok; llama_pos pos; int s; const float * h; };
+    std::vector<ent> pend, starts;
+    llama_memory_t mm = llama_get_memory(cm_);
+    for (int s : in_batch) {
+        request_ptr & r = slots[s];
+        r->mtp_fed = false;
+        r->draft.clear();
+        if (!r->mtp_ok || k_slot[s] <= 0) continue;
+        llama_memory_seq_rm(mm, s, r->mtp_pos0, -1);   // drafted positions of the previous step
+        for (size_t i = 0; i < r->mtp_tok.size(); i++) pend.push_back({ r->mtp_tok[i], r->mtp_pos0 + (llama_pos) i, s, r->mtp_h.data() + i * n_embd_ });
+        starts.push_back({ r->cur, r->pos, s, r->mtp_hlast.data() });
+    }
+    if (starts.empty()) return true;
+
+    llama_batch_ext * mb = llama_batch_ext_init(cm_);
+    const int nb = (int) llama_n_batch(cm_);
+    auto add = [&](const ent & e, bool out) {
+        const int32_t idx = llama_batch_ext_add_token(mb, e.s, e.tok);
+        llama_batch_ext_set_pos(mb, idx, &e.pos);
+        llama_batch_ext_set_embd_state(mb, idx, { e.h, 1, (size_t) n_embd_ });
+        if (out) llama_batch_ext_set_output_logits(mb, idx, true);
+        return idx;
+    };
+    bool ok = true;
+    // long catch-ups (a new prompt) go first in n_batch chunks; the last call also carries the draft starts
+    size_t i0 = 0;
+    while (ok && pend.size() - i0 + starts.size() > (size_t) nb) {
+        const size_t n = std::min((size_t) nb, pend.size() - i0);
+        llama_batch_ext_clear(mb);
+        for (size_t i = i0; i < i0 + n; i++) add(pend[i], false);
+        ok = llama_process(cm_, LLAMA_PROCESS_TYPE_DECODE, mb) == 0;
+        i0 += n;
+    }
+    std::vector<int32_t> out(starts.size());
+    if (ok) {
+        llama_batch_ext_clear(mb);
+        for (size_t i = i0; i < pend.size(); i++) add(pend[i], false);
+        for (size_t e = 0; e < starts.size(); e++) out[e] = add(starts[e], true);
+        ok = llama_process(cm_, LLAMA_PROCESS_TYPE_DECODE, mb) == 0;
+    }
+    if (ok) {
+        for (const ent & e : starts) {
+            request_ptr & r = slots[e.s];
+            r->mtp_fed = true;              // committed through pos; the drafted positions after it are dropped next step
+            r->mtp_tok.clear();
+            r->mtp_h.clear();
+            r->mtp_pos0 = r->pos + 1;
+        }
+    }
+    // draft passes: one token per slot that still needs one, chained on the MTP head's own hidden state
+    std::vector<float> hbuf(starts.size() * n_embd_);
+    while (ok) {
+        std::vector<size_t> next;
+        for (size_t e = 0; e < starts.size(); e++) {
+            if (out[e] < 0) continue;
+            request_ptr & r = slots[starts[e].s];
+            const float * lg = llama_get_logits_ith(cm_, out[e]);
+            const float * h  = llama_get_embeddings_nextn_ith(cm_, out[e]);
+            if (!lg || !h) { ok = false; break; }
+            r->draft.push_back(argmax_draft(lg, n_vocab_, draft_head_));
+            if ((int) r->draft.size() < k_slot[starts[e].s]) {
+                std::memcpy(hbuf.data() + e * n_embd_, h, sizeof(float) * n_embd_);
+                next.push_back(e);
+            }
+            out[e] = -1;
+        }
+        if (!ok || next.empty()) break;
+        llama_batch_ext_clear(mb);
+        for (size_t e : next) {
+            request_ptr & r = slots[starts[e].s];
+            out[e] = add({ r->draft.back(), (llama_pos) (r->pos + r->draft.size()), starts[e].s, hbuf.data() + e * n_embd_ }, true);
+        }
+        ok = llama_process(cm_, LLAMA_PROCESS_TYPE_DECODE, mb) == 0;
+    }
+    llama_batch_ext_free(mb);
+    if (!ok) {
+        fprintf(stderr, "[trilane] MTP draft decode failed; this step decodes without drafts\n");
+        for (const ent & e : starts) slots[e.s]->draft.clear();
+    }
+    return ok;
+}
+
+void spec_tuner::init(int k_max, int slots, const std::vector<int> & guess) {
+    K = k_max; S = slots;
+    t_ms.assign((size_t) (S + 1) * (K + 1), -1.0);
+    n_obs.assign(t_ms.size(), 0);
+    acc.assign(K + 1, 0.0);
+    tried.assign(K + 1, 0.0);
+    steps.assign(S + 1, 0);
+    cur.assign(S + 1, 0);
+    for (int a = 1; a <= S; a++) cur[a] = guess.empty() ? K : guess[std::min((size_t) a, guess.size()) - 1];
+}
+
+double spec_tuner::expected(int k) const {
+    double e = 1.0, run = 1.0;
+    for (int i = 1; i <= k; i++) {
+        run *= (acc[i] + 1.0) / (tried[i] + 2.0);
+        e += run;
+    }
+    return e;
+}
+
+int spec_tuner::pick(int a) {
+    a = std::max(1, std::min(a, S));
+    const int base = a * (K + 1);
+    steps[a]++;
+    // hill climb: measure the current length and its two neighbours, move to the fastest of the three
+    for (int k : { cur[a], cur[a] - 1, cur[a] + 1 }) {
+        if (k >= 0 && k <= K && n_obs[base + k] < 3) return k;
+    }
+    int best = cur[a];
+    double best_tps = -1;
+    for (int k = std::max(0, cur[a] - 1); k <= std::min(K, cur[a] + 1); k++) {
+        const double tps = a * expected(k) / t_ms[base + k];
+        if (tps > best_tps) { best_tps = tps; best = k; }
+    }
+    cur[a] = best;
+    if (steps[a] % 128 == 0) {  // probe a neighbour now and then so its step time stays current
+        int p = best + (((steps[a] / 128) & 1) ? 1 : -1);
+        if (p < 0) p = best + 1;
+        if (p > K) p = best - 1;
+        return std::max(0, std::min(K, p));
+    }
+    return best;
+}
+
+void spec_tuner::observe(int a, int k, double ms) {
+    a = std::max(1, std::min(a, S));
+    const int i = a * (K + 1) + k;
+    if (n_obs[i] >= 3 && ms > 3.0 * t_ms[i]) return;   // a stall (admission, CPU prefill, clock dip), not the step
+    t_ms[i] = t_ms[i] < 0 ? ms : 0.85 * t_ms[i] + 0.15 * ms;
+    n_obs[i]++;
+}
+
+void spec_tuner::dump() const {
+    fprintf(stderr, "[spec-tuner] p:");
+    for (int i = 1; i <= K; i++) fprintf(stderr, " %.2f", (acc[i] + 1.0) / (tried[i] + 2.0));
+    for (int a = 1; a <= S; a++) {
+        if (!steps[a]) continue;
+        fprintf(stderr, " | %d slots: k=%d, ms", a, cur[a]);
+        for (int k = 0; k <= K; k++) fprintf(stderr, " %.1f", t_ms[a * (K + 1) + k]);
+    }
+    fprintf(stderr, "\n");
+}
+
+void spec_tuner::observe_slot(int n_drafted, int n_accepted) {
+    for (int i = 1; i <= std::min(n_drafted, K); i++) {
+        if (i > n_accepted + 1) break;
+        tried[i] = 0.998 * tried[i] + 1.0;
+        acc[i]   = 0.998 * acc[i] + (i <= n_accepted ? 1.0 : 0.0);
+    }
+}
+
 // CPU lane: continuous batching. Admit prefilled requests into free slots between steps, then decode
-// one token for every active slot in a single batch.
+// one token for every active slot in a single batch (with speculative decoding: cur + k drafts per slot).
 void engine::cpu_worker() {
     if (tp_decode_) decode_thread_like_pool(params_.prio); // per-step pools (--no-threadpool): unchanged
     const int S = params_.max_seqs;
+    const int K = spec_ ? params_.spec_nmax : 0;
     std::vector<request_ptr> slots(S);
-    llama_batch b = llama_batch_init(S, 0, 1);
+    llama_batch b = llama_batch_init(S * (1 + K), 0, 1);
     llama_memory_t mem = llama_get_memory(cd_);
+    llama_memory_t mem_mtp = cm_ ? llama_get_memory(cm_) : nullptr;
 
     auto finish_slot = [&](int s) {
         request_ptr r = slots[s];
         if (!r->pending.empty()) { r->push(r->pending); r->pending.clear(); }
         r->st.decode_ms = now_ms() - r->t_decode0;
         llama_memory_seq_rm(mem, s, -1, -1);
+        if (mem_mtp) llama_memory_seq_rm(mem_mtp, s, -1, -1);
+        if (spec_auto_ && getenv("TRILANE_SPEC_DEBUG")) tuner_.dump();
         slots[s].reset();
         n_active_--;
         record(r);
@@ -771,7 +1113,7 @@ void engine::cpu_worker() {
                 r->st.t_start_ms = t0;
                 r->st.queue_ms   = t0 - r->st.t_submit_ms;
                 const bool restored = r->restore.empty() || llama_state_seq_set_data(cd_, r->restore.data(), r->restore.size(), s) > 0;
-                if (!restored || !prefill(cd_, r->toks, restored ? r->st.n_cached : 0, s)) {
+                if (!restored || !prefill(cd_, r->toks, restored ? r->st.n_cached : 0, s, spec_ ? &r->h_prompt : nullptr)) {
                     llama_memory_seq_rm(mem, s, -1, -1);
                     r->st.stop_reason = "prefill_error";
                     record(r);
@@ -787,6 +1129,7 @@ void engine::cpu_worker() {
                 r->restore.clear();
                 r->restore.shrink_to_fit();
             }
+            if (spec_) mtp_setup(r, s);
             r->st.slot = s;
             r->st.t_cpu_join_ms = now_ms();
             set_live(r, "CPU" + std::to_string(s), "decode");
@@ -810,26 +1153,127 @@ void engine::cpu_worker() {
             if (!r) continue;
             if (should_stop(r)) { finish_slot(s); continue; }
             emit(r);
-            const int i = b.n_tokens++;
-            b.token[i] = r->cur; b.pos[i] = r->pos++; b.n_seq_id[i] = 1; b.seq_id[i][0] = s; b.logits[i] = 1;
             in_batch.push_back(s);
         }
-        if (b.n_tokens == 0) continue;
+        if (in_batch.empty()) continue;
+
+        // drafts: k tokens per slot (0 = plain step), capped by what the request may still emit
+        int k = 0;
+        std::vector<int> k_slot(S, 0);
+        const double t_step0 = now_ms();
+        bool fresh = false;   // a slot's first step carries its prompt catch-up: not a typical step time
+        for (int s : in_batch) fresh = fresh || slots[s]->st.n_steps == 0;
+        const int k_step = !spec_ ? 0 : spec_auto_ ? tuner_.pick((int) in_batch.size())
+                                                   : params_.spec_k[std::min(in_batch.size(), params_.spec_k.size()) - 1];
+        if (k_step > 0) {
+            // every slot of the step carries 1 + k tokens (non-drafting slots pad with cur), and each slot's KV stream
+            // holds n_ctx cells: a slot near the end of its context caps the step's k for all slots
+            int k_cap = k_step;
+            for (int s : in_batch) k_cap = std::min(k_cap, params_.n_ctx - 1 - slots[s]->pos);
+            for (int s : in_batch) {
+                request_ptr & r = slots[s];
+                if (!r->mtp_ok) continue;
+                const int left = std::min(r->gp.max_tokens - r->st.n_gen, k_cap);
+                k_slot[s] = std::max(0, std::min(k_step, left));
+                k = std::max(k, k_slot[s]);
+            }
+        }
+        if (spec_) {
+            for (int s : in_batch) { slots[s]->draft.clear(); slots[s]->mtp_fed = false; }
+            if (k > 0) {
+                { std::lock_guard<std::mutex> lk(live_mtx_); cpu_phase_ = "draft x" + std::to_string(in_batch.size()); }
+                if (!mtp_draft(slots, in_batch, k_slot)) k = 0;
+            }
+        }
+
+        std::vector<int> base(S, -1);
+        for (int s : in_batch) {
+            request_ptr & r = slots[s];
+            base[s] = b.n_tokens;
+            const int nd = (int) r->draft.size();
+            for (int i = 0; i <= k; i++) {
+                const int j = b.n_tokens++;
+                // a slot with fewer drafts pads with cur: equal token counts keep all slots in one ubatch
+                b.token[j] = i == 0 ? r->cur : i <= nd ? r->draft[i - 1] : r->cur;
+                b.pos[j] = r->pos + i; b.n_seq_id[j] = 1; b.seq_id[j][0] = s; b.logits[j] = 1;
+            }
+        }
         {
             std::lock_guard<std::mutex> lk(live_mtx_);
-            cpu_phase_ = "decode x" + std::to_string(b.n_tokens);
+            cpu_phase_ = "decode x" + std::to_string(in_batch.size()) + (k > 0 ? " (+" + std::to_string(k) + " drafted each)" : "");
         }
+        const bool more_threads = k > 0 && params_.threads_batch != params_.threads_decode;
+        if (more_threads) llama_set_n_threads(cd_, params_.threads_decode, params_.threads_batch);
         const double t_dec = now_ms();
-        if (llama_decode(cd_, b) != 0) {
+        const int rc = llama_decode(cd_, b);
+        if (more_threads) llama_set_n_threads(cd_, params_.threads_decode, params_.threads_decode);
+        if (rc != 0) {
             for (int s : in_batch) { slots[s]->st.stop_reason = "decode_error"; finish_slot(s); }
             continue;
         }
         const double dt_dec = now_ms() - t_dec;
         for (int s : in_batch) slots[s]->st.decode_llama_ms += dt_dec;
-        for (int i = 0; i < (int) in_batch.size(); i++) {
-            request_ptr & r = slots[in_batch[i]];
-            r->cur = llama_sampler_sample(r->smpl, cd_, i);
-            r->st.batch_peak = std::max(r->st.batch_peak, (int) in_batch.size());
+        if (!spec_) {
+            for (int i = 0; i < (int) in_batch.size(); i++) {
+                request_ptr & r = slots[in_batch[i]];
+                r->pos++;
+                r->cur = llama_sampler_sample(r->smpl, cd_, i);
+                r->st.batch_peak = std::max(r->st.batch_peak, (int) in_batch.size());
+            }
+        } else {
+            const float * H = llama_get_embeddings_nextn(cd_);   // target hidden state of every batch token
+            for (int s : in_batch) {
+                request_ptr & r = slots[s];
+                r->st.batch_peak = std::max(r->st.batch_peak, (int) in_batch.size());
+                r->st.n_steps++;
+                const int nd = (int) r->draft.size(), b0 = base[s];
+                // longest drafted prefix the slot's own sampler reproduces from the target logits
+                int j = 0;
+                llama_token t = llama_sampler_sample(r->smpl, cd_, b0);
+                while (j < nd && t == r->draft[j] && !llama_vocab_is_eog(vocab_, t)) {
+                    j++;
+                    t = llama_sampler_sample(r->smpl, cd_, b0 + j);
+                }
+                r->st.n_drafted  += nd;
+                r->st.n_accepted += j;
+                if (spec_auto_ && nd > 0) tuner_.observe_slot(nd, j);
+                const llama_token cur_old = r->cur;
+                const int pos_old = r->pos;
+                if (r->mtp_ok) {
+                    if (!H) {
+                        r->mtp_ok = false;
+                    } else {
+                        if (!r->mtp_fed) {   // cur was not fed to the MTP head this step: it waits with the rest
+                            r->mtp_tok.push_back(cur_old);
+                            r->mtp_h.insert(r->mtp_h.end(), r->mtp_hlast.begin(), r->mtp_hlast.end());
+                        }
+                        for (int i = 0; i < j; i++) {
+                            r->mtp_tok.push_back(r->draft[i]);
+                            r->mtp_h.insert(r->mtp_h.end(), H + (size_t) (b0 + i) * n_embd_, H + (size_t) (b0 + i + 1) * n_embd_);
+                        }
+                        mtp_trim(r, s);
+                        r->mtp_hlast.assign(H + (size_t) (b0 + j) * n_embd_, H + (size_t) (b0 + j + 1) * n_embd_);
+                    }
+                }
+                r->pos = pos_old + 1 + j;
+                // drop the rejected drafts and pads: bounded recurrent-state rollback (at most k positions)
+                if (j < k && !llama_memory_seq_rm(mem, s, r->pos, -1)) {
+                    fprintf(stderr, "[trilane] rollback failed in slot %d\n", s);
+                    r->st.stop_reason = "decode_error";
+                    finish_slot(s);
+                    continue;
+                }
+                bool stopped = false;
+                for (int i = 0; i < j; i++) {
+                    r->cur = r->draft[i];
+                    if (should_stop(r)) { finish_slot(s); stopped = true; break; }
+                    emit(r);
+                }
+                if (stopped) continue;
+                r->cur = t;
+                r->draft.clear();
+            }
+            if (spec_auto_ && k == k_step && !fresh) tuner_.observe((int) in_batch.size(), k, now_ms() - t_step0);
         }
         if (n_active_ == 0) { std::lock_guard<std::mutex> lk(live_mtx_); cpu_phase_ = "idle"; }
     }
