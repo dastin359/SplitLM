@@ -12,6 +12,7 @@
 //   --spec-async         draft-model mode: keep drafting on the draft context while the target verifies
 //   --adaptive           pick the draft length online (acceptance estimate x measured draft/verify times)
 
+#include <thread>
 #include "llama.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -60,7 +61,8 @@ struct args {
     std::string draft_dev = "CPU";  // --draft-dev: device of the draft context
     int draft_threads = 0;          // --draft-threads: CPU threads of the draft context (0 = -t)
     int threads_batch = 0;          // -tb: CPU threads for multi-token batches (verification, MTP catch-up) of the decode
-                                    // and MTP contexts (0 = -t); the 2-4-token verify GEMMs are compute-bound
+                                    // and MTP contexts (0 = auto: -t + 2 when weights are aliased to the NPU tiles, whose
+                                    // 2-4-token verify GEMMs are compute-bound; else -t)
 
     int draft_head_n = -1, draft_head_tail = 256; // --draft-head N[:T]; -1 = auto (see apply_draft_head)
     bool spec_async = false;        // --spec-async
@@ -488,7 +490,6 @@ int main(int argc, char ** argv) {
         a.repack_budget_mb = !e ? 0 : strcmp(e, "auto") == 0 ? -1 : atoll(e);
     }
     if (a.draft_threads <= 0) a.draft_threads = a.threads;
-    if (a.threads_batch <= 0) a.threads_batch = a.threads;
     if (a.spec_type == "draft-model" && a.draft_model.empty()) { fprintf(stderr, "--spec-type draft-model needs --draft-model\n"); return 1; }
     if (a.spec_async && a.spec_type != "draft-model") { fprintf(stderr, "--spec-async is implemented for --spec-type draft-model only\n"); return 1; }
 
@@ -593,6 +594,9 @@ int main(int argc, char ** argv) {
     print_mem("decode model loaded");
     if (n_alias > 0 && avail_mib() >= 0 && avail_mib() < 3072)
         fprintf(stderr, "[spec] WARNING: only %.0f MiB RAM free after loading; lower --repack-budget or --alias\n", avail_mib());
+    if (a.threads_batch <= 0)
+        a.threads_batch = n_alias > 0 ? std::min(a.threads + 2, std::max(a.threads, (int) std::thread::hardware_concurrency())) : a.threads;
+    fprintf(stderr, "[spec] threads: %d decode, %d multi-token batches\n", a.threads, a.threads_batch);
     if (!mp) mp = md;
 
     // ---- spec2: a second model in memory (draft), on its own device ----
