@@ -222,6 +222,7 @@ class engine {
     std::string apply_template(const std::vector<chat_msg> & msgs) const;
     std::vector<llama_token> tokenize(const std::string & text) const;
     bool prefill(llama_context * c, const std::vector<llama_token> & toks, int from, llama_seq_id seq, std::vector<float> * h_out = nullptr);
+    void mtp_trim(const request_ptr & r, int slot);
     void mtp_setup(const request_ptr & r, int slot);
     bool mtp_draft(std::vector<request_ptr> & slots, const std::vector<int> & in_batch, const std::vector<int> & k_slot);
     int  cache_lookup(const std::vector<llama_token> & toks, std::vector<uint8_t> & state_out);

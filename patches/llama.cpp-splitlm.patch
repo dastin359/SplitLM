@@ -348,7 +348,7 @@ index 0d48c9a..7e7c303 100644
  }
  #endif
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index ab82e3d..27a28b8 100644
+index ab82e3d..5d23181 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -490,6 +490,11 @@ struct ggml_threadpool {
@@ -520,16 +520,19 @@ index ab82e3d..27a28b8 100644
  
      struct ggml_cplan cplan;
      memset(&cplan, 0, sizeof(struct ggml_cplan));
-@@ -2998,6 +3110,8 @@ struct ggml_cplan ggml_graph_plan(
+@@ -2998,6 +3110,11 @@ struct ggml_cplan ggml_graph_plan(
                          // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                          size_t n_chunks = n_tasks;
                          size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 +                        // trilane: + per-thread scratch of the F16 decode kernel (placed after the partials)
 +                        decode += n_tasks*(ggml_cpu_fa_dec_scratch_size(DK, DV, neq2) + CACHE_LINE_SIZE) + CACHE_LINE_SIZE;
++
++                        // trilane srv-spec: batch-invariant split-KV attention (0 when it does not apply)
++                        decode = MAX(decode, ggml_cpu_fa_bi_wsize(node, n_tasks));
  
                          cur += MAX(prefill, decode);
                      } break;
-@@ -3056,6 +3170,10 @@ struct ggml_cplan ggml_graph_plan(
+@@ -3056,6 +3173,10 @@ struct ggml_cplan ggml_graph_plan(
      cplan.work_size  = work_size;
      cplan.work_data  = NULL;
  
@@ -540,7 +543,7 @@ index ab82e3d..27a28b8 100644
      return cplan;
  }
  
-@@ -3063,6 +3181,311 @@ struct ggml_cplan ggml_graph_plan(
+@@ -3063,6 +3184,311 @@ struct ggml_cplan ggml_graph_plan(
  // Try to fuse the current node with subsequent nodes for better performance.
  // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
  static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
@@ -852,7 +855,7 @@ index ab82e3d..27a28b8 100644
  
  static int ggml_cpu_try_fuse_ops(
          const struct ggml_cgraph * cgraph,
-@@ -3076,6 +3499,13 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3076,6 +3502,13 @@ static int ggml_cpu_try_fuse_ops(
  
      struct ggml_tensor * node = cgraph->nodes[node_n];
  
@@ -866,7 +869,7 @@ index ab82e3d..27a28b8 100644
      if (node->op == GGML_OP_RMS_NORM) {
          // RMS_NORM + MUL fusion
          const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
-@@ -3095,9 +3525,302 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3095,9 +3528,302 @@ static int ggml_cpu_try_fuse_ops(
          }
      }
  
@@ -1169,7 +1172,7 @@ index ab82e3d..27a28b8 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3118,6 +3841,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3118,6 +3844,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          /*.wdata      =*/ cplan->work_data,
          /*.threadpool =*/ tp,
          /*.use_ref    =*/ cplan->use_ref,
@@ -1177,7 +1180,7 @@ index ab82e3d..27a28b8 100644
      };
  
  #ifdef GGML_USE_OPENMP
-@@ -3126,6 +3850,55 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3126,6 +3853,55 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -1233,7 +1236,7 @@ index ab82e3d..27a28b8 100644
      for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
          struct ggml_tensor * node = cgraph->nodes[node_n];
  
-@@ -3138,11 +3911,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3138,11 +3914,31 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
@@ -1265,7 +1268,7 @@ index ab82e3d..27a28b8 100644
          } else {
              ggml_compute_forward(&params, node);
          }
-@@ -3153,8 +3946,69 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3153,8 +3949,69 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              tp->ec    = GGML_STATUS_ABORTED;
          }
  
@@ -1336,7 +1339,7 @@ index ab82e3d..27a28b8 100644
          }
      }
  
-@@ -3164,8 +4018,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3164,8 +4021,35 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-done cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -1372,7 +1375,7 @@ index ab82e3d..27a28b8 100644
  #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
      ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
  #endif
-@@ -3324,6 +4205,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3324,6 +4208,9 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
          threadpool->n_graph          = 0;
          threadpool->n_barrier        = 0;
          threadpool->n_barrier_passed = 0;
@@ -1382,7 +1385,7 @@ index ab82e3d..27a28b8 100644
          threadpool->current_chunk    = 0;
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
-@@ -3389,6 +4273,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
+@@ -3389,6 +4276,7 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
  }
  
  enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
@@ -1390,7 +1393,7 @@ index ab82e3d..27a28b8 100644
      ggml_cpu_init();
  
      GGML_ASSERT(cplan);
-@@ -3415,6 +4300,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3415,6 +4303,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
          threadpool->abort            = -1;
          threadpool->ec               = GGML_STATUS_SUCCESS;
      }
@@ -1400,7 +1403,7 @@ index ab82e3d..27a28b8 100644
  
  #ifdef GGML_USE_OPENMP
      if (n_threads > 1) {
-@@ -3462,6 +4350,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3462,6 +4353,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
          ggml_threadpool_free(threadpool);
      }
  
@@ -1414,7 +1417,7 @@ index ab82e3d..27a28b8 100644
      return ret;
  }
  
-@@ -3933,6 +4828,36 @@ void ggml_cpu_init(void) {
+@@ -3933,6 +4831,36 @@ void ggml_cpu_init(void) {
          {
              const char * env = getenv("GGML_CPU_DISABLE_FUSION");
              ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
@@ -2787,7 +2790,7 @@ index 0000000..ef8543c
 +}
 +#endif
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 7a73e13..1945e81 100644
+index 7a73e13..0a6c131 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -2055,25 +2055,62 @@ static void ggml_compute_forward_concat_f32(
@@ -2866,7 +2869,7 @@ index 7a73e13..1945e81 100644
      }
  }
  
-@@ -9515,6 +9552,690 @@ static void ggml_flash_attn_ext_reduce_partials(
+@@ -9515,6 +9552,828 @@ static void ggml_flash_attn_ext_reduce_partials(
      }
  }
  
@@ -3499,7 +3502,7 @@ index 7a73e13..1945e81 100644
 +}
 +
 +// can the decode kernel take this FLASH_ATTN_EXT node (given the split-KV path is taken)?
-+static bool ggml_fa_dec_supported(const ggml_tensor * dst) {
++static bool ggml_fa_dec_supported(const ggml_tensor * dst, bool streams = false) {
 +    const ggml_tensor * q    = dst->src[0];
 +    const ggml_tensor * k    = dst->src[1];
 +    const ggml_tensor * v    = dst->src[2];
@@ -3513,7 +3516,8 @@ index 7a73e13..1945e81 100644
 +    if (k->ne[0] % 8 != 0 || v->ne[0] % 16 != 0 || k->ne[2] != v->ne[2] || q->ne[2] % k->ne[2] != 0) {
 +        return false;
 +    }
-+    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1)) {
++    // streams (batch-invariant path): one mask plane per KV stream, viewed per row by the caller
++    if (mask && (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || (streams ? q->ne[3] % mask->ne[3] != 0 : mask->ne[3] != 1))) {
 +        return false;
 +    }
 +    return true;
@@ -3546,27 +3550,172 @@ index 7a73e13..1945e81 100644
 +}
 +#endif // GGML_FA_DEC
 +
-+// trilane srv-spec: batch-invariant mode (GGML_CPU_BATCH_INVARIANT=1, see repack.cpp): every query row runs the
-+// one-row reference loop over the KV cells, so its result no longer depends on how many rows share the call (tiled
-+// kernel for many rows) or on the cache size (split-KV kernel for one row and >= 512 cells)
++// trilane srv-spec: batch-invariant mode (GGML_CPU_BATCH_INVARIANT=1, see repack.cpp): a query row's result must not
++// depend on how many rows share the call (tiled kernel for many rows), on the cache size (split-KV kernel for one row
++// and >= 512 cells) or on the thread count (split-KV chunk size); see ggml_fa_bi below
 +static bool fa_batch_invariant() {
 +    static const bool v = [] { const char * e = getenv("GGML_CPU_BATCH_INVARIANT"); return e && atoi(e) != 0; }();
 +    return v;
 +}
 +
++// Batch-invariant split-KV attention: the KV cells are cut into chunks at FIXED absolute cell indices (multiples of
++// FA_BI_CHUNK), each (query row, chunk) runs the F16 decode kernel (all heads, blocks of FA_DEC_BKV cells from the
++// chunk start), and the chunk partials of a row are folded in chunk order. A row's result therefore depends only on its
++// unmasked cells (masked ones are skipped by the kernel), not on the row count, the cache size or the thread count, and
++// long contexts keep the KV parallelism of the split-KV decode path. Rows are spread over threads when there are
++// enough of them, (row, chunk) pairs otherwise; both give the same bits. Larger row sets (prompt prefill) keep the
++// regular paths.
++#define FA_BI_CHUNK    128
++#define FA_BI_MAX_ROWS 64
++
++#ifdef GGML_FA_DEC
++static bool ggml_fa_bi_applies(const ggml_tensor * dst) {
++    const ggml_tensor * q = dst->src[0];
++    return fa_batch_invariant() && q->type == GGML_TYPE_F32 && q->ne[1]*q->ne[3] <= FA_BI_MAX_ROWS &&
++           q->ne[3] % dst->src[1]->ne[3] == 0 && q->ne[3] % dst->src[2]->ne[3] == 0 && ggml_fa_dec_supported(dst, true);
++}
++
++static int64_t ggml_fa_bi_thread_f32(int64_t DK, int64_t DV, int64_t H) {
++    return ggml_fa_dec_scratch_f32(DK, DV, H) + 2*H*(2 + DV) + 2*CACHE_LINE_SIZE_F32;
++}
++
++size_t ggml_cpu_fa_bi_wsize(const ggml_tensor * dst, int n_tasks) {
++    if (!ggml_fa_bi_applies(dst)) {
++        return 0;
++    }
++    const ggml_tensor * q = dst->src[0];
++    const int64_t DK = dst->src[1]->ne[0], DV = dst->src[2]->ne[0], H = q->ne[2];
++    const int64_t rows = q->ne[1]*q->ne[3];
++    const int64_t nch  = (dst->src[1]->ne[1] + FA_BI_CHUNK - 1)/FA_BI_CHUNK;
++    int64_t n = n_tasks*ggml_fa_bi_thread_f32(DK, DV, H) + 2*CACHE_LINE_SIZE_F32;
++    if (rows < n_tasks) {
++        n += rows*H*nch*(2 + DV);
++    }
++    return sizeof(float)*n;
++}
++
++// one (row, chunk): a view of q / mask at row (iq1, iq3) and of k / v at its stream, then the decode kernel
++static void ggml_fa_bi_chunk(const ggml_tensor * dst, int64_t row, int64_t ic0, int64_t ic1, float * scratch, float * partials, int64_t stride) {
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++    const ggml_tensor * v = dst->src[2];
++    const ggml_tensor * m = dst->src[3];
++    const int64_t iq1 = row % q->ne[1], iq3 = row / q->ne[1];
++    ggml_tensor qr = *q, kr = *k, vr = *v, mr;
++    qr.data = (char *) q->data + iq1*q->nb[1] + iq3*q->nb[3]; qr.ne[1] = 1; qr.ne[3] = 1;
++    kr.data = (char *) k->data + (iq3/(q->ne[3]/k->ne[3]))*k->nb[3]; kr.ne[3] = 1;
++    vr.data = (char *) v->data + (iq3/(q->ne[3]/v->ne[3]))*v->nb[3]; vr.ne[3] = 1;
++    ggml_tensor d = *dst;
++    d.src[0] = &qr; d.src[1] = &kr; d.src[2] = &vr;
++    if (m) {
++        mr = *m;
++        mr.data = (char *) m->data + iq1*m->nb[1] + (iq3 % m->ne[3])*m->nb[3]; mr.ne[1] = 1; mr.ne[3] = 1;
++        d.src[3] = &mr;
++    }
++    ggml_fa_dec_chunk(&d, ic0, ic1, scratch, partials, stride);
++}
++
++// running (M, S, VKQ) of one head += one chunk partial (same arithmetic as ggml_flash_attn_ext_reduce_partials)
++static inline void ggml_fa_bi_fold(float * run, const float * part, int64_t DV) {
++    const float Mc = part[0], Sc = part[1];
++    if (Sc == 0.0f) {
++        return;
++    }
++    const float Mn = fmaxf(run[0], Mc);
++    const float so = expf(run[0] - Mn);
++    const float sn = expf(Mc - Mn);
++    for (int64_t d = 0; d < DV; ++d) {
++        run[2 + d] = run[2 + d]*so + part[2 + d]*sn;
++    }
++    run[1] = run[1]*so + Sc*sn;
++    run[0] = Mn;
++}
++
++static inline void ggml_fa_bi_write(ggml_tensor * dst, int64_t row, int64_t h, float * run, int64_t DV) {
++    const int64_t N = dst->src[0]->ne[1];
++    const int64_t iq1 = row % N, iq3 = row / N;
++    if (run[1] != 0.0f) {
++        ggml_vec_scale_f32(DV, run + 2, 1.0f/run[1]);
++    }
++    // permute(0, 2, 1, 3)
++    memcpy((char *) dst->data + (iq3*dst->ne[2]*dst->ne[1] + h + iq1*dst->ne[1])*dst->nb[1], run + 2, dst->nb[1]);
++}
++
++static void ggml_fa_bi(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * q = dst->src[0];
++    const int64_t DK = dst->src[1]->ne[0], DV = dst->src[2]->ne[0], H = q->ne[2];
++    const int64_t rows = q->ne[1]*q->ne[3];
++    const int64_t nek1 = dst->src[1]->ne[1];
++    const int64_t nch  = (nek1 + FA_BI_CHUNK - 1)/FA_BI_CHUNK;
++    const int64_t ps   = 2 + DV;
++    const int ith = params->ith, nth = params->nth;
++
++    float * base      = (float *) GGML_PAD((uintptr_t) params->wdata, CACHE_LINE_SIZE);
++    const int64_t tsz = ggml_fa_bi_thread_f32(DK, DV, H);
++    float * scratch   = (float *) GGML_PAD((uintptr_t) (base + ith*tsz), CACHE_LINE_SIZE);
++    float * part      = scratch + ggml_fa_dec_scratch_f32(DK, DV, H);   // [H][ps] one chunk
++    float * run       = part + H*ps;                                     // [H][ps] running fold
++
++    if (rows >= nth) {
++        for (int64_t r = ith; r < rows; r += nth) {
++            for (int64_t h = 0; h < H; h++) {
++                run[h*ps] = -INFINITY; run[h*ps + 1] = 0.0f;
++                memset(run + h*ps + 2, 0, DV*sizeof(float));
++            }
++            for (int64_t c = 0; c < nch; c++) {
++                ggml_fa_bi_chunk(dst, r, c*FA_BI_CHUNK, std::min((c + 1)*FA_BI_CHUNK, nek1), scratch, part, ps);
++                for (int64_t h = 0; h < H; h++) {
++                    ggml_fa_bi_fold(run + h*ps, part + h*ps, DV);
++                }
++            }
++            for (int64_t h = 0; h < H; h++) {
++                ggml_fa_bi_write(dst, r, h, run + h*ps, DV);
++            }
++        }
++        return;
++    }
++    // few rows: (row, chunk) tasks into shared partials [row][head][chunk], then one fold per (row, head)
++    float * G = base + nth*tsz + CACHE_LINE_SIZE_F32;
++    for (int64_t t = ith; t < rows*nch; t += nth) {
++        const int64_t r = t / nch, c = t % nch;
++        ggml_fa_bi_chunk(dst, r, c*FA_BI_CHUNK, std::min((c + 1)*FA_BI_CHUNK, nek1), scratch, G + (r*H*nch + c)*ps, nch*ps);
++    }
++    ggml_barrier(params->threadpool);
++    for (int64_t t = ith; t < rows*H; t += nth) {
++        const int64_t r = t / H, h = t % H;
++        run[0] = -INFINITY; run[1] = 0.0f;
++        memset(run + 2, 0, DV*sizeof(float));
++        for (int64_t c = 0; c < nch; c++) {
++            ggml_fa_bi_fold(run, G + ((r*H + h)*nch + c)*ps, DV);
++        }
++        ggml_fa_bi_write(dst, r, h, run, DV);
++    }
++}
++#else
++size_t ggml_cpu_fa_bi_wsize(const ggml_tensor * dst, int n_tasks) { GGML_UNUSED(dst); GGML_UNUSED(n_tasks); return 0; }
++#endif
++
  static void ggml_compute_forward_flash_attn_ext_f16(
          const ggml_compute_params * params,
          ggml_tensor * dst) {
-@@ -9564,7 +10285,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9564,7 +10423,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
      const bool use_ref = params->use_ref;
  
      const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
 -    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
-+    const bool use_split_kv_path = !use_ref && !fa_batch_invariant() && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
++#ifdef GGML_FA_DEC
++    if (!use_ref && ggml_fa_bi_applies(dst)) {
++        ggml_fa_bi(params, dst);
++        return;
++    }
++#endif
++    // batch-invariant mode without the kernel above: the one-row loop for up to FA_BI_MAX_ROWS rows
++    const bool bi_ref = fa_batch_invariant() && neq1*neq3 <= FA_BI_MAX_ROWS;
++    const bool use_split_kv_path = !use_ref && !bi_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
  
      if (use_split_kv_path) {
          const int64_t chunk_size = (nek1 + nth - 1) / nth;
-@@ -9579,7 +10300,20 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9579,7 +10446,20 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t partial_stride = nth * partial_size;
          float *       chunk_partials = partials_base + ith * partial_size;
  
@@ -3588,16 +3737,16 @@ index 7a73e13..1945e81 100644
              for (int64_t q_head = 0; q_head < neq2; q_head++) {
                  ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                      params, dst, q_head, q_head + 1, ic_start, ic_end,
-@@ -9621,7 +10355,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9621,7 +10501,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t dr = (nr + nchunk - 1) / nchunk;
  
          static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
 -        bool use_tiled = !use_ref &&
-+        bool use_tiled = !use_ref && !fa_batch_invariant() &&
++        bool use_tiled = !use_ref && !bi_ref &&
                                 (q->type == GGML_TYPE_F32 &&
                                  kv_is_f32_or_f16 &&
                                  k->type == v->type &&
-@@ -11197,12 +11931,35 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
+@@ -11197,12 +12077,35 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
      }
  }
  
@@ -3634,7 +3783,7 @@ index 7a73e13..1945e81 100644
  
      ggml_tensor * src_q     = dst->src[0];
      ggml_tensor * src_k     = dst->src[1];
-@@ -11282,18 +12039,69 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11282,18 +12185,69 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
  
          // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
          // For K>1, work in scratch and copy out per-token when the slot is in range.
@@ -3706,7 +3855,7 @@ index 7a73e13..1945e81 100644
          for (int64_t t = 0; t < n_tokens; t++) {
              const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
              const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
-@@ -11342,9 +12150,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11342,9 +12296,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
              if (K > 1) {
                  const int64_t target_slot = n_tokens - 1 - t;
                  if (target_slot >= 0 && target_slot < K) {
@@ -3721,7 +3870,7 @@ index 7a73e13..1945e81 100644
                  }
              }
          }
-@@ -11354,7 +12164,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+@@ -11354,7 +12310,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
  
  static void ggml_compute_forward_gated_delta_net_f32(
          const ggml_compute_params * params,
@@ -3733,7 +3882,7 @@ index 7a73e13..1945e81 100644
  
      ggml_tensor * V = dst->src[2];
      int64_t nr = V->ne[1] * V->ne[3];
-@@ -11388,7 +12201,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -11388,7 +12347,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
          const int64_t ir0 = dr * current_chunk;
          const int64_t ir1 = MIN(ir0 + dr, nr);
  
@@ -3742,7 +3891,7 @@ index 7a73e13..1945e81 100644
          current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
      }
  }
-@@ -11410,6 +12223,19 @@ void ggml_compute_forward_gated_delta_net(
+@@ -11410,6 +12369,19 @@ void ggml_compute_forward_gated_delta_net(
      }
  }
  
@@ -3763,19 +3912,21 @@ index 7a73e13..1945e81 100644
  // ggml_compute_forward_dsv4_hc_comb
  
 diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
-index 2728b08..e0af448 100644
+index 2728b08..04d311b 100644
 --- a/ggml/src/ggml-cpu/ops.h
 +++ b/ggml/src/ggml-cpu/ops.h
-@@ -87,6 +87,8 @@ void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params,
+@@ -87,6 +87,10 @@ void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params,
  void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +// trilane: per-thread scratch (bytes) of the single-token F16 decode kernel of FLASH_ATTN_EXT
 +size_t ggml_cpu_fa_dec_scratch_size(int64_t DK, int64_t DV, int64_t n_head);
++// trilane srv-spec: work buffer (bytes) of the batch-invariant split-KV attention, 0 if it does not apply
++size_t ggml_cpu_fa_bi_wsize(const struct ggml_tensor * dst, int n_tasks);
  void ggml_compute_forward_flash_attn_back(
          const struct ggml_compute_params * params,
          const bool masked,
-@@ -104,6 +106,7 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
+@@ -104,6 +108,7 @@ void ggml_compute_forward_rwkv_wkv7(const struct ggml_compute_params * params, s
  void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_gla(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);

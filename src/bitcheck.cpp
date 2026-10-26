@@ -63,7 +63,7 @@ static bool cb(ggml_tensor * t, bool ask, void * ud) {
 
 int main(int argc, char ** argv) {
     std::string model, pfile;
-    int n_gen = 64, chunk = 4, rs_a = 0, rs_b = 3, threads = 8, n_seq = 1, n_seq_a = 1, kvu = 1; bool trace = false;
+    int n_gen = 64, chunk = 4, rs_a = 0, rs_b = 3, threads = 8, threads_b = -1, n_seq = 1, n_seq_a = 1, kvu = 1; bool trace = false;
     for (int i = 1; i < argc; i++) {
         std::string k = argv[i];
         auto next = [&]() { return argv[++i]; };
@@ -77,6 +77,7 @@ int main(int argc, char ** argv) {
         else if (k == "--seqs-a") n_seq_a = atoi(next());
         else if (k == "--kvu") kvu = atoi(next());
         else if (k == "-t") threads = atoi(next());
+        else if (k == "-tb") threads_b = atoi(next());   // run B's threads (verification steps use more)
         else if (k == "--trace") trace = true;
     }
     llama_backend_init();
@@ -95,9 +96,10 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> prompt(text.size() + 16);
     prompt.resize(llama_tokenize(vocab, text.c_str(), (int) text.size(), prompt.data(), (int) prompt.size(), true, true));
 
-    auto make = [&](int rs, rec * r) {
+    if (threads_b <= 0) threads_b = threads;
+    auto make = [&](int rs, rec * r, int threads) {
         llama_context_params cp = llama_context_default_params();
-        cp.n_ctx = 4096 * std::max(n_seq, n_seq_a); cp.n_batch = 2048; cp.n_ubatch = 512; cp.n_seq_max = std::max(n_seq, n_seq_a); cp.kv_unified = kvu != 0;
+        cp.n_ctx = 4096 * std::max(n_seq, n_seq_a); cp.n_batch = std::max(2048, (int) prompt.size()); cp.n_ubatch = 512; cp.n_seq_max = std::max(n_seq, n_seq_a); cp.kv_unified = kvu != 0;
         cp.n_threads = threads; cp.n_threads_batch = threads; cp.no_perf = true; cp.op_offload = false;
         cp.n_rs_seq = rs; cp.n_outputs_max_per_seq = 0;
         cp.cb_eval = cb; cp.cb_eval_user_data = r;
@@ -117,7 +119,7 @@ int main(int argc, char ** argv) {
 
     // run A: one token per call, sequence 0 only... but with the same other sequences present
     rec ra, rb;
-    llama_context * ca = make(rs_a, &ra);
+    llama_context * ca = make(rs_a, &ra, threads);
     do_prompt(ca);
     std::vector<llama_token> toks;
     std::vector<uint64_t> la;
@@ -138,7 +140,7 @@ int main(int argc, char ** argv) {
     llama_free(ca);
 
     // run B: the same tokens, chunk per call and sequence
-    llama_context * cb2 = make(rs_b, &rb);
+    llama_context * cb2 = make(rs_b, &rb, threads_b);
     do_prompt(cb2);
     std::vector<uint64_t> lb(n_gen);
     rb.on = trace;

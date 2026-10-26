@@ -242,8 +242,11 @@ bool engine::load(const engine_params & p) {
         // differently, so without this a token's greedy choice could depend on how many rows its decode call carried
         // (k + 1 when verifying drafts, one per slot when slots share a step). TRILANE_BATCH_INVARIANT=0 keeps the
         // faster mixed kernels; models without an MTP head are not touched.
+        // On by default only while drafting is on: with --spec off / TRILANE_SPEC=0 the old kernels and the shared KV
+        // pool run exactly as before (TRILANE_BATCH_INVARIANT=1 forces the invariant kernels without drafting, the
+        // reference for text identity; =0 turns them off with drafting).
         const char * bi = getenv("TRILANE_BATCH_INVARIANT");
-        batch_invariant_ = nextn > 0 && !(bi && atoi(bi) == 0);
+        batch_invariant_ = nextn > 0 && (bi ? atoi(bi) != 0 : spec_);
         if (batch_invariant_ && !getenv("GGML_CPU_BATCH_INVARIANT")) _putenv_s("GGML_CPU_BATCH_INVARIANT", "1");
         if (spec == 1 && nextn <= 0) fprintf(stderr, "[trilane] speculative decoding requested, but %s has no MTP head: off\n", p.model.c_str());
         dp.load_mtp = spec_;
@@ -480,12 +483,27 @@ std::vector<llama_token> engine::tokenize(const std::string & text) const {
     return toks;
 }
 
+// The MTP head catches up on the most recent TRILANE_MTP_WINDOW (default 1024) positions only. A slot that does not
+// draft for a long time (3+ decoding slots with the default table) or a long prompt would otherwise keep one hidden
+// row per token and replay all of them through the MTP layer in one step, stalling every slot. Older positions are
+// left out of the MTP cache: that only changes the drafts, never the text.
+static size_t mtp_window() {
+    static const size_t w = [] { const char * e = getenv("TRILANE_MTP_WINDOW"); return e ? (size_t) std::max(16, atoi(e)) : (size_t) 1024; }();
+    return w;
+}
+
 // prefill toks[from..] at positions from.. into sequence seq, logits for the last token only; false on a failed decode
 bool engine::prefill(llama_context * c, const std::vector<llama_token> & toks, int from, llama_seq_id seq, std::vector<float> * h_out) {
-    const int nb = params_.n_batch;
+    // the context's own batch limit: a dense-aliased decode context with drafting has a small n_batch
+    const int nb = std::min(params_.n_batch, (int) llama_n_batch(c));
     llama_batch b = llama_batch_init(nb, 0, 1);
+    // the MTP head only catches up on the last mtp_window() prompt tokens (each paired with the hidden row before it):
+    // h_out keeps the rows of the chunks that reach them. (Switching the hidden-row output off for the other chunks
+    // cost ~180 ms of first-token time on the NPU context: its graph is rebuilt.)
+    const int need_from = h_out ? std::max(from, (int) toks.size() - (int) mtp_window() - 1) : (int) toks.size();
     for (int i0 = from; i0 < (int) toks.size(); i0 += nb) {
         const int n = std::min(nb, (int) toks.size() - i0);
+        const bool need = h_out && i0 + n > need_from;
         b.n_tokens = n;
         for (int j = 0; j < n; j++) {
             b.token[j] = toks[i0 + j]; b.pos[j] = i0 + j; b.n_seq_id[j] = 1; b.seq_id[j][0] = seq;
@@ -496,7 +514,7 @@ bool engine::prefill(llama_context * c, const std::vector<llama_token> & toks, i
             llama_batch_free(b);
             return false;
         }
-        if (h_out) {
+        if (need) {
             // target hidden states of this chunk, for the MTP head's prompt catch-up on the CPU lane
             llama_synchronize(c);
             const float * h = llama_get_embeddings_nextn(c);
@@ -834,6 +852,15 @@ void engine::npu_worker() {
 // (llama.cpp common's sample-and-match rule; greedy: identical text, sampled: the same distribution), and rolls its
 // recurrent state back over the rest (n_rs_seq snapshots per slot, pending rollback index per sequence).
 
+void engine::mtp_trim(const request_ptr & r, int slot) {
+    if (r->mtp_tok.size() <= mtp_window()) return;
+    const size_t drop = r->mtp_tok.size() - mtp_window();
+    llama_memory_seq_rm(llama_get_memory(cm_), slot, r->mtp_pos0, -1);  // drafted cells of an earlier step
+    r->mtp_tok.erase(r->mtp_tok.begin(), r->mtp_tok.begin() + drop);
+    r->mtp_h.erase(r->mtp_h.begin(), r->mtp_h.begin() + drop * n_embd_);
+    r->mtp_pos0 += (int) drop;
+}
+
 // the prompt hidden states of a freshly admitted request become its first MTP catch-up
 void engine::mtp_setup(const request_ptr & r, int slot) {
     llama_memory_seq_rm(llama_get_memory(cm_), slot, -1, -1);
@@ -843,14 +870,17 @@ void engine::mtp_setup(const request_ptr & r, int slot) {
     r->mtp_h.clear();
     const int n = (int) r->toks.size(), c = r->st.n_cached;
     const size_t rows = (size_t) (n - c);
+    // h_prompt holds the hidden rows of the last `have` prefilled tokens (prefill skips chunks outside the MTP window)
+    const size_t have = r->h_prompt.size() / n_embd_;
     // a sequence that already decoded on the NPU has positions the MTP head never saw: it does not draft
-    if (!r->decoding && rows > 0 && r->h_prompt.size() == rows * n_embd_) {
-        r->mtp_pos0 = c;
-        r->mtp_tok.assign(r->toks.begin() + c, r->toks.end());
+    if (!r->decoding && have > 0 && have <= rows && r->h_prompt.size() == have * n_embd_) {
+        r->mtp_pos0 = n - (int) have;
+        r->mtp_tok.assign(r->toks.end() - have, r->toks.end());
         r->mtp_h.assign(n_embd_, 0.0f);    // the token at mtp_pos0 pairs with the hidden state before it: unknown here
         r->mtp_h.insert(r->mtp_h.end(), r->h_prompt.begin(), r->h_prompt.end() - n_embd_);
         r->mtp_hlast.assign(r->h_prompt.end() - n_embd_, r->h_prompt.end());
         r->mtp_ok = true;
+        mtp_trim(r, slot);
     }
     r->h_prompt.clear();
     r->h_prompt.shrink_to_fit();
@@ -1136,10 +1166,14 @@ void engine::cpu_worker() {
         const int k_step = !spec_ ? 0 : spec_auto_ ? tuner_.pick((int) in_batch.size())
                                                    : params_.spec_k[std::min(in_batch.size(), params_.spec_k.size()) - 1];
         if (k_step > 0) {
+            // every slot of the step carries 1 + k tokens (non-drafting slots pad with cur), and each slot's KV stream
+            // holds n_ctx cells: a slot near the end of its context caps the step's k for all slots
+            int k_cap = k_step;
+            for (int s : in_batch) k_cap = std::min(k_cap, params_.n_ctx - 1 - slots[s]->pos);
             for (int s : in_batch) {
                 request_ptr & r = slots[s];
                 if (!r->mtp_ok) continue;
-                const int left = std::min(r->gp.max_tokens - r->st.n_gen, params_.n_ctx - 1 - r->pos);
+                const int left = std::min(r->gp.max_tokens - r->st.n_gen, k_cap);
                 k_slot[s] = std::max(0, std::min(k_step, left));
                 k = std::max(k, k_slot[s]);
             }
@@ -1217,6 +1251,7 @@ void engine::cpu_worker() {
                             r->mtp_tok.push_back(r->draft[i]);
                             r->mtp_h.insert(r->mtp_h.end(), H + (size_t) (b0 + i) * n_embd_, H + (size_t) (b0 + i + 1) * n_embd_);
                         }
+                        mtp_trim(r, s);
                         r->mtp_hlast.assign(H + (size_t) (b0 + j) * n_embd_, H + (size_t) (b0 + j + 1) * n_embd_);
                     }
                 }

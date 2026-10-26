@@ -74,8 +74,9 @@ static void usage() {
         "          decode (the last entry holds for more slots; default N,1,0 with N = --spec-nmax), or auto: chosen\n"
         "          online from measured step times and acceptance\n"
         "          -tb: CPU threads of verification batches (default: -t + 2)\n"
-        "  env TRILANE_BATCH_INVARIANT=0: MTP models keep the faster mixed-rounding CPU matmul kernels (greedy text may\n"
-        "          then depend on how many tokens share a decode call)\n"
+        "  env TRILANE_BATCH_INVARIANT: batch-invariant CPU kernels + one KV stream per slot, default on while drafting\n"
+        "          (drafted text = plain decoding with them); =1 also without drafting, =0 off (text may then depend on\n"
+        "          how many tokens share a decode call). TRILANE_MTP_WINDOW: MTP catch-up window (default 1024)\n"
         "  --prio: decode thread priority 0 normal, 1 medium, 2 high (default), 3 realtime; 0 = old default\n"
         "  env TRILANE_WORKER0_PRIO=0: decode thread (graph worker 0) keeps normal priority and throttling (old behaviour)\n");
     exit(1);
