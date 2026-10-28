@@ -794,6 +794,10 @@ int main(int argc, char ** argv) {
                 for (size_t b = 0; b < std::min(st.size(), st2.size()); b++) if (st[b] != st2[b]) { nd++; if (first == (size_t) -1) first = b; }
                 fprintf(stderr, "[det] rep %d hash %016llx ndiff %zu first %lld\n", r, (unsigned long long) fnv1a(st2.data(), st2.size()), nd, (long long) first);
             }
+            if (er && atoi(er) > 0) {  // leave the prefill context holding the handed-off state, not the last repeat's
+                llama_memory_clear(llama_get_memory(cp), true);
+                if (llama_state_seq_set_data(cp, st.data(), st.size(), 0) == 0) { fprintf(stderr, "state restore failed\n"); return 1; }
+            }
         }
     }
     if (spec) common_speculative_set_ctx_tgt(spec, cd); // verification hidden states now come from the CPU context
@@ -844,9 +848,7 @@ int main(int argc, char ** argv) {
         t_verify_by_n[std::min<int>(batch_tgt.size(), 15)] += tv1 - tv0;
         n_verify_by_n[std::min<int>(batch_tgt.size(), 15)]++;
         n_steps++;
-        if (spec && !common_speculative_process(spec, batch_tgt)) { fprintf(stderr, "MTP process failed\n"); break; }
-        t_mtp_proc += now_ms() - tv1;
-        if (g_det_hash) {
+        if (g_det_hash) {  // hash the verify logits before the drafter's processing step runs
             const int nv = llama_vocab_n_tokens(vocab);
             fprintf(stderr, "[det] step %d pos %d n %d", n_steps, n_past - 1, (int) batch_tgt.size());
             for (int i = 0; i < (int) batch_tgt.size(); i++) {
@@ -854,6 +856,9 @@ int main(int argc, char ** argv) {
             }
             fprintf(stderr, "\n");
         }
+        const double tm0 = now_ms();
+        if (spec && !common_speculative_process(spec, batch_tgt)) { fprintf(stderr, "MTP process failed\n"); break; }
+        t_mtp_proc += now_ms() - tm0;
 
         common_sampler_ptr smpl_save;
         if (use_ckpt_tgt && !draft.empty()) smpl_save.reset(common_sampler_clone(smpl.get()));
