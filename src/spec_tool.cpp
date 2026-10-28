@@ -46,6 +46,15 @@ static void log_cb(ggml_log_level level, const char * text, void *) {
 
 static double now_ms() { return llama_time_us() / 1000.0; }
 
+// TRILANE_DET_HASH=1: print FNV-1a hashes of the prefill->decode state blob and of every verify step's logits
+// (stderr), to localize run-to-run nondeterminism (NPU prefill vs CPU verify). Diagnostic only.
+static bool g_det_hash = false;
+static uint64_t fnv1a(const void * p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const uint8_t * b = (const uint8_t *) p;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
 struct args {
     std::string model, prompt_file, mode = "spec", prefill_dev = "HTP0", alias = "auto", spec_type = "draft-mtp";
     int ngram_n = 3;
@@ -450,6 +459,7 @@ static int run_draft_model(const args & a, llama_context * cp, llama_context * c
 }
 
 int main(int argc, char ** argv) {
+    { const char * e = getenv("TRILANE_DET_HASH"); g_det_hash = e && atoi(e) != 0; }
     args a;
     for (int i = 1; i < argc; i++) {
         std::string k = argv[i];
@@ -767,6 +777,24 @@ int main(int argc, char ** argv) {
         std::vector<uint8_t> st(llama_state_seq_get_size(cp, 0));
         llama_state_seq_get_data(cp, st.data(), st.size(), 0);
         if (llama_state_seq_set_data(cd, st.data(), st.size(), 0) == 0) { fprintf(stderr, "state handoff failed\n"); return 1; }
+        if (g_det_hash) {
+            fprintf(stderr, "[det] state %zu B hash %016llx\n", st.size(), (unsigned long long) fnv1a(st.data(), st.size()));
+            if (const char * dp = getenv("TRILANE_DET_DUMP")) {  // raw handoff state blob, for byte-level diffs between runs
+                if (FILE * fd = fopen(dp, "wb")) { fwrite(st.data(), 1, st.size(), fd); fclose(fd); }
+            }
+            // TRILANE_DET_REP=N: prefill the same prompt N more times on the prefill context and compare each state
+            // with the first one (in-process repeats; the decode context keeps the first state)
+            const char * er = getenv("TRILANE_DET_REP");
+            for (int r = 0, nr = er ? atoi(er) : 0; r < nr; r++) {
+                llama_memory_clear(llama_get_memory(cp), true);
+                if (llama_process(cp, LLAMA_PROCESS_TYPE_DECODE, batch_prompt.get()) != 0) { fprintf(stderr, "repeat prefill failed\n"); break; }
+                std::vector<uint8_t> st2(llama_state_seq_get_size(cp, 0));
+                llama_state_seq_get_data(cp, st2.data(), st2.size(), 0);
+                size_t nd = 0, first = (size_t) -1;
+                for (size_t b = 0; b < std::min(st.size(), st2.size()); b++) if (st[b] != st2[b]) { nd++; if (first == (size_t) -1) first = b; }
+                fprintf(stderr, "[det] rep %d hash %016llx ndiff %zu first %lld\n", r, (unsigned long long) fnv1a(st2.data(), st2.size()), nd, (long long) first);
+            }
+        }
     }
     if (spec) common_speculative_set_ctx_tgt(spec, cd); // verification hidden states now come from the CPU context
     double t_handoff = now_ms();
@@ -818,6 +846,14 @@ int main(int argc, char ** argv) {
         n_steps++;
         if (spec && !common_speculative_process(spec, batch_tgt)) { fprintf(stderr, "MTP process failed\n"); break; }
         t_mtp_proc += now_ms() - tv1;
+        if (g_det_hash) {
+            const int nv = llama_vocab_n_tokens(vocab);
+            fprintf(stderr, "[det] step %d pos %d n %d", n_steps, n_past - 1, (int) batch_tgt.size());
+            for (int i = 0; i < (int) batch_tgt.size(); i++) {
+                fprintf(stderr, " %016llx", (unsigned long long) fnv1a(llama_get_logits_ith(cd, i), sizeof(float) * nv));
+            }
+            fprintf(stderr, "\n");
+        }
 
         common_sampler_ptr smpl_save;
         if (use_ckpt_tgt && !draft.empty()) smpl_save.reset(common_sampler_clone(smpl.get()));
