@@ -4857,7 +4857,7 @@ index fc6715c..7da6d1f 100644
  void ggml_quantize_mat_q8_0_4x1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
  void ggml_quantize_mat_q8_K_4x1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index 605c23c..8daea10 100644
+index 605c23c..a23bd0d 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -3,6 +3,7 @@
@@ -4876,7 +4876,7 @@ index 605c23c..8daea10 100644
  #include "htp/matmul-ops.h"
  #include "htp/binary-ops.h"
  #include "htp/flash-attn-ops.h"
-@@ -148,10 +150,39 @@ static const char * htp_power_mode_to_str(int mode) {
+@@ -148,10 +150,41 @@ static const char * htp_power_mode_to_str(int mode) {
  static size_t opt_mbuf_dyn    = 512ul * 1024 * 1024;      // max dynamic (compute) buffer size
  static size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buffer size
  static size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
@@ -4898,6 +4898,8 @@ index 605c23c..8daea10 100644
 +static int    opt_dst_flush      = 0; // GGML_HEXAGON_DST_FLUSH (diagnostic): 1 = clean dirty L2 ranges overlapping an op's outputs before it runs, 2 = whole-L2 clean before every op
 +static int    opt_opsum          = 0; // GGML_HEXAGON_OPSUM (diagnostic, with GGML_HEXAGON_PROFILE=1): per-op output word sums in the profile lines
 +static bool   opt_op_stack       = true; // GGML_HEXAGON_OP_STACK=0: pre-r17 DSP stacks (ops on the dspqueue callback thread's own ~16 KB stack instead of a 64 KB one, 16 KB HVX worker / 32 KB htp-main stacks)
++static int    opt_mmid_scat_first = 1; // GGML_HEXAGON_MMID_SCAT_FIRST=0: streamed expert gather step overlaps the scatter again (HTP_BATCH_MMID_SCAT_OVL)
++static int    opt_mmid_rep       = 0; // GGML_HEXAGON_MMID_REP=R (diagnostic, 0-15): every HMX MUL_MAT_ID_NX op runs R more times, outputs compared
 +static int    opt_wq_stall       = 0; // GGML_HEXAGON_WQ_STALL=k (diagnostic, 0-15): HVX workers pause k*16 times between seeing new work and scanning the queue
 +static int    opt_wq_old         = 0; // GGML_HEXAGON_WQ_OLD=1 (diagnostic): pre-r16 HVX work-queue scan (a worker could run its part of a task twice and release the producer early)
 +static int    opt_hmxq_drain     = 0; // GGML_HEXAGON_HMXQ_DRAIN: pop HMX jobs an op left in the queue after it (PROFILE=1 prints 'hmxq N' = jobs left)
@@ -4916,7 +4918,7 @@ index 605c23c..8daea10 100644
  static int    opt_gdn_select = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  static int    opt_ar_select  = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  static int    opt_ar_scatter = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
-@@ -166,7 +197,155 @@ static int opt_opqueue  = 8;   // max number of pending batches
+@@ -166,7 +199,155 @@ static int opt_opqueue  = 8;   // max number of pending batches
  static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
  static int opt_oppoll   = 0;    // polling for batch completions
  static int opt_opfusion  = 1;    // enable/disable op fusion
@@ -5072,7 +5074,7 @@ index 605c23c..8daea10 100644
  
  enum ggml_hexagon_fusion_flags {
      GGML_HEXAGON_FUSE_ALLREDUCE_ADD = (1 << 1), // 2
-@@ -175,6 +354,12 @@ enum ggml_hexagon_fusion_flags {
+@@ -175,6 +356,12 @@ enum ggml_hexagon_fusion_flags {
      GGML_HEXAGON_FUSE_MUL_MAT_NX    = (1 << 4), // 16
      GGML_HEXAGON_FUSE_MUL_MAT_ID_NX = (1 << 5), // 32
      GGML_HEXAGON_FUSE_GDN_CPY       = (1 << 6), // 64
@@ -5085,7 +5087,7 @@ index 605c23c..8daea10 100644
  };
  
  static inline bool ggml_hexagon_is_fusion_enabled(int flag) {
-@@ -265,6 +450,17 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_op
+@@ -265,12 +452,28 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_op
          static_assert(HTP_PROF_PMU_NCNT == 8, "current implementation assumes 8 PMU counters");
          snprintf(pmu_str, sizeof(pmu_str), " pmu [%u,%u,%u,%u,%u,%u,%u,%u]",
                  pmu[0], pmu[1], pmu[2], pmu[3], pmu[4], pmu[5], pmu[6], pmu[7]);
@@ -5103,7 +5105,18 @@ index 605c23c..8daea10 100644
      }
  
      htp_opformat fmt(node);
-@@ -315,6 +511,19 @@ enum ggml_hexagon_tensor_flags {
+     float mhz = op_usec > 0 ? (float) op_cycles / op_usec : 0.0f;
+     GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|%s|%s|%s|%s|%s|usec %u cycles %u start %u mhz %.1f%s\n", sess_name.c_str(),
+             node.op_name().c_str(), fmt.names, fmt.dims, fmt.types, fmt.strides, fmt.kparams, op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
++    if (opt_opsum && opt_profile != 2) {  // short line (a long profile line gets truncated): op, output, all 8 words
++        const char * dn = strrchr(fmt.names, '>');
++        GGML_LOG_DEBUG("ggml-hex: osumw %s %s %08x %08x %08x %08x %08x %08x %08x %08x\n", node.op_name().c_str(), dn ? dn + 2 : "-",
++                       pmu[4], pmu[5], pmu[6], pmu[7], pmu[0], pmu[1], pmu[2], pmu[3]);
++    }
+ }
+ 
+ static void ggml_hexagon_dump_batch_prof(const std::string & sess_name, const htp_opbatch_rsp & rsp) {
+@@ -315,6 +518,19 @@ enum ggml_hexagon_tensor_flags {
      GGML_HEXAGON_TENSOR_WEIGHT    = (1 << 1),
      GGML_HEXAGON_TENSOR_FENCE     = (1 << 2),
      GGML_HEXAGON_TENSOR_FUSEABLE  = (1 << 3),
@@ -5123,7 +5136,7 @@ index 605c23c..8daea10 100644
  };
  
  struct ggml_hexagon_session;
-@@ -342,7 +551,8 @@ static void ggml_hexagon_precompute_unary_params(
+@@ -342,7 +558,8 @@ static void ggml_hexagon_precompute_unary_params(
      const struct ggml_tensor * src0,
      const struct ggml_tensor * src1,
      const struct ggml_tensor * dst,
@@ -5133,7 +5146,7 @@ index 605c23c..8daea10 100644
  );
  
  static bool ggml_hexagon_precompute_binary_params(
-@@ -441,7 +651,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
+@@ -441,7 +658,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
      const struct ggml_tensor * src0,
      const struct ggml_tensor * act,
      int32_t n_weights,
@@ -5143,7 +5156,7 @@ index 605c23c..8daea10 100644
  );
  
  static void ggml_hexagon_precompute_fused_mmidnx_params(
-@@ -483,6 +694,8 @@ struct ggml_hexagon_tensor_extra {
+@@ -483,6 +701,8 @@ struct ggml_hexagon_tensor_extra {
      std::vector<uint8_t> shadow_buf;
      size_t               shadow_size { 0 };
      uint32_t             flags { 0 };
@@ -5152,7 +5165,7 @@ index 605c23c..8daea10 100644
  };
  
  static inline bool ggml_hexagon_tensor_is_fuseable(const struct ggml_tensor * t) {
-@@ -501,6 +714,10 @@ static inline bool ggml_hexagon_can_rt_repack(const struct ggml_tensor * t) {
+@@ -501,6 +721,10 @@ static inline bool ggml_hexagon_can_rt_repack(const struct ggml_tensor * t) {
      return opt_rt_repack > 1 || ggml_is_quantized(t->type);
  }
  
@@ -5163,7 +5176,7 @@ index 605c23c..8daea10 100644
  static inline bool ggml_hexagon_tensor_is_tiled(const struct ggml_tensor * t) {
      const auto * extra = (const ggml_hexagon_tensor_extra *) t->extra;
      if (extra && (extra->flags & GGML_HEXAGON_TENSOR_TILED)) {
-@@ -596,6 +813,7 @@ struct ggml_hexagon_session {
+@@ -596,6 +820,7 @@ struct ggml_hexagon_session {
      std::atomic<uint32_t> last_error{HTP_STATUS_OK};
  
      uint64_t                cached_uid = 0;
@@ -5171,7 +5184,7 @@ index 605c23c..8daea10 100644
      std::vector<htp_opnode> cached_nodes;
  
      ggml_hexagon_mdev_group                mdev;
-@@ -618,7 +836,7 @@ struct ggml_hexagon_session {
+@@ -618,7 +843,7 @@ struct ggml_hexagon_session {
      std::unordered_map<uint64_t, volatile uint32_t *> cpy_fence_slots;
  
      void enqueue_mdev_group();
@@ -5180,7 +5193,7 @@ index 605c23c..8daea10 100644
      void enqueue_cpy(const ggml_tensor * src, ggml_tensor * dst, const ggml_tensor * sync_tensor = nullptr, uint32_t fence_seq = 0);
      void enqueue_fence(const ggml_tensor * sync_tensor, uint32_t fence_seq = 0, bool wait = true);
      void enqueue_allreduce(const ggml_tensor * dst, const std::vector<const ggml_tensor *> & src_tensors,
-@@ -700,11 +918,13 @@ struct ggml_hexagon_rpcmem_block {
+@@ -700,11 +925,13 @@ struct ggml_hexagon_rpcmem_block {
              throw std::runtime_error("ggml-hex: rpcmem_to_fd failed");
          }
          this->size = size;
@@ -5194,7 +5207,7 @@ index 605c23c..8daea10 100644
          }
      }
  };
-@@ -896,6 +1116,119 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
+@@ -896,6 +1123,119 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
      return GGML_STATUS_SUCCESS;
  }
  
@@ -5314,7 +5327,7 @@ index 605c23c..8daea10 100644
  static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                     ggml_tensor *         tensor,
                                                     const void *          data,
-@@ -921,7 +1254,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -921,7 +1261,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
      }
  
      if (offset == 0 && size == ggml_nbytes(tensor) && extra->shadow_buf.empty()) {
@@ -5323,7 +5336,7 @@ index 605c23c..8daea10 100644
          return;
      }
  
-@@ -932,7 +1265,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -932,7 +1272,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
      extra->shadow_size += size;
  
      if (extra->shadow_size >= ggml_nbytes(tensor)) {
@@ -5332,7 +5345,7 @@ index 605c23c..8daea10 100644
          extra->shadow_buf.clear();
          extra->shadow_buf.shrink_to_fit();
          extra->shadow_size = 0;
-@@ -1008,7 +1341,7 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
+@@ -1008,7 +1348,7 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
      extra->shadow_size += n_copies * size;
  
      if (extra->shadow_size >= ggml_nbytes(tensor)) {
@@ -5341,7 +5354,7 @@ index 605c23c..8daea10 100644
          extra->shadow_buf.clear();
          extra->shadow_buf.shrink_to_fit();
          extra->shadow_size = 0;
-@@ -1163,6 +1496,9 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
+@@ -1163,6 +1503,9 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
          int64_t ne2 = t->ne[2];
          int64_t ne3 = t->ne[3];
          size_t tiled_size = htp_tiled_row_size(t->type, ne0) * ne1 * ne2 * ne3;
@@ -5351,7 +5364,7 @@ index 605c23c..8daea10 100644
          return std::max(tiled_size, ggml_nbytes(t));
      }
      return ggml_nbytes(t);
-@@ -1449,6 +1785,29 @@ struct ggml_hexagon_opbatch {
+@@ -1449,6 +1792,29 @@ struct ggml_hexagon_opbatch {
      unsigned int n_ops_max;
      size_t       b_vmem_max;
  
@@ -5381,7 +5394,7 @@ index 605c23c..8daea10 100644
      void reset() {
          n_bufs = 0;
          n_tens = 0;
-@@ -1599,6 +1958,12 @@ struct ggml_hexagon_opbatch {
+@@ -1599,6 +1965,12 @@ struct ggml_hexagon_opbatch {
          if ((extra->flags & GGML_HEXAGON_TENSOR_FENCE) != 0) {
              h.flags |= HTP_TENSOR_FENCE;
          }
@@ -5394,7 +5407,7 @@ index 605c23c..8daea10 100644
  
          HEX_VERBOSE("ggml-hex: %s add-tensor #%u %s : bi %d data %p offset %zu size %zu flags 0x%x : %zu:%zu:%zu:%zu\n", sess->c_name(),
                  ti, t->name, h.bi, (void*) t->data, (size_t) t_offset, t_size, h.flags,
-@@ -1607,6 +1972,32 @@ struct ggml_hexagon_opbatch {
+@@ -1607,6 +1979,32 @@ struct ggml_hexagon_opbatch {
          return ti;
      }
  
@@ -5427,7 +5440,7 @@ index 605c23c..8daea10 100644
      bool fit_op(const htp_opnode & node) const {
          if (n_ops >= n_ops_max) return false;
  
-@@ -1667,7 +2058,21 @@ struct ggml_hexagon_opbatch {
+@@ -1667,7 +2065,21 @@ struct ggml_hexagon_opbatch {
          memcpy(o.params,        node.node->op_params, sizeof(node.node->op_params));
          memcpy(o.kernel_params, node.kernel_params,   sizeof(o.kernel_params));
          o.opcode = node.opcode;
@@ -5450,7 +5463,7 @@ index 605c23c..8daea10 100644
  
          ggml_hexagon_dump_op_exec(sess->c_name(), ops[n], o.flags);
  
-@@ -1918,7 +2323,10 @@ struct ggml_hexagon_opbatch {
+@@ -1918,7 +2330,10 @@ struct ggml_hexagon_opbatch {
          if (!ggml_are_same_shape(src0, node.dst())) {
              return false;
          }
@@ -5462,7 +5475,7 @@ index 605c23c..8daea10 100644
              return false;
          }
  
-@@ -1965,6 +2373,15 @@ struct ggml_hexagon_opbatch {
+@@ -1965,6 +2380,15 @@ struct ggml_hexagon_opbatch {
          return true;
      }
  
@@ -5478,7 +5491,7 @@ index 605c23c..8daea10 100644
      bool try_fuse_mul_mat_add(const htp_opnode & node) {
          if (n_ops == 0) return false;
          if (node.opcode != HTP_OP_ADD) return false;
-@@ -1998,36 +2415,53 @@ struct ggml_hexagon_opbatch {
+@@ -1998,36 +2422,53 @@ struct ggml_hexagon_opbatch {
          const struct htp_mm_kernel_params * orig_kparams = (const struct htp_mm_kernel_params *) last_node.kernel_params;
          struct htp_mm_kernel_params kparams;
          ggml_hexagon_precompute_fused_matmul_add_params(sess, src0, src1, src2, node.dst(), &kparams);
@@ -5555,7 +5568,7 @@ index 605c23c..8daea10 100644
          if (!try_fuse_common(src2, node.dst())) {
              return false;
          }
-@@ -2096,13 +2530,18 @@ struct ggml_hexagon_opbatch {
+@@ -2096,13 +2537,18 @@ struct ggml_hexagon_opbatch {
                  return false;
              }
  
@@ -5576,7 +5589,7 @@ index 605c23c..8daea10 100644
              }
              if (!is_supported_mul_mat_nx_kernel(w0, &kparams)) {
                  return false;
-@@ -2113,6 +2552,7 @@ struct ggml_hexagon_opbatch {
+@@ -2113,6 +2559,7 @@ struct ggml_hexagon_opbatch {
                  return false;
              }
  
@@ -5584,7 +5597,7 @@ index 605c23c..8daea10 100644
              if (!try_fuse_common(w_in, d_in)) {
                  return false;
              }
-@@ -2161,13 +2601,15 @@ struct ggml_hexagon_opbatch {
+@@ -2161,13 +2608,15 @@ struct ggml_hexagon_opbatch {
                  return false;
              }
  
@@ -5602,7 +5615,7 @@ index 605c23c..8daea10 100644
              }
              if (!is_supported_mul_mat_nx_kernel(w0, &kparams)) {
                  return false;
-@@ -2178,6 +2620,7 @@ struct ggml_hexagon_opbatch {
+@@ -2178,6 +2627,7 @@ struct ggml_hexagon_opbatch {
                  return false;
              }
  
@@ -5610,7 +5623,7 @@ index 605c23c..8daea10 100644
              if (!try_fuse_common(w1, node.dst())) {
                  return false;
              }
-@@ -2258,6 +2701,7 @@ struct ggml_hexagon_opbatch {
+@@ -2258,6 +2708,7 @@ struct ggml_hexagon_opbatch {
                  return false;
              }
  
@@ -5618,7 +5631,7 @@ index 605c23c..8daea10 100644
              if (!try_fuse_common(w_in, d_in)) {
                  return false;
              }
-@@ -2311,6 +2755,7 @@ struct ggml_hexagon_opbatch {
+@@ -2311,6 +2762,7 @@ struct ggml_hexagon_opbatch {
                  return false;
              }
  
@@ -5626,7 +5639,7 @@ index 605c23c..8daea10 100644
              if (!try_fuse_common(w1, node.dst())) {
                  return false;
              }
-@@ -2419,14 +2864,870 @@ struct ggml_hexagon_opbatch {
+@@ -2419,14 +2871,870 @@ struct ggml_hexagon_opbatch {
          return true;
      }
  
@@ -6497,7 +6510,7 @@ index 605c23c..8daea10 100644
          return false;
      }
  };
-@@ -2499,6 +3800,14 @@ struct ggml_hexagon_opqueue {
+@@ -2499,6 +3807,16 @@ struct ggml_hexagon_opqueue {
          req.n_bufs    = op_batch->n_bufs;
          req.n_tensors = op_batch->n_tens;
          req.n_ops     = op_batch->n_ops;
@@ -6507,12 +6520,14 @@ index 605c23c..8daea10 100644
 +                        (opt_dst_flush == 1 ? HTP_BATCH_DST_FLUSH : 0u) | (opt_dst_flush == 2 ? HTP_BATCH_OP_FLUSH_ALL : 0u) |
 +                        (opt_opsum ? HTP_BATCH_OPSUM : 0u) | (opt_hmxq_drain ? HTP_BATCH_HMXQ_DRAIN : 0u) |
 +                        (opt_wq_old ? HTP_BATCH_WQ_OLD : 0u) |
-+                        (((uint32_t) opt_wq_stall & HTP_BATCH_WQ_STALL_MASK) << HTP_BATCH_WQ_STALL_SHIFT);
++                        (((uint32_t) opt_wq_stall & HTP_BATCH_WQ_STALL_MASK) << HTP_BATCH_WQ_STALL_SHIFT) |
++                        (opt_mmid_scat_first ? 0u : HTP_BATCH_MMID_SCAT_OVL) |
++                        (((uint32_t) opt_mmid_rep & HTP_BATCH_MMID_REP_MASK) << HTP_BATCH_MMID_REP_SHIFT);
 +        req.pad       = 0;
  
          op_cache[slot]   = op_batch->ops;
          start_usec[slot] = ggml_time_us();
-@@ -2654,6 +3963,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
+@@ -2654,6 +3972,13 @@ void ggml_hexagon_session::flush_pending(bool all) {
          }
  
          if (err != 0) {
@@ -6526,7 +6541,7 @@ index 605c23c..8daea10 100644
              GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
          }
  
-@@ -2693,6 +4009,50 @@ void ggml_hexagon_session::start_batch() {
+@@ -2693,6 +4018,50 @@ void ggml_hexagon_session::start_batch() {
  void ggml_hexagon_session::flush_batch(size_t min_ops) {
      if (op_batch->n_ops < min_ops) { return; }
  
@@ -6577,7 +6592,7 @@ index 605c23c..8daea10 100644
      op_batch->sort_buffers();
  
      htp_opbatch_req req {};
-@@ -2737,7 +4097,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+@@ -2737,7 +4106,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
      op_batch->reset();
  }
  
@@ -6586,7 +6601,7 @@ index 605c23c..8daea10 100644
      auto clone_tensor_buffer = [this](const ggml_tensor * t) {
          auto sbuf = this->mmap_tensor(t);
          if (!sbuf) return;
-@@ -2760,7 +4120,19 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+@@ -2760,7 +4129,19 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
          return;
      }
  
@@ -6606,7 +6621,7 @@ index 605c23c..8daea10 100644
          flush_async();
      }
  
-@@ -2774,6 +4146,21 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
+@@ -2774,6 +4155,21 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
      }
  
      op_batch->add_op(node);
@@ -6628,7 +6643,7 @@ index 605c23c..8daea10 100644
  }
  
  void ggml_hexagon_session::enqueue_mdev_group() {
-@@ -3322,7 +4709,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
+@@ -3322,7 +4718,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
      this->op_batch = new ggml_hexagon_opbatch(this, opt_opbatch, this->max_vmem);
  
      // Start dspqueue/opbatch processing
@@ -6638,7 +6653,7 @@ index 605c23c..8daea10 100644
      if (err != 0) {
          GGML_LOG_ERROR("ggml-hex: %s failed to start session: 0x%08x\n", this->c_name(), (unsigned) err);
          throw std::runtime_error("ggml-hex: iface start failed (see log for details)");
-@@ -3502,6 +4890,26 @@ static bool ggml_hexagon_flash_attn_is_hmx_eligible(
+@@ -3502,6 +4899,26 @@ static bool ggml_hexagon_flash_attn_is_hmx_eligible(
      return S >= s_cross;
  }
  
@@ -6665,7 +6680,7 @@ index 605c23c..8daea10 100644
  static bool ggml_hexagon_precompute_flash_attn_params(
      const struct ggml_hexagon_session * sess,
      const struct ggml_tensor * op,
-@@ -3548,7 +4956,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3548,7 +4965,9 @@ static bool ggml_hexagon_precompute_flash_attn_params(
      kparams->logit_softcap = logit_softcap;
  
      kparams->head_split = (opt_fa_head_split != 0) ? 1 : 0;
@@ -6676,7 +6691,7 @@ index 605c23c..8daea10 100644
      kparams->G = G;
  
      const uint32_t n_head = q->ne[2];
-@@ -3565,7 +4975,12 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3565,7 +4984,12 @@ static bool ggml_hexagon_precompute_flash_attn_params(
          const uint32_t DK_pad = hex_round_up(DK, 64);
          const uint32_t DV_pad = hex_round_up(DV, 64);
          size_t Br = 0, Bc = 0;
@@ -6690,7 +6705,7 @@ index 605c23c..8daea10 100644
          if (ret == 0) {
              kparams->kernel_type = HTP_FA_KERNEL_HMX;
              if (logit_softcap == 0.0f) {
-@@ -3582,7 +4997,11 @@ static bool ggml_hexagon_precompute_flash_attn_params(
+@@ -3582,7 +5006,11 @@ static bool ggml_hexagon_precompute_flash_attn_params(
  
              kparams->u.hmx.g_br = hex_align_up(G * Br, 32);
              kparams->u.hmx.pipeline = (kparams->n_kv_blocks >= 3 && sess->n_threads >= 2) ? 1 : 0;
@@ -6703,7 +6718,7 @@ index 605c23c..8daea10 100644
  
              const size_t row_vec_bytes = hex_align_up(Bc * sizeof(uint16_t), 256);
              kparams->u.hmx.row_buf_stride = row_vec_bytes / 128; // HVX vector is 128 bytes
-@@ -3836,10 +5255,11 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3836,10 +5264,11 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
      bool is_batched,
      size_t src2_size,
      size_t vtcm_budget,
@@ -6717,7 +6732,7 @@ index 605c23c..8daea10 100644
      const int n_threads = (int)sess->n_threads;
      const int ne10 = act->ne[0];
  
-@@ -3856,6 +5276,15 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3856,6 +5285,15 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
          }
      }
      const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(m_for_solver);
@@ -6733,7 +6748,7 @@ index 605c23c..8daea10 100644
  
      const bool is_batched_val = is_matmul_id ? false : is_batched;
      const int group_size = (ne02 > 0 ? ne12 / ne02 : 1);
-@@ -3889,10 +5318,55 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
+@@ -3889,10 +5327,55 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
          if (!htp_mm_hmx_solve_2d_params(wtype, ne00_padded, m_id_rows, ne01_padded, m_for_solver_padded, cost_m, n_threads, pipeline, is_matmul_id, aligned_tile_size, src2_size, vtcm_budget, &m_chunk, &n_chunk, &act_threads_selected, &vtcm_size)) {
              return false;
          }
@@ -6790,7 +6805,7 @@ index 605c23c..8daea10 100644
      kparams->m_chunk = m_chunk;
      kparams->n_chunk = n_chunk;
      kparams->n_threads = n_threads;
-@@ -4448,9 +5922,13 @@ static void ggml_hexagon_precompute_unary_params(
+@@ -4448,9 +5931,13 @@ static void ggml_hexagon_precompute_unary_params(
      const struct ggml_tensor * src0,
      const struct ggml_tensor * src1,
      const struct ggml_tensor * dst,
@@ -6805,7 +6820,7 @@ index 605c23c..8daea10 100644
  
      const uint32_t src0_nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
      const uint32_t n_threads  = (std::min)((uint32_t)sess->n_threads, src0_nrows);
-@@ -4488,7 +5966,7 @@ static void ggml_hexagon_precompute_unary_params(
+@@ -4488,7 +5975,7 @@ static void ggml_hexagon_precompute_unary_params(
  
      htp_unary_vtcm_layout_build(&L, op, src0->ne[0], dst->ne[0],
                                  op == HTP_OP_RMS_NORM_MUL ? src1->ne[0] : 0,
@@ -6814,7 +6829,7 @@ index 605c23c..8daea10 100644
                                  &col_tile, &vtcm_row_per_thread);
  
      kparams->col_tile = col_tile;
-@@ -4504,6 +5982,12 @@ static void ggml_hexagon_precompute_unary_params(
+@@ -4504,6 +5991,12 @@ static void ggml_hexagon_precompute_unary_params(
      kparams->vtcm_dst_size  = L.dst_bytes * n_threads;
  
      kparams->block = col_tile ? 0 : ((L.src0_bytes / 2) / src0_row_size_aligned);
@@ -6827,7 +6842,7 @@ index 605c23c..8daea10 100644
  
      const uint32_t tiles_per_row = col_tile > 0 ? (src0->ne[0] + col_tile - 1) / col_tile : 1;
      kparams->div_ne01  = init_fastdiv_values(src0->ne[1]);
-@@ -4559,6 +6043,13 @@ static void ggml_hexagon_precompute_get_rows_params(
+@@ -4559,6 +6052,13 @@ static void ggml_hexagon_precompute_get_rows_params(
      }
  
      kparams->vtcm_size = (total_tasks == 0) ? 0 : vtcm_layout.total_bytes;
@@ -6841,7 +6856,7 @@ index 605c23c..8daea10 100644
      kparams->tasks_per_thread = kparams->n_threads > 0 ? (total_tasks + kparams->n_threads - 1) / kparams->n_threads : 0;
      kparams->total_tasks = total_tasks;
  
-@@ -4680,9 +6171,11 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4680,9 +6180,11 @@ static void ggml_hexagon_precompute_rope_params(
      const uint32_t n_threads  = (std::min)((uint32_t) sess->n_threads, src0_nrows);
      const uint32_t n_freq_factors = src2 ? (uint32_t) src2->ne[0] : 0;
  
@@ -6854,7 +6869,7 @@ index 605c23c..8daea10 100644
      kparams->n_threads              = n_threads;
      kparams->src0_nrows             = src0_nrows;
      kparams->src0_nrows_per_thread  = (src0_nrows + n_threads - 1) / n_threads;
-@@ -4692,6 +6185,9 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4692,6 +6194,9 @@ static void ggml_hexagon_precompute_rope_params(
      kparams->src0_row_size_aligned  = (uint32_t) layout.src0_row_size_aligned;
      kparams->freq_factors_offset    = (uint32_t) (layout.bytes_per_thread * n_threads);
      kparams->freq_factors_size      = (uint32_t) layout.freq_factors_size_aligned;
@@ -6864,7 +6879,7 @@ index 605c23c..8daea10 100644
  
      if (src0_nrows > 0) {
          kparams->div_ne2_ne1 = init_fastdiv_values(dst->ne[2] * dst->ne[1]);
-@@ -4699,12 +6195,13 @@ static void ggml_hexagon_precompute_rope_params(
+@@ -4699,12 +6204,13 @@ static void ggml_hexagon_precompute_rope_params(
      }
  }
  
@@ -6880,7 +6895,7 @@ index 605c23c..8daea10 100644
  ) {
      memset(kparams, 0, sizeof(*kparams));
  
-@@ -4714,7 +6211,7 @@ static void ggml_hexagon_precompute_ssm_conv_params(
+@@ -4714,7 +6220,7 @@ static void ggml_hexagon_precompute_ssm_conv_params(
      const uint32_t n_s     = (uint32_t) dst->ne[2];
      const uint32_t ncs     = (uint32_t) src0->ne[0];
  
@@ -6889,7 +6904,7 @@ index 605c23c..8daea10 100644
  
      kparams->n_threads = n_threads;
      kparams->d_conv    = d_conv;
-@@ -4783,6 +6280,23 @@ static void ggml_hexagon_precompute_ssm_conv_params(
+@@ -4783,6 +6289,23 @@ static void ggml_hexagon_precompute_ssm_conv_params(
      kparams->vtcm_size      = kparams->vtcm_src0_size + kparams->vtcm_src1_size + kparams->vtcm_dst_size;
  }
  
@@ -6913,7 +6928,7 @@ index 605c23c..8daea10 100644
  static void ggml_hexagon_precompute_gated_delta_net_params(
      const struct ggml_hexagon_session * sess,
      const struct ggml_tensor * op,
-@@ -4820,13 +6334,30 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
+@@ -4820,13 +6343,30 @@ static void ggml_hexagon_precompute_gated_delta_net_params(
  
      if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout, S_v, HTP_GDN_CHUNK_SIZE, total_rows, sess->vtcm_size, n_threads, true, &n_heads_batch)) {
          kparams->kernel_type     = HTP_GDN_KERNEL_HMX_CHUNKED;
@@ -6945,7 +6960,7 @@ index 605c23c..8daea10 100644
      } else {
          htp_gdn_vtcm_layout_build(&hvx_layout, S_v, n_threads);
          kparams->kernel_type     = HTP_GDN_KERNEL_HVX_RECURRENT;
-@@ -4902,6 +6433,7 @@ static void ggml_hexagon_precompute_sort_params(
+@@ -4902,6 +6442,7 @@ static void ggml_hexagon_precompute_sort_params(
      kparams->merge_indices_off = (int32_t) layout.merge_indices_off;
      kparams->merge_elems       = (int32_t) layout.merge_elems;
      kparams->n_slots           = (int32_t) layout.n_slots;
@@ -6953,7 +6968,7 @@ index 605c23c..8daea10 100644
  }
  
  static void ggml_hexagon_pool_interior_range(
-@@ -5256,7 +6788,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
+@@ -5256,7 +6797,8 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
      const struct ggml_tensor * src0, // W0
      const struct ggml_tensor * act,  // x
      int32_t n_weights,
@@ -6963,7 +6978,7 @@ index 605c23c..8daea10 100644
  ) {
      memset(kparams, 0, sizeof(*kparams));
      kparams->n_threads = sess->n_threads;
-@@ -5282,7 +6815,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
+@@ -5282,7 +6824,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
  
      bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 2);
      if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, act, nullptr, false, is_batched)) {
@@ -6972,7 +6987,7 @@ index 605c23c..8daea10 100644
              kparams->n_weights = n_weights;
              goto finalize;
          }
-@@ -6125,7 +7658,8 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
+@@ -6125,7 +7667,8 @@ static bool ggml_hexagon_supported_rope(const struct ggml_hexagon_session * sess
      const uint32_t n_freq_factors = src2 ? (uint32_t) src2->ne[0] : 0;
  
      struct htp_rope_vtcm_layout layout;
@@ -6982,7 +6997,7 @@ index 605c23c..8daea10 100644
      if (layout.total_bytes > sess->vtcm_size) {
          return false;
      }
-@@ -6905,12 +8439,951 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
+@@ -6905,12 +8448,951 @@ static bool is_mergeable_mul_mat_id_pair(const ggml_tensor * n1, const ggml_tens
      return true;
  }
  
@@ -7934,7 +7949,7 @@ index 605c23c..8daea10 100644
  
      HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
  
-@@ -6927,9 +9400,154 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6927,9 +9409,154 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              auto * extra = (ggml_hexagon_tensor_extra *) graph->nodes[i]->extra;
              if (!extra) continue;
  
@@ -8091,7 +8106,7 @@ index 605c23c..8daea10 100644
                  extra->flags |= GGML_HEXAGON_TENSOR_FUSEABLE;
              } else if ((graph->nodes[i]->op == GGML_OP_MUL_MAT &&
                          ggml_get_op_params_i32(graph->nodes[i], 1) != GGML_HINT_SRC0_IS_HADAMARD) ||
-@@ -6943,9 +9561,260 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6943,9 +9570,260 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -8353,7 +8368,7 @@ index 605c23c..8daea10 100644
                  continue;
              }
  
-@@ -6968,6 +9837,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6968,6 +9846,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                      htp_repack_tensor_tiled(src0, raw.data(), raw.size());
                      auto * extra = (ggml_hexagon_tensor_extra *) src0->extra;
                      extra->flags |= GGML_HEXAGON_TENSOR_TILED;
@@ -8365,7 +8380,7 @@ index 605c23c..8daea10 100644
                  }
              }
  
-@@ -6991,8 +9865,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -6991,8 +9874,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                  auto inputs = node.get_inputs();
                  const struct ggml_tensor * src0 = inputs[0];
                  const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
@@ -8400,7 +8415,7 @@ index 605c23c..8daea10 100644
                      (struct htp_unary_kernel_params *)node.kernel_params
                  );
              } else if (node.opcode == HTP_OP_GET_ROWS) {
-@@ -7031,6 +9930,38 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -7031,6 +9939,38 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                      node.opcode == HTP_OP_TOP_K,
                      (struct htp_sort_kernel_params *) node.kernel_params
                  );
@@ -8439,7 +8454,7 @@ index 605c23c..8daea10 100644
              } else if (node.opcode == HTP_OP_POOL_2D || node.opcode == HTP_OP_POOL_1D) {
                  ggml_hexagon_precompute_pool_2d_params(
                      sess, node.node->src[0], node.dst(),
-@@ -7074,8 +10005,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -7074,8 +10014,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
      }
  
      // Queue and execute
@@ -8450,7 +8465,7 @@ index 605c23c..8daea10 100644
      }
  
      if (sess->last_error > HTP_STATUS_OK) {
-@@ -7773,6 +10704,19 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
+@@ -7773,6 +10713,19 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
          return false;
      }
  
@@ -8470,7 +8485,7 @@ index 605c23c..8daea10 100644
      bool supp = false;
      switch (op->op) {
          case GGML_OP_NONE:
-@@ -8369,7 +11313,65 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8369,7 +11322,65 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
      const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
      const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
@@ -8536,7 +8551,7 @@ index 605c23c..8daea10 100644
      const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
      const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
      const char * str_etm      = getenv("GGML_HEXAGON_ETM");
-@@ -8378,6 +11380,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8378,6 +11389,17 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
      const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
      const char * str_fa_head_split = getenv("GGML_HEXAGON_FA_HEAD_SPLIT");
@@ -8554,7 +8569,7 @@ index 605c23c..8daea10 100644
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
-@@ -8385,6 +11398,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8385,6 +11407,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_arch     = getenv("GGML_HEXAGON_ARCH");
      const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
      const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
@@ -8562,7 +8577,7 @@ index 605c23c..8daea10 100644
      const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
      const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
      const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
-@@ -8427,6 +11441,100 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8427,6 +11450,100 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
      opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
      opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
@@ -8663,7 +8678,7 @@ index 605c23c..8daea10 100644
      opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
      opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
      opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
-@@ -8443,6 +11551,27 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8443,6 +11560,29 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
      opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
      opt_fa_head_split = str_fa_head_split ? atoi(str_fa_head_split)       : opt_fa_head_split;
@@ -8682,6 +8697,8 @@ index 605c23c..8daea10 100644
 +    { const char * e = getenv("GGML_HEXAGON_HMXQ_DRAIN"); if (e) opt_hmxq_drain = atoi(e); }
 +    { const char * e = getenv("GGML_HEXAGON_WQ_OLD"); if (e) opt_wq_old = atoi(e); }
 +    { const char * e = getenv("GGML_HEXAGON_WQ_STALL"); if (e) opt_wq_stall = atoi(e); }
++    { const char * e = getenv("GGML_HEXAGON_MMID_SCAT_FIRST"); if (e) opt_mmid_scat_first = atoi(e); }
++    { const char * e = getenv("GGML_HEXAGON_MMID_REP"); if (e) opt_mmid_rep = atoi(e); }
 +    { const char * e = getenv("GGML_HEXAGON_OP_STACK"); if (e) opt_op_stack = atoi(e) != 0; }
 +    { const char * e = getenv("GGML_HEXAGON_FUSE_HAZARD"); if (e) opt_fuse_hazard = atoi(e); }
 +    opt_fa_il_opt     = str_fa_il_opt     ? atoi(str_fa_il_opt)           : opt_fa_il_opt;
@@ -8691,7 +8708,7 @@ index 605c23c..8daea10 100644
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
      opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
      opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
-@@ -8464,6 +11593,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -8464,6 +11604,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
              p = comma + 1;
          }
      }
@@ -16884,7 +16901,7 @@ index 840b1ed..cd71471 100644
          return;
      }
 diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
-index 9b4b86d..c3436e0 100644
+index 9b4b86d..4e9b693 100644
 --- a/ggml/src/ggml-hexagon/htp/htp-ops.h
 +++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
 @@ -115,6 +115,7 @@ enum htp_op_code {
@@ -16963,7 +16980,7 @@ index 9b4b86d..c3436e0 100644
  };
  
  enum htp_buf_flags {
-@@ -167,9 +220,83 @@ struct htp_buf_desc {
+@@ -167,9 +220,96 @@ struct htp_buf_desc {
  
  enum htp_op_flags {
      HTP_OPFLAGS_STUB  = (1U << 0),
@@ -17041,13 +17058,26 @@ index 9b4b86d..c3436e0 100644
 +// and reading the queue indices (widens the window of the pre-r16 double-run race; scheduling only)
 +#define HTP_BATCH_WQ_STALL_SHIFT  21
 +#define HTP_BATCH_WQ_STALL_MASK   0xfu
++// bit 19 (host GGML_HEXAGON_MMID_SCAT_FIRST=0): the streamed expert kernel's step that DMA-gathers a new segment's activation
++// rows runs the scatter of the older item concurrently with the gathers again (pre-r18 task order). Default: the scatter
++// tasks come first and the gather threads start their DMA gathers only when all of them are done (same fork-join, same
++// arithmetic). With the concurrent order the op rarely (~1 in 1,000 LFM2.5 prefills) produced wrong output around that
++// step: mostly single 128-byte HMX output-tile vectors of the scattered item (zeros or unrelated values), once a whole
++// gathered activation row pair. The hardware cause is not known (the gathers still overlap thread 0's dequant).
++#define HTP_BATCH_MMID_SCAT_OVL   (1u << 19)
++// bits 26-29 (host GGML_HEXAGON_MMID_REP=R, diagnostic): every MUL_MAT_ID_NX op on HMX runs R more times on the same inputs;
++// the DSP compares dsts[0] after each run with the first run's (per-2KB-block hashes, then element by element) and reports
++// the result in htp_prof_desc.pmu[0..7] (needs GGML_HEXAGON_PROFILE=1 GGML_HEXAGON_OPSUM=1; 'osumw' log lines).
++// Ops whose outputs overlap an input run once and are reported as not checked.
++#define HTP_BATCH_MMID_REP_SHIFT  26
++#define HTP_BATCH_MMID_REP_MASK   0xfu
 +
  // Op descriptor
 +
  struct htp_op_desc {
      uint32_t opcode;                    // GGML/HTP Op
      uint32_t flags;                     // Op flags
-@@ -207,6 +334,12 @@ enum htp_power_mode {
+@@ -207,6 +347,12 @@ enum htp_power_mode {
      HTP_POWER_MODE_COUNT
  };
  
@@ -17060,7 +17090,7 @@ index 9b4b86d..c3436e0 100644
  enum htp_trace_event_id {
      HTP_TRACE_EVT_DMA                 = 0,
      HTP_TRACE_EVT_L2FLUSH             = 1,
-@@ -260,6 +393,8 @@ struct htp_opbatch_req {
+@@ -260,6 +406,8 @@ struct htp_opbatch_req {
      uint32_t n_tensors;   // Number of tensors
      uint32_t n_ops;       // Number of ops
      uint32_t n_traces;    // Number of trace descriptors per thread
@@ -18048,7 +18078,7 @@ index b7c2d74..fc1ad33 100644
 +
  #endif /* HVX_SIGMOID_H */
 diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
-index b72ef2b..4de9476 100644
+index b72ef2b..389a34f 100644
 --- a/ggml/src/ggml-hexagon/htp/main.c
 +++ b/ggml/src/ggml-hexagon/htp/main.c
 @@ -35,12 +35,25 @@
@@ -18392,7 +18422,7 @@ index b72ef2b..4de9476 100644
      memset(ctx->dirty_ranges, 0, sizeof(ctx->dirty_ranges));
      htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
  
-@@ -1306,23 +1485,70 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+@@ -1306,23 +1485,73 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
      octx->ctx           = ctx;
  
      mdev_group_init(ctx, req);
@@ -18427,6 +18457,9 @@ index b72ef2b..4de9476 100644
 +    if (hmx_wake == 2) {
 +        hmx_queue_spin_begin_wake(ctx->hmx_queue);
 +    }
++    extern uint32_t g_mmid_chk[8];
++    extern int      g_mmid_chk_valid;
++    g_mmid_chk_valid = 0;
      for (uint32_t i = 0; i < n_ops; i++) {
          struct profile_data prof;
  
@@ -18463,7 +18496,7 @@ index b72ef2b..4de9476 100644
          htp_ops_context_set_status(octx, op_status);
  
          if (ctx->profiler) {
-@@ -1333,9 +1559,52 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+@@ -1333,9 +1562,56 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
              for (int j = 0; j < HEX_NUM_PMU_COUNTERS; j++) {
                  pds[i].pmu[j] = prof.pmu_counters[j];
              }
@@ -18503,11 +18536,15 @@ index b72ef2b..4de9476 100644
 +                }
 +                if (ctx->batch_flags & HTP_BATCH_OPSUM) {
 +                    for (int d = 0; d < 4 && d < HTP_OP_MAX_OUTPUTS; d++) {
-+                        pds[i].pmu[4 + d] = htp_osum(ctx, octx->dsts[d]);
++                        pds[i].pmu[4 + d] = g_mmid_chk_valid ? g_mmid_chk[d] : htp_osum(ctx, octx->dsts[d]);
++                    }
++                    if (g_mmid_chk_valid) {  // GGML_HEXAGON_MMID_REP: the check's detail words replace the stack probe
++                        for (int d = 0; d < 4; d++) pds[i].pmu[d] = g_mmid_chk[4 + d];
 +                    }
 +                }
 +            }
          }
++        g_mmid_chk_valid = 0;  // GGML_HEXAGON_MMID_REP result belongs to this op only (cleared in every profile mode)
      }
  
 +    if (hmx_wake == 2) {
@@ -18516,7 +18553,7 @@ index b72ef2b..4de9476 100644
      if (ctx->hmx_queue) {
          hmx_queue_suspend(ctx->hmx_queue);
          hmx_queue_flush(ctx->hmx_queue);
-@@ -1425,12 +1694,48 @@ static void process_ops(struct htp_context * ctx) {
+@@ -1425,12 +1701,48 @@ static void process_ops(struct htp_context * ctx) {
      vtcm_release(ctx);
  }
  
@@ -18567,7 +18604,7 @@ index b72ef2b..4de9476 100644
  }
  
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index 9af3129..f3bd70b 100644
+index 9af3129..2805bfd 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -125,6 +125,7 @@ struct htp_mm_context {
@@ -19821,7 +19858,7 @@ index 9af3129..f3bd70b 100644
                  }
              }
          }
-@@ -2904,63 +3890,639 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
+@@ -2904,67 +3890,643 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
      return 0;
  }
  
@@ -19909,6 +19946,10 @@ index 9af3129..f3bd70b 100644
 -
 -    const int tile_size       = kparams->tile_size;
 -    const int aligned_tile_size = kparams->aligned_tile_size;
+-
+-    const bool is_tiled       = (tile_size > 0);
+-    tiled_dequant_task_fn_t dequant_worker_fn = hmx_get_dequant_worker_fn(weight_type, is_tiled);
+-    const size_t vtcm_budget  = ctx->vtcm_size;
 +// GGML_HEXAGON_EPI_LUT: one complete row pair of the tiled SWIGLU epilogue (fp16 sigmoid), q(|g|) of four column tiles
 +// gathered from the table at a time (gb: 8 gather vectors of this task, the two halves in turn)
 +static inline __attribute__((always_inline)) void hmx_tsw_lut_row_k(const int mode, const int ncomp, const HVX_Vector * restrict tsrc, HVX_Vector * restrict out,
@@ -19960,9 +20001,13 @@ index 9af3129..f3bd70b 100644
 +    }
 +}
  
--    const bool is_tiled       = (tile_size > 0);
--    tiled_dequant_task_fn_t dequant_worker_fn = hmx_get_dequant_worker_fn(weight_type, is_tiled);
--    const size_t vtcm_budget  = ctx->vtcm_size;
+-    const int m_chunk_n_rows  = kparams->m_chunk;
+-    const int n_chunk_n_cols  = kparams->n_chunk;
+-    const int pipeline        = kparams->pipeline;
+-    const int n_threads       = octx->n_threads;
+-    const int act_threads     = kparams->n_act_threads;
+-    const struct fastdiv_values * act_threads_div = &kparams->div_n_act_threads;
+-    const struct fastdiv_values * k_div           = &kparams->div_ne00_padded;
 +#define hmx_tsw_lut_row(mode, ...) hmx_tsw_lut_row_k(mode, 0, __VA_ARGS__)
 +
 +// GGML_HEXAGON_EPI_FAST + EPI_LUT: the complete row pairs [ra, rb) of the tiled SWIGLU epilogue as one flat sequence of
@@ -19977,13 +20022,8 @@ index 9af3129..f3bd70b 100644
 +    HVX_Vector         rse, rso;
 +};
  
--    const int m_chunk_n_rows  = kparams->m_chunk;
--    const int n_chunk_n_cols  = kparams->n_chunk;
--    const int pipeline        = kparams->pipeline;
--    const int n_threads       = octx->n_threads;
--    const int act_threads     = kparams->n_act_threads;
--    const struct fastdiv_values * act_threads_div = &kparams->div_n_act_threads;
--    const struct fastdiv_values * k_div           = &kparams->div_ne00_padded;
+-    const uint32_t dma_dst_stride  = is_tiled ? aligned_tile_size : row_stride;
+-    const uint32_t dma_width_bytes = is_tiled ? tile_size : row_stride;
 +static inline __attribute__((always_inline)) void hmx_tsw_rowp_set(const int mode, struct hmx_tsw_rowp * p, uint32_t r, const __fp16 * vtcm_src,
 +                                                                 __fp16 * dst_seg, size_t tile_row_stride, size_t k_tiles,
 +                                                                 size_t col_tile0, const float * rs) {
@@ -20000,8 +20040,8 @@ index 9af3129..f3bd70b 100644
 +    }
 +}
  
--    const uint32_t dma_dst_stride  = is_tiled ? aligned_tile_size : row_stride;
--    const uint32_t dma_width_bytes = is_tiled ? tile_size : row_stride;
+-    struct htp_mm_hmx_vtcm_layout L;
+-    htp_mm_hmx_vtcm_layout_build(&L, HTP_MM_KERNEL_HMX_2D, weight_type, k, m_chunk_n_rows, n_chunk_n_cols, 1, pipeline, act_threads, aligned_tile_size, 0);
 +// loads of the group at (A, B, c0, e): g, u, output pointers; issues its gathers into gq
 +static inline __attribute__((always_inline)) void hmx_tsw_flat_load(const int mode, const struct hmx_tsw_rowp * pA,
 +                                                                  const struct hmx_tsw_rowp * pB, size_t c0, size_t e, size_t total,
@@ -20035,8 +20075,10 @@ index 9af3129..f3bd70b 100644
 +    }
 +}
  
--    struct htp_mm_hmx_vtcm_layout L;
--    htp_mm_hmx_vtcm_layout_build(&L, HTP_MM_KERNEL_HMX_2D, weight_type, k, m_chunk_n_rows, n_chunk_n_cols, 1, pipeline, act_threads, aligned_tile_size, 0);
+-    if (L.total_bytes > vtcm_budget) {
+-        FARF(ERROR, "hmx-mm-nx-2d: VTCM overflow: used %zu budget %zu, m %d k %d mc %d nc %d",
+-             L.total_bytes, vtcm_budget, m, k, m_chunk_n_rows, n_chunk_n_cols);
+-        return HTP_STATUS_VTCM_TOO_SMALL;
 +static inline __attribute__((always_inline)) void hmx_tsw_lut_flat_k(const int mode, const __fp16 * vtcm_src, __fp16 * dst_seg,
 +                                                                   size_t tile_row_stride, size_t k_tiles, size_t col_tile0,
 +                                                                   uint32_t ra, uint32_t rb, size_t nt, size_t tstep, size_t up_v,
@@ -20090,13 +20132,11 @@ index 9af3129..f3bd70b 100644
 +        if (!more) {
 +            break;
 +        }
-+    }
+     }
 +}
  
--    if (L.total_bytes > vtcm_budget) {
--        FARF(ERROR, "hmx-mm-nx-2d: VTCM overflow: used %zu budget %zu, m %d k %d mc %d nc %d",
--             L.total_bytes, vtcm_budget, m, k, m_chunk_n_rows, n_chunk_n_cols);
--        return HTP_STATUS_VTCM_TOO_SMALL;
+-    uint8_t * const base = (uint8_t *) ctx->vtcm_base;
+-    __fp16  *vtcm_weight_raw[2] = {
 +// MUL_MAT_NX+SWIGLU with HTP_MM_ACT_F16OUT: the paired epilogue stores fp16 in the consumer's activation tile layout
 +typedef struct {
 +    __fp16 *       dst_seg;    // tile row 0 of this m-block in the consumer layout
@@ -20504,9 +20544,13 @@ index 9af3129..f3bd70b 100644
 +        FARF(ERROR, "hmx-mm-nx-2d: VTCM overflow: used %zu budget %zu, m %d k %d mc %d nc %d",
 +             L.total_bytes, vtcm_budget, m, k, m_chunk_n_rows, n_chunk_n_cols);
 +        return HTP_STATUS_VTCM_TOO_SMALL;
-     }
- 
-     uint8_t * const base = (uint8_t *) ctx->vtcm_base;
++    }
++
++    uint8_t * const base = (uint8_t *) ctx->vtcm_base;
++    __fp16  *vtcm_weight_raw[2] = {
+         VTCM_LAYOUT_PTR(__fp16, base, L.off_weight[0]),
+         VTCM_LAYOUT_PTR_OPTIONAL(__fp16, base, L.off_weight[1], pipeline)
+     };
 @@ -3000,6 +4562,13 @@ static int hmx_mm_nx_2d_f32(struct htp_ops_context * octx, const struct htp_mm_k
          return HTP_STATUS_OK;
      }
@@ -21217,7 +21261,7 @@ index 9af3129..f3bd70b 100644
      if (n_rows <= 0) return;
      int chunks_per_thread = hmx_ceil_div(n_rows, n_threads);
      chunks_per_thread = hex_align_up(chunks_per_thread, 2);
-@@ -3502,49 +5669,984 @@ static void transfer_output_chunk_scattered_threaded(
+@@ -3502,6 +5669,8 @@ static void transfer_output_chunk_scattered_threaded(
          .dst_nb2           = dst_nb2,
          .start_row         = start_row,
          .cne1              = cne1,
@@ -21226,17 +21270,10 @@ index 9af3129..f3bd70b 100644
          .traces            = ctx->trace,
      };
  
--    if (actual_threads <= 1) {
--        transfer_output_chunk_scattered_worker_fn(1, 0, &state);
--    } else {
--        worker_pool_run_func(ctx->worker_pool, transfer_output_chunk_scattered_worker_fn, &state, actual_threads);
-+    if (actual_threads <= 1) {
-+        transfer_output_chunk_scattered_worker_fn(1, 0, &state);
-+    } else {
-+        worker_pool_run_func(ctx->worker_pool, transfer_output_chunk_scattered_worker_fn, &state, actual_threads);
-+    }
-+}
-+
+@@ -3512,16 +5681,101 @@ static void transfer_output_chunk_scattered_threaded(
+     }
+ }
+ 
 +// HTP_MMID_STREAM_ACT_TILED fallback: copy whole HMX activation tile rows (already in the layout the HMX job
 +// reads) from the producer's expert-sorted fp16 block into VTCM, split over the HVX threads.
 +struct hmx_mmid_tiled_copy_state {
@@ -21320,27 +21357,29 @@ index 9af3129..f3bd70b 100644
 +// call, chunk 0 of the next call (`next`) is prefetched into the raw buffer when it fits in this call's weight
 +// area; `pf` carries that prefetch to the next call. Arithmetic is unchanged: each output element is still one
 +// HMX job over the full k.
-+static int hmx_mm_id_2d_f32(struct htp_context *ctx,
-+                                         dma_queue *weight_dma,
+ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+                                          dma_queue *weight_dma,
+-                                         float *restrict dst,
 +                                         int n_w,
 +                                         float * const * dsts,
 +                                         const size_t * dst_nb1s,
 +                                         const size_t * dst_nb2s,
 +                                         const dma_addr_t * weights,
-+                                         const float *activation,
-+                                         int m, int k, int n,
-+                                         int k_valid,
-+                                         int ne11,
-+                                         size_t act_nb1, size_t act_nb2,
-+                                         int weight_stride,
-+                                         int weight_type,
-+                                         int tile_size,
-+                                         int aligned_tile_size,
-+                                         const struct mmid_row_mapping *matrix_rows,
-+                                         int cur_a,
-+                                         int mapping_stride,
-+                                         int m_start,
-+                                         int m_end,
+                                          const float *activation,
+-                                         dma_addr_t weight,
+                                          int m, int k, int n,
+                                          int k_valid,
+                                          int ne11,
+                                          size_t act_nb1, size_t act_nb2,
+-                                         size_t dst_nb1, size_t dst_nb2,
+                                          int weight_stride,
+                                          int weight_type,
+                                          int tile_size,
+@@ -3531,20 +5785,906 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+                                          int mapping_stride,
+                                          int m_start,
+                                          int m_end,
+-                                         int n_threads) {
 +                                         int n_threads,
 +                                         bool aligned_out,  // HTP_MMID_STREAM_ALIGNED_OUT
 +                                         int combine_w,     // weight whose scatter does dst = silu(dst) * acc (-1: none)
@@ -21349,9 +21388,12 @@ index 9af3129..f3bd70b 100644
 +                                         const __fp16 * tiled_act) { // non-NULL: this expert's rows in the
 +                                         // HTP_MMID_STREAM_ACT_TILED layout (row 0 of the expert), copied
 +                                         // as whole tile rows instead of gathered
-+    struct htp_thread_trace * tr = &ctx->trace[0];
-+    htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
-+
+     struct htp_thread_trace * tr = &ctx->trace[0];
+     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+ 
+-    const int cne1 = m;
+-    const int m_core = m_end - m_start;
+-    const int m_core_padded = hex_align_up(m_core > 0 ? m_core : 1, 32);
 +    const int cne1 = m;
 +    const int m_core = m_end - m_start;
 +    const int m_core_padded = hex_align_up(m_core > 0 ? m_core : 1, 32);
@@ -21828,6 +21870,10 @@ index 9af3129..f3bd70b 100644
 +    uint8_t                         bag_np[HTP_MAX_NTHREADS], bag_nc[HTP_MAX_NTHREADS];
 +    uint32_t                        bag_ps[HTP_MAX_NTHREADS][HMX_MMID_BAG_MAX_BLK];
 +
++    // scatter first: the first scat_first tasks of the list are the scatter tasks; the gather threads wait for s_done == scat_first
++    uint32_t                        scat_first;
++    atomic_uint                     s_done;
++
 +    // dequant
 +    tiled_dequantize_state_t        dq;
 +} hmx_mmid_hvx_step_t;
@@ -21978,6 +22024,38 @@ index 9af3129..f3bd70b 100644
 +    dma_queue_push(q, dma_make_data(dst, src), row, row, row, bytes / row);
 +}
 +
++// scatter task j of a step (rows [j * s_task_rows, ...) of the older item)
++static void hmx_mmid_step_scatter(hmx_mmid_hvx_step_t * st, struct htp_thread_trace * tr, uint32_t j) {
++    const uint32_t r0 = j * st->s_task_rows;
++    int rows = (int) st->s_n_rows - (int) r0;
++    if (rows > (int) st->s_task_rows) rows = (int) st->s_task_rows;
++    if (rows <= 0 || st->s_mr + r0 >= st->s_cne1) return;
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, j);
++    if (st->s_tiled) {
++        // valid rows only (the pair holding the last one is written whole)
++        const uint32_t valid = st->s_cne1 - (st->s_mr + r0);
++        transfer_output_chunk_tiled_swiglu_pair(
++            st->s_tiled, st->s_src, r0, (uint32_t) rows < valid ? (uint32_t) rows : valid,
++            st->s_n_cols, st->s_col_tile0, st->s_k_tiles, st->s_swiglu, (g_mmid_opt & HTP_MMID_OPT_SCAT_V1) != 0);
++    } else if (st->s_swiglu == HMX_MMID_SCATTER_F16) {
++        transfer_output_chunk_f16_scattered(
++            (__fp16 *) st->s_dst, st->s_src, st->s_mr + r0, r0, (uint32_t) rows, st->s_n_cols,
++            st->matrix_rows, st->s_a, st->mapping_stride, st->s_nb1, st->s_nb2, st->s_cne1,
++            st->s_aligned);
++    } else if (st->s_swiglu) {
++        transfer_output_chunk_scattered_swiglu_pair(
++            st->s_dst, st->s_src, st->s_mr + r0, r0, (uint32_t) rows, st->s_n_cols,
++            st->matrix_rows, st->s_a, st->mapping_stride, st->s_nb1, st->s_nb2, st->s_cne1,
++            st->s_aligned, st->s_swiglu);
++    } else {
++        transfer_output_chunk_fp16_to_fp32_scattered(
++            st->s_dst, st->s_src, st->s_mr + r0, r0, (uint32_t) rows, st->s_n_cols,
++            st->matrix_rows, st->s_a, st->mapping_stride, st->s_nb1, st->s_nb2, st->s_cne1,
++            st->s_aligned);
++    }
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, j);
++}
++
 +static void hmx_mmid_hvx_step_worker(unsigned int n, unsigned int i, void * data) {
 +    (void) n;
 +    hmx_mmid_hvx_step_t * st = (hmx_mmid_hvx_step_t *) data;
@@ -22016,6 +22094,24 @@ index 9af3129..f3bd70b 100644
 +        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, 0);
 +    }
 +
++    if (i > 0 && st->n_g_dma > 0 && st->scat_first) {
++        // scatter first (HTP_BATCH_MMID_SCAT_OVL clear): the list starts with the step's scatter tasks; a gather thread helps
++        // with them and starts its DMA gathers only when all of them are done. With the gathers running alongside the
++        // scatter, the op rarely produced wrong output (~1 in 1,000 LFM2.5 prefills, always around this step, which runs
++        // the next segment's DMA gathers on threads 1..n-1): mostly single 128-byte HMX output-tile vectors of the item
++        // scattered here (zeros or unrelated values), once a whole gathered activation row pair of the new segment. The
++        // hardware mechanism is not known; this order removes the scatter / gather overlap (same tasks, same arithmetic)
++        // and stopped the events in the GGML_HEXAGON_MMID_REP diagnostic. The gathers still overlap thread 0's dequant.
++        for (;;) {
++            unsigned int t = atomic_load(&st->next);
++            if (t >= st->scat_first) break;
++            if (!atomic_compare_exchange_weak(&st->next, &t, t + 1)) continue;
++            hmx_mmid_step_scatter(st, tr, st->idx[t]);
++            atomic_fetch_add(&st->s_done, 1);
++        }
++        while (atomic_load(&st->s_done) < st->scat_first) {
++        }
++    }
 +    if (i > 0 && st->n_g_dma > 0) {
 +        dma_queue * q    = st->ctx->dma[i];
 +        float *     ring = st->dma_ring + (size_t) (i - 1) * st->dma_ring_floats;
@@ -22059,34 +22155,8 @@ index 9af3129..f3bd70b 100644
 +                break;
 +            }
 +            case HMX_MMID_T_SCATTER: {
-+                const uint32_t r0 = j * st->s_task_rows;
-+                int rows = (int) st->s_n_rows - (int) r0;
-+                if (rows > (int) st->s_task_rows) rows = (int) st->s_task_rows;
-+                if (rows <= 0 || st->s_mr + r0 >= st->s_cne1) break;
-+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, j);
-+                if (st->s_tiled) {
-+                    // valid rows only (the pair holding the last one is written whole)
-+                    const uint32_t valid = st->s_cne1 - (st->s_mr + r0);
-+                    transfer_output_chunk_tiled_swiglu_pair(
-+                        st->s_tiled, st->s_src, r0, (uint32_t) rows < valid ? (uint32_t) rows : valid,
-+                        st->s_n_cols, st->s_col_tile0, st->s_k_tiles, st->s_swiglu, (g_mmid_opt & HTP_MMID_OPT_SCAT_V1) != 0);
-+                } else if (st->s_swiglu == HMX_MMID_SCATTER_F16) {
-+                    transfer_output_chunk_f16_scattered(
-+                        (__fp16 *) st->s_dst, st->s_src, st->s_mr + r0, r0, (uint32_t) rows, st->s_n_cols,
-+                        st->matrix_rows, st->s_a, st->mapping_stride, st->s_nb1, st->s_nb2, st->s_cne1,
-+                        st->s_aligned);
-+                } else if (st->s_swiglu) {
-+                    transfer_output_chunk_scattered_swiglu_pair(
-+                        st->s_dst, st->s_src, st->s_mr + r0, r0, (uint32_t) rows, st->s_n_cols,
-+                        st->matrix_rows, st->s_a, st->mapping_stride, st->s_nb1, st->s_nb2, st->s_cne1,
-+                        st->s_aligned, st->s_swiglu);
-+                } else {
-+                    transfer_output_chunk_fp16_to_fp32_scattered(
-+                        st->s_dst, st->s_src, st->s_mr + r0, r0, (uint32_t) rows, st->s_n_cols,
-+                        st->matrix_rows, st->s_a, st->mapping_stride, st->s_nb1, st->s_nb2, st->s_cne1,
-+                        st->s_aligned);
-+                }
-+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_O_PROC, j);
++                hmx_mmid_step_scatter(st, tr, j);
++                if (st->scat_first) atomic_fetch_add(&st->s_done, 1);
 +                break;
 +            }
 +            default: {
@@ -22115,33 +22185,13 @@ index 9af3129..f3bd70b 100644
 +            st->bag_np[i]    = (uint8_t) (p + 1);
 +        }
 +        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, 4001);
-     }
++    }
 +#undef HMX_MMID_BAG_PUSH
 +#undef HMX_MMID_BAG_BLK
- }
++}
  
--static int hmx_mm_id_2d_f32(struct htp_context *ctx,
--                                         dma_queue *weight_dma,
--                                         float *restrict dst,
--                                         const float *activation,
--                                         dma_addr_t weight,
--                                         int m, int k, int n,
--                                         int k_valid,
--                                         int ne11,
--                                         size_t act_nb1, size_t act_nb2,
--                                         size_t dst_nb1, size_t dst_nb2,
--                                         int weight_stride,
--                                         int weight_type,
--                                         int tile_size,
--                                         int aligned_tile_size,
--                                         const struct mmid_row_mapping *matrix_rows,
--                                         int cur_a,
--                                         int mapping_stride,
--                                         int m_start,
--                                         int m_end,
--                                         int n_threads) {
--    struct htp_thread_trace * tr = &ctx->trace[0];
--    htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+-    if (k % 32 != 0 || n % 32 != 0) { return -1; }
+-    if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN)) { return -1; }
 +// task list: memory-bound tasks first and spread out, dequant tasks in between
 +static void hmx_mmid_hvx_step_build(hmx_mmid_hvx_step_t * st, uint32_t n_g, uint32_t n_s, uint32_t n_d, bool dma_gather) {
 +    st->n_g_dma = dma_gather ? n_g : 0;
@@ -22149,6 +22199,11 @@ index 9af3129..f3bd70b 100644
 +    if (dma_gather) n_g = 0;
 +    uint32_t g = 0, s = 0, d = 0, t = 0;
 +    assert(n_g <= HMX_MMID_MAX_G && n_s <= HMX_MMID_MAX_S && n_d <= HMX_MMID_MAX_D);
++    atomic_store(&st->s_done, 0);
++    if (st->scat_first) {  // requested by the caller (nonzero); becomes the scatter task count
++        st->scat_first = n_s;
++        for (; s < n_s; ++s) { st->type[t] = HMX_MMID_T_SCATTER; st->idx[t++] = (uint8_t) s; }
++    }
 +    while (g < n_g || s < n_s || d < n_d) {
 +        if (g < n_g) { st->type[t] = HMX_MMID_T_GATHER;  st->idx[t++] = (uint8_t) g++; }
 +        if (s < n_s) { st->type[t] = HMX_MMID_T_SCATTER; st->idx[t++] = (uint8_t) s++; }
@@ -22158,9 +22213,14 @@ index 9af3129..f3bd70b 100644
 +    atomic_store(&st->next, 0);
 +}
  
--    const int cne1 = m;
--    const int m_core = m_end - m_start;
--    const int m_core_padded = hex_align_up(m_core > 0 ? m_core : 1, 32);
+-    size_t row_stride = htp_tensor_get_row_size(weight_type, k);
+-    if (row_stride == 0) {
+-        return -1;
++// GGML_HEXAGON_MMID_REP diagnostic: plan of the last streamed op (read by op_matmul_id_nx's repeat check)
++static uint32_t g_chk_mc, g_chk_nc, g_chk_n, g_chk_n_as;
++static bool     g_chk_tiled, g_chk_bag;
++static uint32_t g_chk_offs[HMX_MMID_TILED_MAX_AS];
++
 +// Returns 1 when the op cannot use the streamed kernel (nothing was done, use the per-expert kernel),
 +// 0 on success, -1 on error.
 +static int hmx_mm_id_stream_f32(struct htp_context *ctx,
@@ -22213,16 +22273,11 @@ index 9af3129..f3bd70b 100644
 +
 +    const size_t row_stride = htp_tensor_get_row_size(weight_type, k);
 +    if (row_stride == 0) return 1;
- 
--    if (k % 32 != 0 || n % 32 != 0) { return -1; }
--    if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN)) { return -1; }
++
 +    const bool is_tiled = (tile_size > 0);
 +    tiled_dequant_task_fn_t dequant_worker_fn = hmx_get_dequant_worker_fn(ctx, weight_type, is_tiled);
 +    if (!dequant_worker_fn) return 1;  // HMX would read the raw buffers directly: per-expert kernel
- 
--    size_t row_stride = htp_tensor_get_row_size(weight_type, k);
--    if (row_stride == 0) {
--        return -1;
++
 +    htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 +    const bool aligned_out = (flags & HTP_MMID_STREAM_ALIGNED_OUT) != 0;
 +    const bool act_f16     = (flags & HTP_MMID_STREAM_ACT_F16) != 0;
@@ -22236,7 +22291,7 @@ index 9af3129..f3bd70b 100644
      }
  
      const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
-@@ -3552,113 +6654,375 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3552,113 +6692,384 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
      const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
  
      const size_t vec_dot_size = k * sizeof(__fp16);
@@ -22364,6 +22419,12 @@ index 9af3129..f3bd70b 100644
 -        const size_t n_rows = hex_smin((size_t) m_end - mr, m_chunk_n_rows);
 -        const size_t n_row_tiles = hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS);
 +    FARF(HIGH, "hmx-mm-id-stream: n_w %d k %d n %d mc %zu nc %zu depth %u vtcm %zu/%zu", n_w, k, n, mc, nc, nd, vtcm_used, ctx->vtcm_size);
++    const bool scat_first = !(ctx->batch_flags & HTP_BATCH_MMID_SCAT_OVL);
++    if (ctx->batch_flags & (HTP_BATCH_MMID_REP_MASK << HTP_BATCH_MMID_REP_SHIFT)) {  // GGML_HEXAGON_MMID_REP diagnostic
++        g_chk_mc = (uint32_t) mc; g_chk_nc = (uint32_t) nc_w; g_chk_n = (uint32_t) n; g_chk_bag = bag;
++        g_chk_tiled = tiled_out;
++        if (tiled_out) memcpy(g_chk_offs, tiled_offs, n_as * sizeof(uint32_t));
++    }
  
 -        transfer_activation_chunk_gathered_threaded(
 -            ctx, vtcm_f16_act, activation, (int) mr, (int) n_rows, k,
@@ -22426,6 +22487,7 @@ index 9af3129..f3bd70b 100644
 +    step.s_k_tiles      = (uint32_t) n / 32;
 +    step.ab_pop = step.ab_sync = step.ab_push = false;
 +    step.bag_nw  = (uint32_t) n_threads - 1;
++    step.scat_first = 0;
 +    step.bag_fin = step.bag_inc = false;
 +    memset(step.bag_np, 0, sizeof(step.bag_np));
 +    memset(step.bag_nc, 0, sizeof(step.bag_nc));
@@ -22529,14 +22591,14 @@ index 9af3129..f3bd70b 100644
 +                ab_inflight = -1;
 +                nseg = cur;
 +                hmx_mmid_pos_next_seg(&nseg, (int) mc);
-             }
++            }
 +            if (n_threads > 1 && nseg.valid && ab_inflight < 0 && (int64_t) hmx_popped > act_last_item[(seg + 1) % 2]) {
 +                step.ab_push       = true;
 +                step.ab_push_dst   = act_bufs[(seg + 1) % 2];
 +                step.ab_push_src   = HMX_MMID_ACT_BLOCK_SRC(nseg);
 +                step.ab_push_bytes = HMX_MMID_ACT_BLOCK_BYTES(nseg);
 +                ab_inflight        = (int64_t) seg + 1;
-+            }
+             }
 +        } else if (new_seg && bag) {
 +            HMX_MMID_POP_UNTIL(act_last_item[seg % 2]);  // the rows overwrite the act buffer of segment - 2
 +            // finish this segment's rows (blocks pushed / converted in the steps before keep their counts: the
@@ -22594,6 +22656,7 @@ index 9af3129..f3bd70b 100644
 +            step.bag_rows = (uint32_t) hex_smin((size_t) (bag_next.cne1 - bag_next.mr), mc);
 +        }
 +        step.bag_step = item;
++        step.scat_first = (scat_first && n_s && n_g && dma_gather && n_threads > 1) ? 1 : 0;
 +        hmx_mmid_hvx_step_build(&step, n_g, n_s, dq->n_tasks, dma_gather);
 +        if (n_threads > 1) {
 +            worker_pool_run_func(ctx->worker_pool, hmx_mmid_hvx_step_worker, &step, n_threads);
@@ -22631,7 +22694,7 @@ index 9af3129..f3bd70b 100644
 +        if (item == 0) {
 +            htp_trace_event_start(tr, HTP_TRACE_EVT_BUFF, (uint16_t) (0x2000 | (k / 32)));
 +            htp_trace_event_stop(tr, HTP_TRACE_EVT_BUFF, (uint16_t) (0x2000 | (k / 32)));
-+        }
+         }
 +        {
 +            const uint32_t vr = (uint32_t) hex_smin((size_t) (cur.cne1 - cur.mr), n_rows);
 +            htp_trace_event_start(tr, HTP_TRACE_EVT_BUFF, (uint16_t) vr);
@@ -22644,7 +22707,7 @@ index 9af3129..f3bd70b 100644
 +        }
 +        if (diag & 1) {  // diagnostic: HMX job alone (no HVX work while it runs)
 +            while (hmx_queue_depth(ctx->hmx_queue)) hex_pause();
-         }
++        }
 +        act_last_item[seg % 2] = (int64_t) item;
 +
 +        struct hmx_mmid_out * o = &pend[(pend_head + n_pend++) % nd];
@@ -22680,6 +22743,7 @@ index 9af3129..f3bd70b 100644
 +            step.s_col_tile0 = (uint32_t) o->col0 / 32;
 +            step.s_task_rows = 16 * hmx_ceil_div((uint32_t) o->n_rows, 16 * HMX_MMID_MAX_S);
 +            step.ab_pop = step.ab_sync = step.ab_push = false;
++            step.scat_first = 0;
 +            hmx_mmid_hvx_step_build(&step, 0, hmx_ceil_div((uint32_t) o->n_rows, step.s_task_rows), 0, false);
 +            worker_pool_run_func(ctx->worker_pool, hmx_mmid_hvx_step_worker, &step, n_threads);
 +            continue;
@@ -22698,7 +22762,7 @@ index 9af3129..f3bd70b 100644
      return 0;
  }
  
-@@ -3749,12 +7113,40 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
+@@ -3749,12 +7160,40 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
          };
          ret = hmx_mm_batched(octx->ctx, &batch_params,
                               kparams->m_chunk, kparams->n_chunk,
@@ -22740,7 +22804,7 @@ index 9af3129..f3bd70b 100644
          ret = hmx_mm_2d_f32(
              octx->ctx, octx->ctx->dma[0], dst_ptr, src2_addr, src2_bytes,
              act_addr, src0->data,
-@@ -3764,8 +7156,12 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
+@@ -3764,8 +7203,12 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
              kparams->n_act_threads,
              &kparams->div_n_act_threads,
              &kparams->div_ne00_padded,
@@ -22754,7 +22818,7 @@ index 9af3129..f3bd70b 100644
      }
  
      if (ret != 0) {
-@@ -3787,6 +7183,8 @@ static inline void htp_mm_tensor_collapse_rows(struct htp_tensor * c, const stru
+@@ -3787,6 +7230,8 @@ static inline void htp_mm_tensor_collapse_rows(struct htp_tensor * c, const stru
  
  static int op_matmul_impl(struct htp_ops_context * octx) {
      const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
@@ -22763,7 +22827,7 @@ index 9af3129..f3bd70b 100644
  
      const int status = htp_mm_init_context(octx, kparams);
      if (status != HTP_STATUS_OK) {
-@@ -3834,6 +7232,44 @@ int op_matmul(struct htp_ops_context * octx) {
+@@ -3834,6 +7279,44 @@ int op_matmul(struct htp_ops_context * octx) {
      return op_matmul_impl(octx);
  }
  
@@ -22808,7 +22872,7 @@ index 9af3129..f3bd70b 100644
  static int hmx_mm_op_matmul_id(
      struct htp_ops_context * octx,
      struct htp_mm_context * mmctx
-@@ -3857,42 +7293,119 @@ static int hmx_mm_op_matmul_id(
+@@ -3857,42 +7340,119 @@ static int hmx_mm_op_matmul_id(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -22960,7 +23024,7 @@ index 9af3129..f3bd70b 100644
      }
  
      return HTP_STATUS_OK;
-@@ -3988,6 +7501,37 @@ static int hvx_mm_matmul_id(
+@@ -3988,6 +7548,37 @@ static int hvx_mm_matmul_id(
      return HTP_STATUS_OK;
  }
  
@@ -22998,7 +23062,7 @@ index 9af3129..f3bd70b 100644
  static int hmx_mm_op_matmul_id_nx(
      struct htp_ops_context * octx,
      struct htp_mm_context * mmctx
-@@ -4016,48 +7560,197 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -4016,48 +7607,197 @@ static int hmx_mm_op_matmul_id_nx(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -23231,7 +23295,7 @@ index 9af3129..f3bd70b 100644
      }
  
      return HTP_STATUS_OK;
-@@ -4218,10 +7911,208 @@ static inline void scan_expert_ids(
+@@ -4218,10 +7958,208 @@ static inline void scan_expert_ids(
      }
  }
  
@@ -23440,7 +23504,7 @@ index 9af3129..f3bd70b 100644
      struct htp_mm_context mmctx_struct = {0};
      struct htp_mm_context * mmctx = &mmctx_struct;
  
-@@ -4259,32 +8150,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
+@@ -4259,32 +8197,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
      struct mmid_row_mapping * matrix_rows = NULL;
  
      if (act_nrows > 1) {
@@ -23477,9 +23541,203 @@ index 9af3129..f3bd70b 100644
      }
  
      mmctx->matrix_row_counts    = matrix_row_counts;
-@@ -4340,7 +8210,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
+@@ -4339,8 +8256,205 @@ int op_matmul_id(struct htp_ops_context * octx) {
+     return s;
  }
  
++// ---- GGML_HEXAGON_MMID_REP (HTP_BATCH_MMID_REP_SHIFT, diagnostic) ---------------------------------------------------
++// The op runs 1 + R times on the same inputs; after each run the HVX threads clean+invalidate dsts[0] from L2 and hash
++// it per 2 KB block. The first run's output is kept (malloc'ed copy); the first repeat that differs from it is compared
++// element by element in the differing blocks. Result in g_mmid_chk[8] (main.c reports it as pmu[4..7] + pmu[0..3] of
++// the op's profile line instead of the OPSUM sums / stack probe):
++//   [0] bits 0-7 runs that differ from run 0, bit 8 run 0 is the odd one (every repeat differs from it and they agree),
++//       bit 9 tiled output, bit 10 BAG, bit 11 no reference copy, bits 16-23 mc / 32, bits 24-31 nc (cols per weight) / 32
++//   [1] first differing element: bits 0-15 expert row (position in the expert's row list), bits 16-31 column
++//   [2] last differing element, same fields
++//   [3] bits 0-23 differing elements, bits 24-31 index of the first odd run
++//   [4] first diff: bits 0-7 expert, bits 8-19 rows differing (distinct), bits 20-31 the expert's row count
++//   [5] reference value bits of the first differing element, [6] the odd run's value bits
++//   [7] bits 0-15 differing 2 KB blocks, bits 16-31 last diff's expert
++// [0] bit 12: not checked (an output overlaps an input: the repeats would not see the same inputs; the op ran once),
++//     bit 13: the per-expert kernel ran (no streamed plan: mc / nc / tiled fields are 0)
++// Buffers (hashes + reference copy) are heap-allocated on first use only.
++#define MMID_CHK_BLK      2048
++#define MMID_CHK_MAX_BLKS 8192
++uint32_t g_mmid_chk[8];
++int      g_mmid_chk_valid = 0;
++static uint32_t * g_chk_ref = NULL, * g_chk_cur = NULL, * g_chk_prev = NULL;
++static uint8_t * g_chk_copy = NULL;
++static size_t    g_chk_copy_size = 0;
++
++typedef struct {
++    const uint8_t * p;
++    uint32_t        n_blk;
++    uint32_t *      out;
++} mmid_chk_task_t;
++
++static void mmid_chk_worker(unsigned int n, unsigned int i, void * data) {
++    const mmid_chk_task_t * t = (const mmid_chk_task_t *) data;
++    const uint32_t per = (t->n_blk + n - 1) / n;
++    const uint32_t b0 = i * per, b1 = b0 + per < t->n_blk ? b0 + per : t->n_blk;
++    if (b0 >= b1) return;
++    hex_l2flush((void *) (t->p + (size_t) b0 * MMID_CHK_BLK), (size_t) (b1 - b0) * MMID_CHK_BLK);
++    for (uint32_t b = b0; b < b1; ++b) {
++        const HVX_Vector * v = (const HVX_Vector *) (t->p + (size_t) b * MMID_CHK_BLK);
++        HVX_Vector acc = Q6_V_vzero(), acx = Q6_V_vzero();
++        for (uint32_t k = 0; k < MMID_CHK_BLK / 128; ++k) {
++            acc = Q6_Vw_vadd_VwVw(acc, v[k]);
++            acx = Q6_V_vxor_VV(Q6_V_vror_VR(acx, 4), v[k]);
++        }
++        uint32_t tmp[64] __attribute__((aligned(128)));
++        ((HVX_Vector *) tmp)[0] = acc;
++        ((HVX_Vector *) tmp)[1] = acx;
++        uint32_t h = 0;
++        for (int j = 0; j < 64; j++) h = h * 31u + tmp[j];
++        t->out[b] = h;
++    }
++}
++
++static void mmid_chk_hash(struct htp_ops_context * octx, const uint8_t * p, uint32_t n_blk, uint32_t * out) {
++    static mmid_chk_task_t t;
++    t.p = p; t.n_blk = n_blk; t.out = out;
++    worker_pool_run_func(octx->ctx->worker_pool, mmid_chk_worker, &t, octx->n_threads);
++}
++
++// byte offset in dsts[0] -> expert, position in its row list, column (tiled: expert-sorted 32x32 fp16 tiles with
++// interleaved row pairs; else rows (i1, i2) of nb1 / nb2 with esize-byte elements, looked up in the row mapping)
++static void mmid_chk_locate(const struct htp_tensor * d, struct htp_mm_context * mmctx, size_t off, uint32_t esize,
++                            uint32_t * a_out, uint32_t * r_out, uint32_t * c_out) {
++    *a_out = 0xff; *r_out = 0xffff; *c_out = 0xffff;
++    if (g_chk_tiled) {
++        const uint32_t col_tiles = g_chk_n / 32;
++        const size_t   e   = off / 2;
++        const uint32_t tr  = (uint32_t) (e / (32 * (size_t) g_chk_n));
++        const uint32_t rem = (uint32_t) (e % (32 * (size_t) g_chk_n));
++        const uint32_t ct  = rem / 1024, te = rem % 1024;
++        const uint32_t row = tr * 32 + 2 * (te / 64) + (te & 1);
++        (void) col_tiles;
++        uint32_t a = 0;
++        for (uint32_t x = 0; x < g_chk_n_as; ++x) if (g_chk_offs[x] <= row) a = x;
++        *a_out = a; *r_out = row - g_chk_offs[a]; *c_out = ct * 32 + (te % 64) / 2;
++        return;
++    }
++    const uint32_t i2 = (uint32_t) (off / d->nb[2]);
++    const uint32_t i1 = (uint32_t) ((off % d->nb[2]) / d->nb[1]);
++    *c_out = (uint32_t) ((off % d->nb[1]) / esize);
++    const uint32_t n_as = g_chk_n_as;
++    for (uint32_t a = 0; a < n_as; ++a) {
++        const uint32_t cnt = mmctx->matrix_row_counts[a];
++        for (uint32_t r = 0; r < cnt; ++r) {
++            const struct mmid_row_mapping m = mmctx->matrix_rows[(size_t) a * mmctx->mapping_stride + r];
++            if (m.i1 == i1 && m.i2 == i2) { *a_out = a; *r_out = r; return; }
++        }
++    }
++}
++
++static int hmx_mm_op_matmul_id_nx(struct htp_ops_context * octx, struct htp_mm_context * mmctx);
++
++static __attribute__((noinline)) int mmid_rep_check(struct htp_ops_context * octx, struct htp_mm_context * mmctx, uint32_t n_rep) {
++    // plan of this op only (the per-expert kernel leaves it unset)
++    g_chk_tiled = false; g_chk_bag = false;
++    g_chk_mc = g_chk_nc = g_chk_n = 0;
++    g_chk_n_as  = (uint32_t) octx->src[0]->ne[2];
++    memset(g_mmid_chk, 0, sizeof(g_mmid_chk));
++    // in place re-runs need inputs the op does not write
++    bool alias = false;
++    for (int o = 0; o < HTP_OP_MAX_OUTPUTS && !alias; ++o) {
++        const struct htp_tensor * t = octx->dsts[o];
++        if (!t || !t->data) continue;
++        for (int i = 0; i < HTP_OP_MAX_INPUTS; ++i) {
++            const struct htp_tensor * x = octx->src[i];
++            if (!x || !x->data) continue;
++            if (t->data < x->data + x->size && x->data < t->data + t->size) { alias = true; break; }
++        }
++    }
++    if (!g_chk_ref) {
++        g_chk_ref = (uint32_t *) malloc(3 * MMID_CHK_MAX_BLKS * sizeof(uint32_t));
++        if (g_chk_ref) { g_chk_cur = g_chk_ref + MMID_CHK_MAX_BLKS; g_chk_prev = g_chk_cur + MMID_CHK_MAX_BLKS; }
++    }
++    if (alias || !g_chk_ref) {
++        const int s0 = hmx_mm_op_matmul_id_nx(octx, mmctx);
++        g_mmid_chk[0] = 0x1000u | (g_chk_ref ? 0 : 0x800u);
++        g_mmid_chk_valid = 1;
++        return s0;
++    }
++    int s = hmx_mm_op_matmul_id_nx(octx, mmctx);
++    const uint32_t stream_bit = g_chk_n ? 0 : 0x2000u;
++    const struct htp_tensor * d = octx->dsts[0];
++    const uint8_t * p = (const uint8_t *) (uintptr_t) d->data;
++    const size_t bytes = (size_t) d->ne[3] * d->nb[3];
++    uint32_t n_blk = (uint32_t) (bytes / MMID_CHK_BLK);
++    if (n_blk > MMID_CHK_MAX_BLKS) n_blk = MMID_CHK_MAX_BLKS;
++    const size_t cbytes = (size_t) n_blk * MMID_CHK_BLK;
++    mmid_chk_hash(octx, p, n_blk, g_chk_ref);
++    if (g_chk_copy_size < cbytes) {
++        free(g_chk_copy);
++        g_chk_copy = memalign(128, cbytes);
++        g_chk_copy_size = g_chk_copy ? cbytes : 0;
++    }
++    const bool have_copy = g_chk_copy != NULL;
++    if (have_copy) memcpy(g_chk_copy, p, cbytes);
++    // element size: fp16 for the fp16 outputs (tiled or F16OUT modes), else f32
++    const struct htp_mm_kernel_params * kp = (const struct htp_mm_kernel_params *) octx->kernel_params;
++    const uint32_t esize = (g_chk_tiled || kp->epilogue == HTP_MM_EPI_SWIGLU_PAIR_H16_F16OUT ||
++                            kp->epilogue == HTP_MM_EPI_SWIGLU_PAIR_F16OUT) ? 2 : 4;
++    uint32_t n_bad = 0, bad_run = 0, nblk0 = 0;
++    bool repeats_agree = true;
++    for (uint32_t r = 1; r <= n_rep && s == HTP_STATUS_OK; ++r) {
++        s = hmx_mm_op_matmul_id_nx(octx, mmctx);
++        mmid_chk_hash(octx, p, n_blk, g_chk_cur);
++        uint32_t nd = 0;
++        for (uint32_t b = 0; b < n_blk; ++b) nd += g_chk_cur[b] != g_chk_ref[b];
++        if (!nd) continue;
++        if (n_bad && memcmp(g_chk_prev, g_chk_cur, n_blk * sizeof(uint32_t))) repeats_agree = false;
++        memcpy(g_chk_prev, g_chk_cur, n_blk * sizeof(uint32_t));
++        ++n_bad;
++        if (n_bad > 1) continue;
++        bad_run = r; nblk0 = nd;
++        if (!have_copy) continue;
++        // element level, in the differing blocks only
++        uint32_t n_el = 0, n_rows = 0, last_row_key = 0xffffffffu;
++        size_t first = (size_t) -1, last = 0;
++        for (uint32_t b = 0; b < n_blk; ++b) {
++            if (g_chk_cur[b] == g_chk_ref[b]) continue;
++            for (size_t o = (size_t) b * MMID_CHK_BLK; o < (size_t) (b + 1) * MMID_CHK_BLK; o += esize) {
++                if (memcmp(p + o, g_chk_copy + o, esize)) {
++                    ++n_el;
++                    if (first == (size_t) -1) first = o;
++                    last = o;
++                    uint32_t a, rr, c;
++                    if (n_rows < 4095) {  // distinct rows (consecutive keys only: cheap, exact for a row-major layout)
++                        mmid_chk_locate(d, mmctx, o, esize, &a, &rr, &c);
++                        const uint32_t key = a << 16 | rr;
++                        if (key != last_row_key) { ++n_rows; last_row_key = key; }
++                    }
++                }
++            }
++        }
++        uint32_t a0, r0, c0, a1, r1, c1;
++        mmid_chk_locate(d, mmctx, first, esize, &a0, &r0, &c0);
++        mmid_chk_locate(d, mmctx, last, esize, &a1, &r1, &c1);
++        g_mmid_chk[1] = (r0 & 0xffff) | c0 << 16;
++        g_mmid_chk[2] = (r1 & 0xffff) | c1 << 16;
++        g_mmid_chk[3] = (n_el & 0xffffff) | r << 24;
++        g_mmid_chk[4] = (a0 & 0xff) | (n_rows & 0xfff) << 8 | (a0 < g_chk_n_as ? (mmctx->matrix_row_counts[a0] & 0xfff) : 0xfff) << 20;
++        uint32_t vr = 0, vb = 0;
++        memcpy(&vr, g_chk_copy + first, esize);
++        memcpy(&vb, p + first, esize);
++        g_mmid_chk[5] = vr;
++        g_mmid_chk[6] = vb;
++        g_mmid_chk[7] = (nd & 0xffff) | (a1 & 0xffff) << 16;
++    }
++    const bool orig_odd = n_rep >= 2 && n_bad == n_rep && repeats_agree;
++    g_mmid_chk[0] = (n_bad & 0xff) | (orig_odd ? 0x100u : 0) | (g_chk_tiled ? 0x200u : 0) | (g_chk_bag ? 0x400u : 0) |
++                    (have_copy ? 0 : 0x800u) | stream_bit | ((g_chk_mc / 32) & 0xff) << 16 | ((g_chk_nc / 32) & 0xff) << 24;
++    if (n_bad && !have_copy) g_mmid_chk[7] = nblk0 | bad_run << 24;
++    g_mmid_chk_valid = 1;
++    return s;
++}
++
  int op_matmul_id_nx(struct htp_ops_context * octx) {
 +    // the dense-only epilogue flags must not leak from the previous dense op (bits 8/16 mean other things here)
 +    g_epi_v1     = 0;
@@ -23489,7 +23747,7 @@ index 9af3129..f3bd70b 100644
      struct htp_mm_context mmctx_struct = {0};
      struct htp_mm_context * mmctx = &mmctx_struct;
  
-@@ -4382,32 +8256,11 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
+@@ -4382,32 +8496,11 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
      struct mmid_row_mapping * matrix_rows = NULL;
  
      if (act_nrows > 1) {
@@ -23526,9 +23784,15 @@ index 9af3129..f3bd70b 100644
      }
  
      mmctx->matrix_row_counts    = matrix_row_counts;
-@@ -4424,6 +8277,9 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
+@@ -4422,8 +8515,14 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
+     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+ 
      int s;
-     if (kparams->n_hmx) {
+-    if (kparams->n_hmx) {
++    const uint32_t n_rep = (octx->ctx->batch_flags >> HTP_BATCH_MMID_REP_SHIFT) & HTP_BATCH_MMID_REP_MASK;
++    if (kparams->n_hmx && n_rep) {
++        s = mmid_rep_check(octx, mmctx, n_rep);
++    } else if (kparams->n_hmx) {
          s = hmx_mm_op_matmul_id_nx(octx, mmctx);
 +    } else if (octx->ctx->op_flags & HTP_OPFLAG_ACT_F16_HI) {
 +        FARF(ERROR, "matmul-id-nx: fp16 row activations need the HMX kernel");  // the host only sets it for HMX ops
@@ -23536,7 +23800,7 @@ index 9af3129..f3bd70b 100644
      } else {
          if (hvx_mm_init_tiled_vec_dot(mmctx, src0->type) == 0) {
              s = hvx_mm_matmul_id_nx(octx, mmctx, act_nrows > 1 ? hvx_mm_id_nx_tiled : hvx_mv_id_nx_tiled);
-@@ -4435,11 +8291,16 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
+@@ -4435,11 +8534,16 @@ int op_matmul_id_nx(struct htp_ops_context * octx) {
      if (mapping_buf != octx->ctx->ddr_spad_base) {
          free(mapping_buf);
      }
